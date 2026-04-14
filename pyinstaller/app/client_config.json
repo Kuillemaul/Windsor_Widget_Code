@@ -1,0 +1,13 @@
+{
+  "provider": "sqlserver",
+  "driver": "ODBC Driver 18 for SQL Server",
+  "server": "192.168.1.133",
+  "port": "14330",
+  "database": "WindsorWidget",
+  "username": "windsor_app",
+  "password": "#AsHmaN14",
+  "trusted_connection": false,
+  "encrypt": false,
+  "trust_server_certificate": true,
+  "timeout": 5
+}
