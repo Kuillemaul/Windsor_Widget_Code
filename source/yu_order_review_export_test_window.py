@@ -390,6 +390,54 @@ class SQLHelper:
         return row[0] if row else None
 
 
+class ExistingDBAdapter:
+    """
+    Wrap the main app's existing database backend so the YU review window can
+    reuse the live connection instead of bootstrapping a second SQLHelper.
+    This avoids installer / config path differences across PCs.
+    """
+    def __init__(self, backend) -> None:
+        if backend is None:
+            raise RuntimeError("ExistingDBAdapter requires a live database backend.")
+        self.backend = backend
+        self.loaded_from_path = "reused-main-app-connection"
+
+    def close(self):
+        # Deliberately do nothing. The main app owns this connection.
+        return None
+
+    def all(self, sql: str, params: tuple | list = ()) -> list[dict[str, Any]]:
+        cur = self.backend.cursor()
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        return [dict(row) if not isinstance(row, dict) else row for row in rows]
+
+    def one(self, sql: str, params: tuple | list = ()) -> dict[str, Any] | None:
+        cur = self.backend.cursor()
+        cur.execute(sql, params)
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return dict(row) if not isinstance(row, dict) else row
+
+    def execute(self, sql: str, params: tuple | list = ()) -> None:
+        cur = self.backend.cursor()
+        cur.execute(sql, params)
+        self.backend.commit()
+
+    def scalar(self, sql: str, params: tuple | list = ()) -> Any:
+        cur = self.backend.cursor()
+        cur.execute(sql, params)
+        row = cur.fetchone()
+        if row is None:
+            return None
+        try:
+            return row[0]
+        except Exception:
+            values = list(dict(row).values()) if isinstance(row, dict) else list(row)
+            return values[0] if values else None
+
+
 # ------------------------------------------------------------
 # Order CSV + resolution + export
 # ------------------------------------------------------------
@@ -741,7 +789,7 @@ def export_yuchang_po_compact_by_rows(
 class YUOrderReviewWindow(QMainWindow):
     def __init__(
         self,
-        db: SQLHelper,
+        db: Any,
         prefix: str,
         template_path: str,
         order_csv_path: str,

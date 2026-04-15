@@ -8846,8 +8846,60 @@ $mail.Display()
         if not hasattr(self.ui, "logo"):
             return
 
-        logo_file = self.find_data_file("Windsor Logo.jpg", "Windsor Logo.jpeg", "Windsor Logo.png")
-        if not logo_file.exists():
+        candidate_paths = []
+
+        # Exact common filenames first.
+        for folder in (
+            self.base_dir,
+            self.base_dir / "data",
+            self.base_dir / "Assets",
+            self.base_dir / "assets",
+            self.app_dir,
+            self.app_dir / "data",
+            self.app_dir / "Assets",
+            self.app_dir / "assets",
+        ):
+            candidate_paths.extend([
+                folder / "Windsor Logo.jpg",
+                folder / "Windsor Logo.jpeg",
+                folder / "Windsor Logo.png",
+                folder / "windsor_logo.jpg",
+                folder / "windsor_logo.jpeg",
+                folder / "windsor_logo.png",
+                folder / "windsor_icon.ico",
+            ])
+
+        # Then any file that looks like a Windsor logo, including things like:
+        # Windsor Logo(2).jpg
+        wildcard_folders = [
+            self.base_dir,
+            self.base_dir / "data",
+            self.base_dir / "Assets",
+            self.base_dir / "assets",
+            self.app_dir,
+            self.app_dir / "data",
+            self.app_dir / "Assets",
+            self.app_dir / "assets",
+        ]
+        for folder in wildcard_folders:
+            try:
+                if not folder.exists():
+                    continue
+                for path in folder.iterdir():
+                    if not path.is_file():
+                        continue
+                    name = path.name.lower()
+                    if (
+                        "windsor" in name
+                        and "logo" in name
+                        and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".ico", ".webp"}
+                    ):
+                        candidate_paths.append(path)
+            except Exception:
+                pass
+
+        logo_file = next((path for path in candidate_paths if path.exists()), None)
+        if logo_file is None:
             return
 
         if self._logo_label is None:
@@ -11821,13 +11873,19 @@ $mail.Display()
         dialog.exec()
 
     def open_yu_order_review_window(self, csv_path):
+        message_parent = QApplication.activeModalWidget() or self
+
         template_path = self.ensure_yu_template_path()
         if not template_path:
-            QMessageBox.warning(self, "Missing YU template", "Choose the YU workbook template before continuing.")
+            QMessageBox.warning(
+                message_parent,
+                "Missing YU template",
+                "Choose the YU workbook template before continuing."
+            )
             return False
         try:
             module = load_yu_review_module(self)
-            db_helper = module.SQLHelper()
+            db_helper = module.ExistingDBAdapter(self.db_conn)
             window = module.YUOrderReviewWindow(
                 db=db_helper,
                 prefix="yu_test",
@@ -11836,7 +11894,14 @@ $mail.Display()
                 output_dir=self.get_yu_order_output_dir(),
             )
         except Exception as exc:
-            QMessageBox.critical(self, "YU Order Review", f"Could not open YU order review window.\n\n{exc}")
+            QMessageBox.critical(
+                message_parent,
+                "YU Order Review",
+                "Could not open YU order review window.\n\n"
+                f"{exc}\n\n"
+                "If this only fails in the installed EXE, rebuild the EXE from the current patched source so "
+                "yu_order_review_export_test_window is bundled inside the app."
+            )
             return False
 
         self.yu_order_review_db_helpers.append(db_helper)

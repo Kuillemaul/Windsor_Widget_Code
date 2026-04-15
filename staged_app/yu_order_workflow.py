@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import csv
 import sys
-import importlib.util
 import os
 from pathlib import Path
 from datetime import date, datetime
+
+import yu_order_review_export_test_window as yu_order_review_module
 
 from PySide6.QtCore import Qt, QDate
 from PySide6.QtGui import QDoubleValidator
@@ -434,26 +435,10 @@ class YUOrderEntryDialog(QDialog):
 
 
 def load_yu_review_module(main_window):
-    module_name = 'yu_order_review_export_test_window'
-    module_path = Path(__file__).resolve().parent / f'{module_name}.py'
-    if not module_path.exists():
-        raise FileNotFoundError(
-            'yu_order_review_export_test_window.py was not found in the same folder as the app. '
-            'Place that file beside the main app file first.'
-        )
-
-    existing = sys.modules.get(module_name)
-    if existing is not None:
-        return existing
-
-    spec = importlib.util.spec_from_file_location(module_name, str(module_path))
-    if spec is None or spec.loader is None:
-        raise RuntimeError('Could not load yu_order_review_export_test_window.py')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
     try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(module_name, None)
-        raise
-    return module
+        return yu_order_review_module
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not import the bundled yu_order_review_export_test_window module. "
+            "Rebuild the EXE from the current patched source files."
+        ) from exc
