@@ -668,26 +668,48 @@ def export_yuchang_po_compact_by_rows(
 
             old_from_row = anc._from.row + 1
             old_from_col = anc._from.col + 1
+
+            # Keep header images like the logo even when they sit outside the export column window.
             if old_from_row not in row_map:
-                continue
-            if not (export_min_idx <= old_from_col <= export_max_idx):
-                continue
+                if old_from_row <= header_end_row:
+                    target_row = old_from_row
+                else:
+                    continue
+            else:
+                target_row = row_map[old_from_row]
 
             img_bytes = img._data()
             new_img = XLImage(BytesIO(img_bytes))
             new_anchor = deepcopy(anc)
-            new_anchor._from.row = row_map[old_from_row] - 1
-            new_anchor._from.col = old_from_col - export_min_idx
+            new_anchor._from.row = max(0, target_row - 1)
+
+            if old_from_col < export_min_idx:
+                new_anchor._from.col = 0
+            elif old_from_col > export_max_idx:
+                new_anchor._from.col = export_max_idx - export_min_idx
+            else:
+                new_anchor._from.col = old_from_col - export_min_idx
 
             if hasattr(new_anchor, "to") and hasattr(new_anchor.to, "row") and hasattr(new_anchor.to, "col"):
                 old_to_row = anc.to.row + 1
                 old_to_col = anc.to.col + 1
+
                 if old_to_row not in row_map:
-                    continue
-                if not (export_min_idx <= old_to_col <= export_max_idx):
-                    continue
-                new_anchor.to.row = row_map[old_to_row] - 1
-                new_anchor.to.col = old_to_col - export_min_idx
+                    if old_to_row <= header_end_row:
+                        target_to_row = old_to_row
+                    else:
+                        target_to_row = target_row
+                else:
+                    target_to_row = row_map[old_to_row]
+
+                new_anchor.to.row = max(0, target_to_row - 1)
+
+                if old_to_col < export_min_idx:
+                    new_anchor.to.col = 0
+                elif old_to_col > export_max_idx:
+                    new_anchor.to.col = export_max_idx - export_min_idx
+                else:
+                    new_anchor.to.col = old_to_col - export_min_idx
 
             new_img.anchor = new_anchor
             out_ws.add_image(new_img)

@@ -73,6 +73,8 @@ from yu_order_workflow import YUOrderEntryDialog, load_yu_review_module
 
 TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
 TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
+APP_VERSION = "1.0c"
+APP_DESIGNER = "Bradley Mayze"
 
 
 def _safe_table_settings_token(table, fallback_scope="table"):
@@ -424,7 +426,7 @@ SHIPMENT_BUTTON_MAP = {
 try:
     from openpyxl import load_workbook, Workbook
     from openpyxl.utils import get_column_letter
-    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.styles.numbers import is_date_format
     from openpyxl.styles.colors import COLOR_INDEX
     from openpyxl.utils.datetime import from_excel
@@ -2492,6 +2494,7 @@ class MainWindow(QMainWindow):
         self.db_conn = None
         self.db_engine = "sqlserver"
         self.db_config = {}
+        self.detached_windows = []
 
         self.customer_names = []
         self.item_numbers = []
@@ -2558,6 +2561,8 @@ class MainWindow(QMainWindow):
             "additional": 7,
             "remove": 8,
         }
+        self.container_sort_column = None
+        self.container_sort_descending = False
         self.order_analysis_columns = {
             "item_number": 0,
             "item_name": 1,
@@ -2607,6 +2612,7 @@ class MainWindow(QMainWindow):
         self.setup_order_entry()
         self.setup_container_entry()
         self.setup_logo()
+        self.update_version_display()
         self.clear_item_summary_fields()
         self.update_charge_freight_box(False)
 
@@ -2655,18 +2661,105 @@ class MainWindow(QMainWindow):
         ]
 
         self.nav_buttons = []
+        self.nav_button_page_map = {}
         for button_name, page_name in nav_map:
             button = getattr(self.ui, button_name, None)
             page = getattr(self.ui, page_name, None)
             if button is not None and page is not None:
                 self.nav_buttons.append((button, page))
+                self.nav_button_page_map[button] = page_name
                 button.clicked.connect(lambda _checked=False, p=page: self.ui.stackedWidget.setCurrentWidget(p))
+                self.install_left_nav_context_menu(button, page_name, button.text())
 
         try:
             self.ui.stackedWidget.currentChanged.connect(self.handle_stacked_widget_changed)
         except Exception:
             pass
         self.handle_stacked_widget_changed()
+
+    def update_version_display(self):
+        version_widget = getattr(self.ui, "textEdit", None)
+        if version_widget is None:
+            return
+        try:
+            version_widget.setReadOnly(True)
+        except Exception:
+            pass
+        html = (
+            "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.0//EN\" "
+            "\"http://www.w3.org/TR/REC-html40/strict.dtd\">"
+            "<html><head><meta charset=\"utf-8\" />"
+            "<style type=\"text/css\">p, li { white-space: pre-wrap; }</style>"
+            "</head><body style=\" font-family:'Segoe UI'; font-size:9pt; font-weight:400; font-style:normal;\">"
+            f"<p style=\" margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; "
+            f"-qt-block-indent:0; text-indent:0px;\">Widget Version {APP_VERSION}<br/>"
+            f"Written and Designed by {APP_DESIGNER}</p></body></html>"
+        )
+        try:
+            version_widget.setHtml(html)
+        except Exception:
+            try:
+                version_widget.setPlainText(f"Widget Version {APP_VERSION}\nWritten and Designed by {APP_DESIGNER}")
+            except Exception:
+                pass
+
+    def install_left_nav_context_menu(self, button, page_name, button_label=""):
+        if button is None:
+            return
+        button.setContextMenuPolicy(Qt.CustomContextMenu)
+        button.customContextMenuRequested.connect(
+            lambda pos, b=button, p=page_name, t=button_label: self.show_left_nav_context_menu(b, pos, p, t)
+        )
+
+    def show_left_nav_context_menu(self, button, pos, page_name, button_label=""):
+        if button is None:
+            return
+        menu = QMenu(button)
+        label_text = (button_label or page_name or "page").strip()
+        open_action = menu.addAction(f"Open {label_text} in new window")
+        chosen = menu.exec(button.mapToGlobal(pos))
+        if chosen == open_action:
+            self.open_page_in_new_window(page_name, label_text)
+
+    def register_detached_window(self, window):
+        if window is None:
+            return
+        self.detached_windows.append(window)
+        try:
+            window.destroyed.connect(lambda *_args, w=window: self._forget_detached_window(w))
+        except Exception:
+            pass
+
+    def _forget_detached_window(self, window):
+        self.detached_windows = [w for w in getattr(self, "detached_windows", []) if w is not window]
+
+    def open_page_in_new_window(self, page_name, page_label=""):
+        detached = MainWindow()
+        self.register_detached_window(detached)
+        detached.show()
+        target_page = getattr(detached.ui, page_name, None)
+        stacked_widget = getattr(detached.ui, "stackedWidget", None)
+        if stacked_widget is not None and target_page is not None:
+            stacked_widget.setCurrentWidget(target_page)
+            try:
+                detached.handle_stacked_widget_changed()
+            except Exception:
+                pass
+        label_text = (page_label or "").strip()
+        if label_text:
+            detached.setWindowTitle(f"Windsor Widget - {label_text}")
+        return detached
+
+    def open_shipments_window_detached(self):
+        detached = ShipmentsWindow(self)
+        self.register_detached_window(detached)
+        detached.show()
+        try:
+            detached.raise_()
+            detached.activateWindow()
+        except Exception:
+            pass
+        return detached
 
     def navigation_selected_style(self):
         if hasattr(self.ui, "radioHighContrast") and self.ui.radioHighContrast.isChecked():
@@ -2778,6 +2871,15 @@ class MainWindow(QMainWindow):
             layout.addWidget(button)
 
         self.shipments_button = button
+
+    def show_shipments_nav_context_menu(self, button, pos):
+        if button is None:
+            return
+        menu = QMenu(button)
+        open_action = menu.addAction("Open Shipments in new window")
+        chosen = menu.exec(button.mapToGlobal(pos))
+        if chosen == open_action:
+            self.open_shipments_window_detached()
 
     def open_shipments_window(self):
         needs_new_window = self.shipments_window is None
@@ -2981,6 +3083,17 @@ class MainWindow(QMainWindow):
             widget.setCursor(Qt.PointingHandCursor)
             label = field_meta.get("label", object_name)
             widget.setToolTip(f"Double-click to edit {label}.")
+
+        for object_name in ("stockOnOrder_label", "stockOnOrder_box"):
+            widget = getattr(self.ui, object_name, None)
+            if widget is None:
+                continue
+            widget.installEventFilter(self)
+            widget.setCursor(Qt.PointingHandCursor)
+            try:
+                widget.setToolTip("Double-click to add the current item to the To Order Sheet.")
+            except Exception:
+                pass
 
     # -----------------------------
     # Database helpers
@@ -4988,7 +5101,7 @@ class MainWindow(QMainWindow):
         checkbox = getattr(self.ui, "combineThreads_checkBox", None)
         if checkbox is not None:
             checkbox.setToolTip(
-                "Combine sales for the base thread code and the LF thread code, for example BN40 101 + LFBN40 101."
+                "Combine sales for the India thread code and the Liberty code with trailing L, for example BN40 101 + BN40 101 L."
             )
             self.combine_threads_checkbox = checkbox
             return
@@ -5002,7 +5115,7 @@ class MainWindow(QMainWindow):
             checkbox = QCheckBox("Combine Threads", frame)
             checkbox.setObjectName("combineThreadsCheck")
             checkbox.setToolTip(
-                "Combine sales for the base thread code and the LF thread code, for example BN40 101 + LFBN40 101."
+                "Combine sales for the India thread code and the Liberty code with trailing L, for example BN40 101 + BN40 101 L."
             )
             layout.addWidget(checkbox)
             self.combine_threads_checkbox = checkbox
@@ -5559,10 +5672,23 @@ class MainWindow(QMainWindow):
             return
 
         if chosen_action == create_order_action:
-            QMessageBox.information(
+            default_po = str(row_data.get("order_number", "") or "").strip()
+            order_number, accepted = QInputDialog.getText(
                 self,
-                "Create Order",
-                "Placeholder only for now. This is where the YU order review/export flow will be wired in later.",
+                "Create YU Order",
+                "Order Number:",
+                QLineEdit.Normal,
+                default_po,
+            )
+            order_number = (order_number or "").strip()
+            if not accepted or not order_number:
+                return
+            self.open_yu_order_entry_dialog(
+                initial_order_number=order_number,
+                initial_lines=[{
+                    "item_number": row_data.get("item_number", ""),
+                    "qty": row_data.get("qty", 0),
+                }],
             )
             return
 
@@ -5743,6 +5869,8 @@ class MainWindow(QMainWindow):
                 cell.font = Font(bold=True)
             if Alignment is not None:
                 cell.alignment = Alignment(horizontal="center", vertical="center")
+            if cell_border is not None:
+                cell.border = cell_border
 
         numeric_columns = {
             self.order_analysis_columns["sales_for_period"],
@@ -5912,6 +6040,8 @@ class MainWindow(QMainWindow):
         table.setSelectionMode(QAbstractItemView.SingleSelection)
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         table.verticalHeader().setVisible(False)
+        table.setSortingEnabled(False)
+        table.horizontalHeader().setSectionsClickable(True)
         table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
@@ -5921,9 +6051,59 @@ class MainWindow(QMainWindow):
         table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
         table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeToContents)
         table.horizontalHeader().setSectionResizeMode(8, QHeaderView.ResizeToContents)
+        if not bool(table.property("_container_header_sort_connected")):
+            table.horizontalHeader().sectionClicked.connect(self.handle_container_header_sort_clicked)
+            table.setProperty("_container_header_sort_connected", True)
         self._updating_container_table = False
         self.refresh_container_note_rows()
         self.refresh_container_totals()
+
+    def container_sort_key_for_line(self, line, column):
+        cols = self.container_columns
+        if column == cols["order"]:
+            return (line.get("order_number", "") or "").strip().upper()
+        if column == cols["item"]:
+            return (line.get("item_number", "") or "").strip().upper()
+        if column == cols["description"]:
+            return (line.get("description", "") or "").strip().upper()
+        if column == cols["qty"]:
+            return self.parse_float(line.get("qty", 0))
+        if column == cols["cartons"]:
+            return self.parse_float(line.get("cartons", 0))
+        if column == cols["additional_cartons"]:
+            return self.parse_float(line.get("additional_cartons", 0))
+        if column == cols["urgent"]:
+            return 1 if bool(line.get("urgent")) else 0
+        if column == cols["additional"]:
+            return 1 if bool(line.get("additional")) else 0
+        return ""
+
+    def handle_container_header_sort_clicked(self, column):
+        cols = self.container_columns
+        if column == cols["remove"]:
+            return
+        if self.container_sort_column == column:
+            self.container_sort_descending = not self.container_sort_descending
+        else:
+            self.container_sort_column = column
+            self.container_sort_descending = False
+
+        lines = self.get_container_line_dicts()
+        lines.sort(
+            key=lambda line: self.container_sort_key_for_line(line, column),
+            reverse=self.container_sort_descending,
+        )
+        self.populate_container_table(lines)
+
+    def apply_container_sort_if_needed(self, lines):
+        if self.container_sort_column is None:
+            return list(lines)
+        sorted_lines = list(lines)
+        sorted_lines.sort(
+            key=lambda line: self.container_sort_key_for_line(line, self.container_sort_column),
+            reverse=self.container_sort_descending,
+        )
+        return sorted_lines
 
     def setup_containers_list_table(self):
         table = getattr(self.ui, "containers_tableWidget", None)
@@ -6207,6 +6387,7 @@ class MainWindow(QMainWindow):
         table = getattr(self.ui, "container_table", None)
         if table is None:
             return
+        lines = self.apply_container_sort_if_needed(lines)
         cols = self.container_columns
         self._updating_container_table = True
         table.clearSpans()
@@ -6614,7 +6795,6 @@ class MainWindow(QMainWindow):
         self.refresh_container_totals()
         self.refresh_containers_list()
         self.refresh_on_order_statuses_from_container_data(persist=True)
-        self.rerun_order_analysis_if_ready()
 
     def refresh_containers_list(self):
         table = getattr(self.ui, "containers_tableWidget", None)
@@ -6788,8 +6968,119 @@ class MainWindow(QMainWindow):
                 if obj is getattr(self.ui, object_name, None):
                     self.edit_item_summary_field(object_name)
                     return True
+            if obj is getattr(self.ui, "stockOnOrder_label", None) or obj is getattr(self.ui, "stockOnOrder_box", None):
+                self.prompt_add_current_item_to_order_sheet()
+                return True
 
         return super().eventFilter(obj, event)
+
+    def add_or_update_to_order_line(self, item_number, qty_value, supplier_name="", urgent=False, status=""):
+        table = getattr(self.ui, "order_table", None)
+        if table is None:
+            return False, "To Order table is not available."
+
+        typed_item = str(item_number or "").strip()
+        item_number = self.find_item_number(typed_item)
+        try:
+            qty_value = float(qty_value)
+        except Exception:
+            qty_value = 0.0
+
+        if not item_number:
+            return False, "Please choose a valid item number."
+        if qty_value <= 0:
+            return False, "Quantity must be greater than 0."
+
+        item_row = self.get_item_master_row(item_number)
+        description = self.get_first(item_row, "description", "item_name", "Item Name", "Description")
+        supplier = (supplier_name or "").strip() or self.get_first(item_row, "supplier_name", "supplier_code", "Column1", "Supplier")
+
+        for row in range(table.rowCount()):
+            existing_item = table.item(row, 0)
+            if existing_item is None or (existing_item.text() or "").strip() != item_number:
+                continue
+
+            qty_item = table.item(row, self.order_qty_column)
+            current_qty = self.parse_float(qty_item.data(Qt.UserRole) if qty_item is not None else 0)
+            new_qty = current_qty + qty_value
+
+            self._updating_order_table = True
+            if qty_item is not None:
+                qty_item.setText(self.format_value(new_qty))
+                qty_item.setData(Qt.UserRole, new_qty)
+
+            if supplier:
+                supplier_item = table.item(row, self.order_supplier_column)
+                if supplier_item is not None:
+                    supplier_item.setText(supplier)
+                    supplier_item.setData(Qt.UserRole, supplier)
+            if urgent:
+                table.setItem(row, self.order_priority_column, self.build_order_status_item("URGENT", True))
+            self._updating_order_table = False
+
+            self.save_order_table_state()
+            if self.current_item_number:
+                self.refresh_item_summary_context_boxes()
+            return True, f"Updated To Order line for {item_number}."
+
+        row = table.rowCount()
+        self._updating_order_table = True
+        table.insertRow(row)
+        table.setItem(row, 0, self.make_order_table_item(item_number))
+        table.setItem(row, 1, self.make_order_table_item(description))
+        table.setItem(
+            row,
+            self.order_on_order_column,
+            self.make_order_table_item(
+                self.format_value(self.get_item_on_order_qty(item_number)),
+                align=Qt.AlignRight | Qt.AlignVCenter,
+            ),
+        )
+
+        qty_item = self.make_order_table_item(
+            self.format_value(qty_value),
+            editable=True,
+            align=Qt.AlignRight | Qt.AlignVCenter,
+        )
+        qty_item.setData(Qt.UserRole, qty_value)
+        table.setItem(row, self.order_qty_column, qty_item)
+
+        supplier_item = self.make_order_table_item(supplier, editable=False)
+        supplier_item.setData(Qt.UserRole, supplier)
+        supplier_item.setToolTip("Double-click to choose a supplier.")
+        table.setItem(row, self.order_supplier_column, supplier_item)
+
+        table.setItem(row, self.order_priority_column, self.build_order_status_item("URGENT" if urgent else status, urgent))
+        table.setItem(row, self.order_remove_column, self.build_order_remove_item())
+        self._updating_order_table = False
+        table.resizeRowsToContents()
+
+        self.save_order_table_state()
+        if self.current_item_number:
+            self.refresh_item_summary_context_boxes()
+        return True, f"Added {item_number} to To Order."
+
+    def prompt_add_current_item_to_order_sheet(self):
+        if not self.current_item_number:
+            return False
+        current_value = self.parse_float(getattr(self.ui, "stockOnOrder_box", None).text() if getattr(self.ui, "stockOnOrder_box", None) is not None and hasattr(getattr(self.ui, "stockOnOrder_box", None), "text") else 0)
+        qty_value, accepted = QInputDialog.getDouble(
+            self,
+            "Add to To Order Sheet",
+            f"Qty for {self.current_item_number}:",
+            current_value if current_value > 0 else 0.0,
+            0.0,
+            999999999.0,
+            3,
+        )
+        if not accepted or qty_value <= 0:
+            return False
+        ok, message = self.add_or_update_to_order_line(self.current_item_number, qty_value)
+        if ok:
+            QMessageBox.information(self, "To Order Sheet", message)
+            return True
+        QMessageBox.warning(self, "To Order Sheet", message)
+        return False
 
     def edit_item_summary_field(self, object_name):
         if self.db_conn is None or not self.current_item_number:
@@ -8081,10 +8372,29 @@ class MainWindow(QMainWindow):
             total += self.parse_float(qty_value)
         return total
 
-    def get_container_sheet_item_qty(self, item_number):
+    def get_on_order_sheet_item_qty(self, item_number):
+        table = getattr(self, "onOrder_table", None)
+        if table is None or not item_number:
+            return 0.0
+
+        total = 0.0
+        target = item_number.strip().upper()
+        for row in range(table.rowCount()):
+            item_cell = table.item(row, self.on_order_item_column)
+            qty_cell = table.item(row, self.on_order_qty_column)
+            item_text = item_cell.text().strip().upper() if item_cell is not None and item_cell.text() else ""
+            if item_text != target:
+                continue
+            qty_value = qty_cell.data(Qt.UserRole) if qty_cell is not None else None
+            if qty_value in (None, "") and qty_cell is not None:
+                qty_value = qty_cell.text()
+            total += self.parse_float(qty_value)
+        return total
+
+    def get_open_container_summary(self, item_number):
         target = (item_number or "").strip().upper()
         if not target:
-            return 0.0
+            return {"qty": 0.0, "eta_text": "", "container_ref": ""}
 
         total = 0.0
         table = getattr(self.ui, "container_table", None)
@@ -8099,7 +8409,10 @@ class MainWindow(QMainWindow):
                 item_text = item_cell.text().strip().upper() if item_cell is not None and item_cell.text() else ""
                 if item_text != target:
                     continue
-                total += self.parse_float(qty_cell.text() if qty_cell is not None else 0)
+                qty_value = qty_cell.data(Qt.UserRole) if qty_cell is not None else None
+                if qty_value in (None, "") and qty_cell is not None:
+                    qty_value = qty_cell.text()
+                total += self.parse_float(qty_value)
 
         current_item_widget = getattr(self.ui, "itemNumberContainer_line", None)
         current_qty_widget = getattr(self.ui, "qtyContainder_line", None)
@@ -8107,18 +8420,93 @@ class MainWindow(QMainWindow):
         if current_item == target:
             total += self.parse_float(current_qty_widget.text() if current_qty_widget is not None else 0)
 
-        return total
+        eta_text = ""
+        eta_date_edit = getattr(self.ui, "eta_dateEdit", None)
+        if total > 0 and eta_date_edit is not None:
+            qdate = eta_date_edit.date()
+            if qdate.isValid():
+                eta_text = qdate.toString("dd/MM/yyyy")
+
+        container_ref = (self.current_container_ref or self.get_container_ref_text() or "").strip()
+        return {"qty": total, "eta_text": eta_text, "container_ref": container_ref}
+
+    def get_saved_next_container_summary(self, item_number):
+        target = (item_number or "").strip()
+        if not target or self.db_conn is None or not self.has_table("container_lines") or not self.has_table("containers"):
+            return {"qty": 0.0, "eta_text": "", "container_ref": ""}
+
+        rows = self.db_all(
+            """
+            SELECT
+                cl.container_ref,
+                SUM(COALESCE(cl.qty, 0)) AS total_qty,
+                MIN(NULLIF(TRIM(c.eta_date), '')) AS eta_date,
+                MIN(NULLIF(TRIM(c.updated_on), '')) AS updated_on
+            FROM container_lines cl
+            LEFT JOIN containers c ON UPPER(TRIM(c.container_ref)) = UPPER(TRIM(cl.container_ref))
+            WHERE UPPER(TRIM(cl.item_number)) = UPPER(TRIM(?))
+            GROUP BY cl.container_ref
+            """,
+            (target,),
+        )
+
+        best = None
+        for row in rows:
+            row_dict = self.row_to_dict(row)
+            qty = self.parse_float(row_dict.get("total_qty", 0))
+            if qty <= 0:
+                continue
+            eta_date = self.parse_date_value(row_dict.get("eta_date"))
+            updated_date = self.parse_date_value(row_dict.get("updated_on"))
+            sort_date = eta_date or updated_date or date.max
+            candidate = {
+                "qty": qty,
+                "eta_text": eta_date.strftime("%d/%m/%Y") if eta_date is not None else "",
+                "container_ref": str(row_dict.get("container_ref") or "").strip(),
+                "_sort_date": sort_date,
+            }
+            if best is None or candidate["_sort_date"] < best["_sort_date"] or (
+                candidate["_sort_date"] == best["_sort_date"] and candidate["container_ref"].upper() < best["container_ref"].upper()
+            ):
+                best = candidate
+
+        if best is None:
+            return {"qty": 0.0, "eta_text": "", "container_ref": ""}
+        return {"qty": best["qty"], "eta_text": best["eta_text"], "container_ref": best["container_ref"]}
+
+    def get_next_container_summary(self, item_number):
+        saved = self.get_saved_next_container_summary(item_number)
+        current = self.get_open_container_summary(item_number)
+
+        if current.get("qty", 0) <= 0:
+            return saved
+        if saved.get("qty", 0) <= 0:
+            return current
+
+        current_ref = str(current.get("container_ref", "") or "").strip().upper()
+        saved_ref = str(saved.get("container_ref", "") or "").strip().upper()
+        if current_ref and saved_ref and current_ref == saved_ref:
+            return current
+
+        current_eta = self.parse_date_value(current.get("eta_text"))
+        saved_eta = self.parse_date_value(saved.get("eta_text"))
+
+        if current_eta is not None and saved_eta is not None:
+            return current if current_eta <= saved_eta else saved
+        if current_eta is not None:
+            return current
+        if saved_eta is not None:
+            return saved
+
+        return current if current_ref else saved
+
+    def get_container_sheet_item_qty(self, item_number):
+        summary = self.get_next_container_summary(item_number)
+        return self.parse_float(summary.get("qty", 0))
 
     def get_next_container_eta_text(self, item_number):
-        if self.get_container_sheet_item_qty(item_number) <= 0:
-            return ""
-        eta_date_edit = getattr(self.ui, "eta_dateEdit", None)
-        if eta_date_edit is None:
-            return ""
-        qdate = eta_date_edit.date()
-        if not qdate.isValid():
-            return ""
-        return qdate.toString("dd/MM/yyyy")
+        summary = self.get_next_container_summary(item_number)
+        return str(summary.get("eta_text", "") or "")
 
     def get_orders_table_item_summary(self, item_number):
         row = self.db_one(
@@ -8216,11 +8604,11 @@ class MainWindow(QMainWindow):
         container_ref = self.get_container_ref_text() or (self.current_container_ref or "Container")
         eta_widget = getattr(self.ui, "eta_dateEdit", None)
         if eta_widget is not None and eta_widget.date().isValid():
-            date_part = eta_widget.date().toString("yyyyMMdd")
+            year_part = eta_widget.date().toString("yy")
         else:
-            date_part = date.today().strftime("%Y%m%d")
+            year_part = date.today().strftime("%y")
         safe_ref = self.sanitize_filename_component(container_ref)
-        filename = f"{safe_ref}_{date_part}.xlsx"
+        filename = f"YU_CONTAINER_{safe_ref}_{year_part}.xlsx"
         return self.get_container_export_directory() / filename
 
     def write_container_export_workbook(self, export_path):
@@ -8231,13 +8619,18 @@ class MainWindow(QMainWindow):
         if table is None:
             raise RuntimeError("Container table is not available.")
 
+        container_ref = self.get_container_ref_text() or (self.current_container_ref or "")
         workbook = Workbook()
         worksheet = workbook.active
         worksheet.title = "Container"
 
         header_fill = PatternFill("solid", fgColor="D9E1F2") if PatternFill is not None else None
+        title_fill = PatternFill("solid", fgColor="B8CCE4") if PatternFill is not None else None
         note_fill = PatternFill("solid", fgColor="F6F1C1") if PatternFill is not None else None
         bold_font = Font(bold=True) if Font is not None else None
+        title_font = Font(bold=True, size=14) if Font is not None else None
+        thin_side = Side(style="thin", color="000000") if Side is not None else None
+        cell_border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side) if Border is not None and thin_side is not None else None
 
         export_headers = ["Order Number", "Item Number", "Description", "Qty", "Cartons"]
         export_column_map = [
@@ -8248,7 +8641,25 @@ class MainWindow(QMainWindow):
             self.container_columns["cartons"],
         ]
 
-        row_index = 1
+        export_date = date.today().strftime("%d/%m/%Y")
+        title_text = f"{export_date} YU NEXT CONTAINER"
+        if container_ref:
+            title_text = f"{title_text} {container_ref}"
+
+        worksheet.cell(row=1, column=1, value=title_text)
+        worksheet.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(export_headers))
+        if title_font is not None:
+            worksheet.cell(row=1, column=1).font = title_font
+        if title_fill is not None:
+            worksheet.cell(row=1, column=1).fill = title_fill
+        if Alignment is not None:
+            worksheet.cell(row=1, column=1).alignment = Alignment(horizontal="center", vertical="center")
+        if cell_border is not None:
+            for border_col in range(1, len(export_headers) + 1):
+                worksheet.cell(row=1, column=border_col).border = cell_border
+        worksheet.row_dimensions[1].height = 24
+
+        row_index = 3
         for column, header_text in enumerate(export_headers, start=1):
             cell = worksheet.cell(row=row_index, column=column, value=header_text)
             if bold_font is not None:
@@ -8260,6 +8671,7 @@ class MainWindow(QMainWindow):
 
         start_table_row = row_index
         row_index += 1
+        total_cartons = 0.0
 
         for table_row in range(table.rowCount()):
             first_item = table.item(table_row, 0)
@@ -8276,17 +8688,44 @@ class MainWindow(QMainWindow):
                 if Alignment is not None:
                     worksheet.cell(row=row_index, column=1).alignment = Alignment(horizontal="left", vertical="center")
                 worksheet.merge_cells(start_row=row_index, start_column=1, end_row=row_index, end_column=len(export_headers))
+                if cell_border is not None:
+                    for border_col in range(1, len(export_headers) + 1):
+                        worksheet.cell(row=row_index, column=border_col).border = cell_border
                 row_index += 1
                 continue
 
             for export_col, table_col in enumerate(export_column_map, start=1):
                 item = table.item(table_row, table_col)
-                cell_value = item.text() if item is not None else ""
+                if table_col in (self.container_columns["qty"], self.container_columns["cartons"], self.container_columns["additional_cartons"]):
+                    raw_value = item.data(Qt.UserRole) if item is not None else ""
+                    cell_value = self.parse_float(raw_value if raw_value not in (None, "") else (item.text() if item is not None else ""))
+                    if table_col == self.container_columns["cartons"]:
+                        total_cartons += cell_value
+                else:
+                    cell_value = item.text() if item is not None else ""
                 worksheet.cell(row=row_index, column=export_col, value=cell_value)
                 if Alignment is not None:
                     align_horizontal = "right" if export_col in (4, 5) else "left"
                     worksheet.cell(row=row_index, column=export_col).alignment = Alignment(horizontal=align_horizontal, vertical="center")
+                if cell_border is not None:
+                    worksheet.cell(row=row_index, column=export_col).border = cell_border
             row_index += 1
+
+        total_row = row_index + 1
+        total_label_cell = worksheet.cell(row=total_row, column=4, value="Total Cartons")
+        total_value_cell = worksheet.cell(row=total_row, column=5, value=total_cartons)
+        if bold_font is not None:
+            total_label_cell.font = bold_font
+            total_value_cell.font = bold_font
+        if header_fill is not None:
+            total_label_cell.fill = header_fill
+            total_value_cell.fill = header_fill
+        if Alignment is not None:
+            total_label_cell.alignment = Alignment(horizontal="right", vertical="center")
+            total_value_cell.alignment = Alignment(horizontal="right", vertical="center")
+        if cell_border is not None:
+            total_label_cell.border = cell_border
+            total_value_cell.border = cell_border
 
         for column in range(1, len(export_headers) + 1):
             max_length = 0
@@ -8309,7 +8748,24 @@ class MainWindow(QMainWindow):
         subject_text = f"Container {container_ref}" if container_ref else "Container Export"
         ps_script = f"""
 $ErrorActionPreference = 'Stop'
-$outlook = New-Object -ComObject Outlook.Application
+
+function New-OutlookApp {{
+    try {{
+        return New-Object -ComObject Outlook.Application
+    }}
+    catch {{
+        try {{
+            Start-Process "outlook.exe" | Out-Null
+            Start-Sleep -Seconds 5
+            return New-Object -ComObject Outlook.Application
+        }}
+        catch {{
+            throw "Outlook could not be opened via COM. Make sure classic Outlook desktop is installed, signed in, and not hung in the background."
+        }}
+    }}
+}}
+
+$outlook = New-OutlookApp
 $mail = $outlook.CreateItem(0)
 $mail.Subject = @"
 {subject_text}
@@ -8324,15 +8780,25 @@ $mail.Display()
 """
         script_path = Path(tempfile.gettempdir()) / "windsor_widget_container_email.ps1"
         script_path.write_text(ps_script, encoding="utf-8")
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script_path)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                ["powershell", "-STA", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script_path)],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=20,
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(
+                "Outlook did not respond within 20 seconds. "
+                "The Excel export succeeded, but the email draft step timed out."
+            )
+
         if result.returncode != 0:
             stderr = (result.stderr or result.stdout or "").strip()
-            raise RuntimeError(stderr or "Could not create Outlook email draft.")
+            message = stderr or "Could not create Outlook email draft."
+            message = message.replace("\r\n", "\n").strip()
+            raise RuntimeError(message)
 
     def export_container_to_excel_and_email(self):
         table = getattr(self.ui, "container_table", None)
@@ -8361,7 +8827,10 @@ $mail.Display()
             QMessageBox.warning(
                 self,
                 "Exported, but email not created",
-                f"The Excel file was created here:\n{export_path}\n\nBut the email draft could not be opened.\n\n{exc}"
+                f"The Excel file was created here:\n{export_path}\n\n"
+                f"But the email draft could not be opened.\n\n"
+                f"{exc}\n\n"
+                "The export still succeeded."
             )
             return
 
@@ -8446,7 +8915,16 @@ $mail.Display()
             return sales_items
 
         normalized = self.normalize_item_code(valid_item)
-        counterpart_normalized = normalized[2:] if normalized.startswith("LF") else f"LF{normalized}"
+
+        # New Liberty thread convention:
+        #   India   -> BN60 101
+        #   Liberty -> BN60 101 L
+        # So combine the base code with the same normalized code plus/minus trailing L.
+        if normalized.endswith("L"):
+            counterpart_normalized = normalized[:-1]
+        else:
+            counterpart_normalized = f"{normalized}L"
+
         counterpart = self.find_item_number_by_normalized(counterpart_normalized)
         if counterpart and self.normalize_item_code(counterpart) != normalized:
             sales_items.append(counterpart)
@@ -8842,7 +9320,7 @@ $mail.Display()
         today = today or self.current_business_date()
         fallback_date = today + timedelta(days=lead_days)
 
-        order_form_qty = self.get_order_sheet_item_qty(item_number)
+        order_form_qty = self.get_order_sheet_item_qty(item_number) + self.get_on_order_sheet_item_qty(item_number)
         next_container_qty = self.get_container_sheet_item_qty(item_number)
         next_container_eta_text = self.get_next_container_eta_text(item_number)
         next_container_eta = self.parse_date_value(next_container_eta_text)
@@ -8878,7 +9356,7 @@ $mail.Display()
             }
 
         order_form_tooltip = (
-            "To order form: qty shown for reference only. Not counted as inbound until it is physically assigned "
+            "To order + on order sheets: qty shown for reference only. Not counted as inbound until it is physically assigned "
             "to a real shipment or container."
             if order_form_qty > 0 else ""
         )
@@ -8887,7 +9365,7 @@ $mail.Display()
             "today": today,
             "lead_days": lead_days,
             "horizon_date": fallback_date,
-            "order_form": entry(order_form_qty, None, False, "To order form", False, order_form_tooltip),
+            "order_form": entry(order_form_qty, None, False, "To order / on order", False, order_form_tooltip),
             "next_container": entry(next_container_qty, next_container_arrival, next_container_used_fallback, "Next container", True),
             "shipped": entry(shipped_qty, shipped_arrival, shipped_used_fallback, "Shipped", True),
         }
@@ -11140,14 +11618,40 @@ $mail.Display()
         return str(base_dir)
 
     def ensure_yu_template_path(self):
-        saved_path = str(self.settings.value("yu/template_path", "") or "").strip()
-        if saved_path and Path(saved_path).exists():
-            return saved_path
+        expected_name = "yuchang_order_form_Widget.xlsx"
 
-        start_dir = str(Path(__file__).resolve().parent)
+        candidate_paths = []
+        saved_path = str(self.settings.value("yu/template_path", "") or "").strip()
+        if saved_path:
+            candidate_paths.append(Path(saved_path))
+
+        # Common local fallback locations
+        app_dir = Path(__file__).resolve().parent
+        candidate_paths.extend([
+            app_dir / expected_name,
+            app_dir / "data" / expected_name,
+            self.base_dir / expected_name,
+            self.base_dir / "data" / expected_name,
+        ])
+
+        seen = set()
+        for candidate in candidate_paths:
+            try:
+                resolved = str(Path(candidate).resolve())
+            except Exception:
+                resolved = str(candidate)
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            if Path(candidate).exists():
+                final_path = str(Path(candidate))
+                self.settings.setValue("yu/template_path", final_path)
+                return final_path
+
+        start_dir = str(app_dir)
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "Choose YU workbook template",
+            f"Choose {expected_name}",
             start_dir,
             "Excel Files (*.xlsx *.xlsm)"
         )
@@ -11156,8 +11660,13 @@ $mail.Display()
         self.settings.setValue("yu/template_path", file_path)
         return file_path
 
-    def open_yu_order_entry_dialog(self):
-        dialog = YUOrderEntryDialog(self, self)
+    def open_yu_order_entry_dialog(self, initial_order_number="", initial_lines=None):
+        dialog = YUOrderEntryDialog(
+            self,
+            self,
+            initial_order_number=initial_order_number,
+            initial_lines=initial_lines or [],
+        )
         self.yu_order_entry_dialog = dialog
         dialog.exec()
 

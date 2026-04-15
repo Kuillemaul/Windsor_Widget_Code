@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import sys
 import importlib.util
 import os
 from pathlib import Path
@@ -67,14 +68,20 @@ class AddToOnOrderDialog(QDialog):
 
 
 class YUOrderEntryDialog(QDialog):
-    def __init__(self, main_window, parent=None):
+    def __init__(self, main_window, parent=None, initial_order_number="", initial_lines=None):
         super().__init__(parent or main_window)
         self.main_window = main_window
         self._loaded_draft_order_no = ""
+        self._initial_lines = list(initial_lines or [])
         self.setWindowTitle("Create Order from YU")
         self.resize(860, 620)
         self.build_ui()
         self.setup_autocomplete()
+        if initial_order_number:
+            self.order_number_edit.setText(str(initial_order_number).strip())
+            self._loaded_draft_order_no = str(initial_order_number).strip()
+        if self._initial_lines:
+            self.load_initial_lines(self._initial_lines)
         self.order_number_edit.setFocus()
 
     def build_ui(self):
@@ -132,6 +139,39 @@ class YUOrderEntryDialog(QDialog):
         self.close_button.clicked.connect(self.reject)
         button_row.addWidget(self.close_button)
         layout.addLayout(button_row)
+
+    def load_initial_lines(self, lines):
+        for line in lines or []:
+            item_number = self.find_item_number(str(line.get("item_number", "")).strip())
+            qty_value = float(line.get("qty", 0) or 0)
+            if not item_number or qty_value <= 0:
+                continue
+
+            for row in range(self.lines_table.rowCount()):
+                existing_item = self.lines_table.item(row, 0)
+                if existing_item is not None and (existing_item.text() or "").strip() == item_number:
+                    qty_item = self.lines_table.item(row, 2)
+                    current_qty = float((qty_item.text() or '0').replace(',', '')) if qty_item is not None else 0.0
+                    new_qty = current_qty + qty_value
+                    self.lines_table.setItem(row, 2, QTableWidgetItem(self.format_qty(new_qty)))
+                    return
+
+            row = self.lines_table.rowCount()
+            self.lines_table.insertRow(row)
+            self.lines_table.setItem(row, 0, QTableWidgetItem(item_number))
+            self.lines_table.setItem(row, 1, QTableWidgetItem(self.description_for_item(item_number)))
+            self.lines_table.setItem(row, 2, QTableWidgetItem(self.format_qty(qty_value)))
+            add_on_order_item = QTableWidgetItem('Add To On Order')
+            add_on_order_item.setTextAlignment(Qt.AlignCenter)
+            self.lines_table.setItem(row, 3, add_on_order_item)
+            remove_item = QTableWidgetItem('Remove')
+            remove_item.setTextAlignment(Qt.AlignCenter)
+            self.lines_table.setItem(row, 4, remove_item)
+
+        try:
+            self.lines_table.resizeColumnsToContents()
+        except Exception:
+            pass
 
     def setup_autocomplete(self):
         item_numbers = getattr(self.main_window, 'item_numbers', []) or []
@@ -393,16 +433,26 @@ class YUOrderEntryDialog(QDialog):
 
 
 def load_yu_review_module(main_window):
-    module_path = Path(__file__).resolve().parent / 'yu_order_review_export_test_window.py'
+    module_name = 'yu_order_review_export_test_window'
+    module_path = Path(__file__).resolve().parent / f'{module_name}.py'
     if not module_path.exists():
         raise FileNotFoundError(
             'yu_order_review_export_test_window.py was not found in the same folder as the app. '
             'Place that file beside the main app file first.'
         )
 
-    spec = importlib.util.spec_from_file_location('yu_order_review_export_test_window', str(module_path))
+    existing = sys.modules.get(module_name)
+    if existing is not None:
+        return existing
+
+    spec = importlib.util.spec_from_file_location(module_name, str(module_path))
     if spec is None or spec.loader is None:
         raise RuntimeError('Could not load yu_order_review_export_test_window.py')
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
     return module

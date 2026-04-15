@@ -1,5 +1,5 @@
 #define MyAppName "Windsor Widget"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.1.5"
 #define MyAppPublisher "Brad Mayze"
 #define MyAppExeName "WindsorWidget.exe"
 
@@ -11,12 +11,12 @@ AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\Windsor Widget
 DefaultGroupName=Windsor Widget
 DisableProgramGroupPage=yes
-OutputBaseFilename=WindsorWidget_Client_1_0_0
+OutputBaseFilename=WindsorWidget_Client_1_1_5
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
 ArchitecturesInstallIn64BitMode=x64compatible
-SetupIconFile=..\assets.ico
+SetupIconFile=..\assets\windsor_icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 PrivilegesRequired=admin
 
@@ -45,6 +45,7 @@ Filename: "{app}\{#MyAppExeName}"; Description: "Launch Windsor Widget"; Flags: 
 var
   SqlPage: TInputQueryWizardPage;
   FolderPage: TInputDirWizardPage;
+  YuTemplatePage: TInputDirWizardPage;
   TestButton: TNewButton;
   ConnectionValidated: Boolean;
   LastValidatedSignature: string;
@@ -66,6 +67,21 @@ begin
   Result := FileExists(ExpandConstant('{tmp}\msodbcsql18.exe'));
 end;
 
+function InitializeSetup(): Boolean;
+begin
+  Result := True;
+  if not IsOdbc18Installed then
+  begin
+    MsgBox(
+      'ODBC Driver 18 for SQL Server is not currently installed.' + #13#10#13#10 +
+      'That is fine if you bundled the Microsoft ODBC installer into this build. ' +
+      'The installer will attempt to install it before first launch.' + #13#10#13#10 +
+      'Python app dependencies are already bundled into the Windsor Widget executable.',
+      mbInformation,
+      MB_OK);
+  end;
+end;
+
 function PosFrom(const Needle, Haystack: string; const Offset: Integer): Integer;
 var
   TailText: string;
@@ -76,6 +92,7 @@ begin
     Result := Pos(Needle, Haystack);
     exit;
   end;
+
   TailText := Copy(Haystack, Offset, MaxInt);
   RelativePos := Pos(Needle, TailText);
   if RelativePos > 0 then
@@ -107,6 +124,43 @@ end;
 procedure MarkConnectionDirty(Sender: TObject);
 begin
   ConnectionValidated := False;
+end;
+
+function ReadExistingConfigValue(const Key: string; const Default: string): string;
+var
+  JsonPath: string;
+  JsonText: AnsiString;
+  SearchText: AnsiString;
+  StartPos: Integer;
+  EndPos: Integer;
+begin
+  Result := Default;
+  JsonPath := ExpandConstant('{commonappdata}\WindsorWidget\client_config.json');
+  if not FileExists(JsonPath) then
+    exit;
+
+  if not LoadStringFromFile(JsonPath, JsonText) then
+    exit;
+
+  SearchText := '"' + Key + '"';
+  StartPos := Pos(SearchText, JsonText);
+  if StartPos <= 0 then
+    exit;
+
+  StartPos := PosFrom(':', JsonText, StartPos);
+  if StartPos <= 0 then
+    exit;
+
+  StartPos := PosFrom('"', JsonText, StartPos);
+  if StartPos <= 0 then
+    exit;
+  StartPos := StartPos + 1;
+
+  EndPos := PosFrom('"', JsonText, StartPos);
+  if EndPos <= StartPos then
+    exit;
+
+  Result := Copy(string(JsonText), StartPos, EndPos - StartPos);
 end;
 
 procedure TestConnectionButtonClick(Sender: TObject);
@@ -164,6 +218,8 @@ end;
 procedure InitializeWizard();
 var
   ExistingFolder: string;
+  ExistingYuTemplatePath: string;
+  ExistingYuTemplateFolder: string;
 begin
   SqlPage := CreateInputQueryPage(
     wpSelectDir,
@@ -177,11 +233,11 @@ begin
   SqlPage.Add('Username:', False);
   SqlPage.Add('Password:', True);
 
-  SqlPage.Values[0] := '';
-  SqlPage.Values[1] := '14330';
-  SqlPage.Values[2] := 'WindsorWidget';
-  SqlPage.Values[3] := 'windsor_app';
-  SqlPage.Values[4] := '';
+  SqlPage.Values[0] := ReadExistingConfigValue('server', '');
+  SqlPage.Values[1] := ReadExistingConfigValue('port', '14330');
+  SqlPage.Values[2] := ReadExistingConfigValue('database', 'WindsorWidget');
+  SqlPage.Values[3] := ReadExistingConfigValue('username', 'windsor_app');
+  SqlPage.Values[4] := ReadExistingConfigValue('password', '');
 
   TestButton := TNewButton.Create(SqlPage);
   TestButton.Parent := SqlPage.Surface;
@@ -211,6 +267,24 @@ begin
   ExistingFolder := ExpandConstant('{reg:HKCU\Software\Windsor\WidgetApp,customerFilesRoot|}');
   if ExistingFolder <> '' then
     FolderPage.Values[0] := ExistingFolder;
+
+  YuTemplatePage := CreateInputDirPage(
+    FolderPage.ID,
+    'YU template folder',
+    'Choose the local folder that contains the YU workbook template',
+    'The installer will save the full path to yuchang_order_form_Widget.xlsx for this PC/user.',
+    False,
+    ''
+  );
+  YuTemplatePage.Add('YU template folder:');
+
+  ExistingYuTemplatePath := ExpandConstant('{reg:HKCU\Software\Windsor\WidgetApp\yu,template_path|}');
+  if ExistingYuTemplatePath <> '' then
+  begin
+    ExistingYuTemplateFolder := ExtractFileDir(ExistingYuTemplatePath);
+    if ExistingYuTemplateFolder <> '' then
+      YuTemplatePage.Values[0] := ExistingYuTemplateFolder;
+  end;
 
   ConnectionValidated := False;
   LastValidatedSignature := '';
@@ -250,6 +324,27 @@ begin
       exit;
     end;
   end;
+
+  if CurPageID = YuTemplatePage.ID then
+  begin
+    if (Trim(YuTemplatePage.Values[0]) = '') or (not DirExists(YuTemplatePage.Values[0])) then
+    begin
+      MsgBox('Choose a valid YU template folder.', mbError, MB_OK);
+      Result := False;
+      exit;
+    end;
+
+    if not FileExists(AddBackslash(Trim(YuTemplatePage.Values[0])) + 'yuchang_order_form_Widget.xlsx') then
+    begin
+      MsgBox(
+        'The selected folder does not contain yuchang_order_form_Widget.xlsx.' + #13#10#13#10 +
+        'Choose the folder that contains that workbook.',
+        mbError,
+        MB_OK);
+      Result := False;
+      exit;
+    end;
+  end;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -258,16 +353,6 @@ var
 begin
   if CurStep = ssPostInstall then
   begin
-    if (not ConnectionValidated) or (LastValidatedSignature <> GetConfigSignature()) then
-    begin
-      MsgBox(
-        'SQL connection details were not successfully validated during install. ' +
-        'The installer will not save client_config.json until the connection test passes.',
-        mbCriticalError,
-        MB_OK);
-      Abort;
-    end;
-
     ConfigDir := ExpandConstant('{commonappdata}\WindsorWidget');
     if not DirExists(ConfigDir) then
       ForceDirectories(ConfigDir);
@@ -290,5 +375,11 @@ begin
 
     SaveStringToFile(ConfigPath, JsonText, False);
     RegWriteStringValue(HKCU, 'Software\Windsor\WidgetApp', 'customerFilesRoot', Trim(FolderPage.Values[0]));
+    RegWriteStringValue(
+      HKCU,
+      'Software\Windsor\WidgetApp\yu',
+      'template_path',
+      AddBackslash(Trim(YuTemplatePage.Values[0])) + 'yuchang_order_form_Widget.xlsx'
+    );
   end;
 end;
