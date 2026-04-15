@@ -16,7 +16,7 @@ Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
 ArchitecturesInstallIn64BitMode=x64compatible
-SetupIconFile=..\assets\windsor_icon.ico
+SetupIconFile=..\source\assets\windsor_icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 PrivilegesRequired=admin
 

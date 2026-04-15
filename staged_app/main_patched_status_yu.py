@@ -7666,7 +7666,7 @@ class MainWindow(QMainWindow):
 
         if not sale_date and not customer_name and not item_number and quantity_value == 0 and price_value == 0:
             return None
-        if not item_number or item_number.startswith("\\"):
+        if not item_number:
             return None
         if not customer_name:
             raise ValueError(f"Line {line_number}: customer name is blank.")
@@ -7674,6 +7674,8 @@ class MainWindow(QMainWindow):
             raise ValueError(f"Line {line_number}: sale date is blank.")
 
         description = item_map.get(item_number.upper(), "")
+        if not description:
+            description = item_number
         month_key = self.sales_month_key_from_date(sale_date)
         extended = quantity_value * price_value
         return (sale_date, customer_name, item_number, description, month_key, quantity_value, price_value, extended)
@@ -9968,6 +9970,7 @@ $mail.Display()
         self.current_customer_months = months
         self.current_customer_pivot = pivot
         self.current_customer_name = valid_customer
+        self.current_customer_combine_accounts = combine_accounts
 
         self.populate_monthly_item_table(pivot, months, valid_customer, combine_accounts)
         self.populate_customer_info(valid_customer)
@@ -10425,6 +10428,11 @@ $mail.Display()
                 qty = item_data["months"].get(month_start, 0.0)
                 month_item = QTableWidgetItem(self.format_value(qty))
                 month_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                month_item.setData(Qt.UserRole, {
+                    "item_number": item_number,
+                    "month_start": month_start.isoformat(),
+                    "qty": qty,
+                })
                 table.setItem(row_index, month_index, month_item)
 
             for numeric_col in (3, 4):
@@ -10472,22 +10480,164 @@ $mail.Display()
         self.draw_monthly_line_chart(self.customer_chart_view, self.current_customer_months, totals, item_number)
 
     def handle_customer_table_double_click(self, row, column):
-        if column != 0:
+        table = getattr(self.ui, "salesTable", None)
+        if table is None or row < 0 or column < 0:
             return
 
+        if column == 0:
+            item_number_item = table.item(row, 0)
+            if item_number_item is None:
+                return
+
+            item_number = self.find_item_number(item_number_item.text())
+            if not item_number:
+                return
+
+            self.open_item_summary_from_customer(item_number)
+            return
+
+        if column >= 5:
+            self.show_customer_month_invoice_lines(row, column)
+            return
+
+
+    def fetch_customer_month_invoice_lines(self, customer_name, item_number, month_start, combine_accounts=False):
+        month_start = self.parse_date_value(month_start)
+        if month_start is None:
+            return []
+
+        matched_customers = self.find_matching_customers(customer_name, combine_accounts)
+        in_clause, in_params = self.sql_in_clause(matched_customers)
+        month_end = self.next_month(month_start) - timedelta(days=1)
+
+        rows = self.db_all(
+            f"""
+            SELECT
+                DATE(sale_date) AS sale_date,
+                TRIM(customer_name) AS customer_name,
+                TRIM(item_number) AS item_number,
+                COALESCE(NULLIF(TRIM(description), ''), TRIM(item_number)) AS description,
+                COALESCE(quantity, 0) AS quantity,
+                COALESCE(price, 0) AS price,
+                COALESCE(extended, COALESCE(quantity, 0) * COALESCE(price, 0)) AS extended
+            FROM sales
+            WHERE DATE(sale_date) BETWEEN ? AND ?
+              AND customer_name IN {in_clause}
+              AND UPPER(TRIM(COALESCE(item_number, ''))) = UPPER(TRIM(?))
+            ORDER BY DATE(sale_date), customer_name COLLATE NOCASE, description COLLATE NOCASE
+            """,
+            [month_start.isoformat(), month_end.isoformat(), *in_params, item_number],
+        )
+        return [self.row_to_dict(row) for row in rows]
+
+    def show_customer_month_invoice_lines(self, row, column):
         table = getattr(self.ui, "salesTable", None)
-        if table is None:
+        if table is None or not self.current_customer_months:
+            return
+        if column < 5 or (column - 5) >= len(self.current_customer_months):
             return
 
         item_number_item = table.item(row, 0)
         if item_number_item is None:
             return
-
-        item_number = self.find_item_number(item_number_item.text())
+        item_number = (item_number_item.text() or "").strip()
         if not item_number:
             return
 
-        self.open_item_summary_from_customer(item_number)
+        month_start = self.current_customer_months[column - 5]
+        combine_accounts = bool(getattr(self, "current_customer_combine_accounts", False))
+        detail_rows = self.fetch_customer_month_invoice_lines(
+            self.current_customer_name,
+            item_number,
+            month_start,
+            combine_accounts=combine_accounts,
+        )
+
+        title_month = month_start.strftime("%b %Y")
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Invoice Lines - {item_number} - {title_month}")
+        dialog.resize(980, 620)
+        layout = QVBoxLayout(dialog)
+
+        summary = QLabel(
+            f"Customer: {self.current_customer_name}\n"
+            f"Item: {item_number}\n"
+            f"Month: {title_month}"
+            + ("\n(Combined state accounts)" if combine_accounts else "")
+        )
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+
+        detail_table = QTableWidget(dialog)
+        detail_table.setColumnCount(6)
+        detail_table.setHorizontalHeaderLabels([
+            "Sale Date",
+            "Customer",
+            "Description / Invoice Line",
+            "Qty",
+            "Price",
+            "Extended",
+        ])
+        detail_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        detail_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        detail_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        detail_table.verticalHeader().setVisible(False)
+        layout.addWidget(detail_table, 1)
+
+        total_qty = 0.0
+        total_value = 0.0
+        detail_table.setRowCount(len(detail_rows))
+        for row_index, line in enumerate(detail_rows):
+            sale_date_text = self.format_short_date(line.get("sale_date"))
+            customer_text = (line.get("customer_name") or "").strip()
+            description_text = (line.get("description") or "").strip()
+            qty_value = self.parse_float(line.get("quantity", 0))
+            price_value = self.parse_float(line.get("price", 0))
+            extended_value = self.parse_float(line.get("extended", qty_value * price_value))
+
+            total_qty += qty_value
+            total_value += extended_value
+
+            values = [
+                sale_date_text,
+                customer_text,
+                description_text,
+                self.format_value(qty_value),
+                self.format_price(price_value),
+                self.format_price(extended_value),
+            ]
+            for col_index, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if col_index in (3, 4, 5):
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                detail_table.setItem(row_index, col_index, item)
+
+        header = detail_table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        detail_table.resizeRowsToContents()
+
+        footer = QLabel(
+            f"Lines: {len(detail_rows)}    "
+            f"Qty Total: {self.format_value(total_qty)}    "
+            f"Value Total: {self.format_price(total_value)}"
+        )
+        footer.setWordWrap(True)
+        layout.addWidget(footer)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        close_button = QPushButton("Close", dialog)
+        close_button.clicked.connect(dialog.accept)
+        button_row.addWidget(close_button)
+        layout.addLayout(button_row)
+
+        dialog.exec()
 
     def open_item_summary_from_customer(self, item_number):
         item_page = getattr(self.ui, "itemSummary_page", None)
