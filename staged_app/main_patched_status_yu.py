@@ -11824,7 +11824,7 @@ $mail.Display()
         template_path = self.ensure_yu_template_path()
         if not template_path:
             QMessageBox.warning(self, "Missing YU template", "Choose the YU workbook template before continuing.")
-            return
+            return False
         try:
             module = load_yu_review_module(self)
             db_helper = module.SQLHelper()
@@ -11837,7 +11837,7 @@ $mail.Display()
             )
         except Exception as exc:
             QMessageBox.critical(self, "YU Order Review", f"Could not open YU order review window.\n\n{exc}")
-            return
+            return False
 
         self.yu_order_review_db_helpers.append(db_helper)
         self.yu_order_review_windows.append(window)
@@ -11850,6 +11850,7 @@ $mail.Display()
             window.showNormal()
         window.raise_()
         window.activateWindow()
+        return True
 
     def _cleanup_yu_order_review_window(self, window, db_helper):
         try:

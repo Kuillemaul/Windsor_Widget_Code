@@ -422,8 +422,9 @@ class YUOrderEntryDialog(QDialog):
         temp_dir = Path(self.main_window.get_yu_order_temp_dir())
         temp_path = temp_dir / f'YU_{order_no}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
         self.write_csv(temp_path)
-        self.main_window.open_yu_order_review_window(str(temp_path))
-        self.accept()
+        opened = self.main_window.open_yu_order_review_window(str(temp_path))
+        if opened:
+            self.accept()
 
     @staticmethod
     def format_qty(value: float) -> str:
