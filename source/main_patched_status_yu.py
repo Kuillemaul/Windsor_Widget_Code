@@ -68,6 +68,7 @@ from PySide6.QtCharts import (
 )
 
 from ui_mainwindow import Ui_MainWindow
+from month_year_picker import MonthYearPicker
 from shipments_window_ui import Ui_MainWindow as Ui_ShipmentsWindow
 from yu_order_workflow import YUOrderEntryDialog, load_yu_review_module
 
@@ -75,6 +76,44 @@ TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
 TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
 APP_VERSION = "1.0c"
 APP_DESIGNER = "Bradley Mayze"
+
+PLANNING_STATUS_ACTIVE = "ACTIVE"
+PLANNING_STATUS_SPECIAL_ORDER = "SPECIAL_ORDER"
+PLANNING_STATUS_PHASE_OUT = "PHASE_OUT"
+PLANNING_STATUS_OBSOLETE = "OBSOLETE"
+PLANNING_STATUSES = (
+    PLANNING_STATUS_ACTIVE,
+    PLANNING_STATUS_SPECIAL_ORDER,
+    PLANNING_STATUS_PHASE_OUT,
+    PLANNING_STATUS_OBSOLETE,
+)
+PLANNING_STATUS_DISPLAY = {
+    PLANNING_STATUS_ACTIVE: "Active",
+    PLANNING_STATUS_SPECIAL_ORDER: "Special Order",
+    PLANNING_STATUS_PHASE_OUT: "Phase Out",
+    PLANNING_STATUS_OBSOLETE: "Obsolete",
+}
+PLANNING_STATUS_COLORS = {
+    PLANNING_STATUS_ACTIVE: {"bg": "#2B2F36", "fg": "#F0F0F0", "border": "#5A5F69"},
+    PLANNING_STATUS_SPECIAL_ORDER: {"bg": "#1F3B57", "fg": "#EAF4FF", "border": "#5EA6E8"},
+    PLANNING_STATUS_PHASE_OUT: {"bg": "#5A431A", "fg": "#FFF3D6", "border": "#E7B14C"},
+    PLANNING_STATUS_OBSOLETE: {"bg": "#5A1F1F", "fg": "#FFEAEA", "border": "#E47C7C"},
+}
+
+
+class SortableTableWidgetItem(QTableWidgetItem):
+    def __lt__(self, other):
+        if isinstance(other, QTableWidgetItem):
+            left = self.data(Qt.UserRole)
+            right = other.data(Qt.UserRole)
+            if left is not None or right is not None:
+                left = "" if left is None else left
+                right = "" if right is None else right
+                try:
+                    return left < right
+                except Exception:
+                    return str(left) < str(right)
+        return super().__lt__(other)
 
 
 def _safe_table_settings_token(table, fallback_scope="table"):
@@ -2513,6 +2552,11 @@ class MainWindow(QMainWindow):
         self.customer_end_picker = getattr(self.ui, "endMonthPickerCustomer", None)
         self.item_start_picker = getattr(self.ui, "startMonthPickerItem", None)
         self.item_end_picker = getattr(self.ui, "endMonthPickerItem", None)
+        self.order_analysis_start_picker = None
+        self.order_analysis_end_picker = None
+        self.default_period_start_qdate = QDate.currentDate()
+        self.default_period_end_qdate = QDate.currentDate()
+        self.order_analysis_load_button = None
         self.lead_time_picker = getattr(self.ui, "leadTimePicker", None)
         self.customer_chart_view = None
         self.item_chart_view = None
@@ -2524,6 +2568,15 @@ class MainWindow(QMainWindow):
         self.combine_threads_checkbox = None
         self.current_saba_customer = None
         self.current_order_analysis_supplier = None
+        self.current_item_planning_status = PLANNING_STATUS_ACTIVE
+        self.item_status_checkboxes = {}
+        self.item_status_checkbox_map = {}
+        self.item_status_frame = None
+        self.item_status_value_label = None
+        self.order_analysis_show_special_checkbox = None
+        self.order_analysis_show_phase_out_checkbox = None
+        self.order_analysis_show_obsolete_checkbox = None
+        self._order_analysis_all_rows = []
         self._updating_order_table = False
         self._updating_on_order_table = False
         self.order_on_order_column = 2
@@ -2566,16 +2619,19 @@ class MainWindow(QMainWindow):
         self.order_analysis_columns = {
             "item_number": 0,
             "item_name": 1,
-            "sales_for_period": 2,
-            "avg_monthly_sales": 3,
-            "soh": 4,
-            "stock_on_order": 5,
-            "on_order_form": 6,
-            "on_next_container": 7,
-            "shipped_container": 8,
-            "suggested_order": 9,
-            "at_risk": 10,
+            "planning_status": 2,
+            "sales_for_period": 3,
+            "avg_monthly_sales": 4,
+            "soh": 5,
+            "stock_on_order": 6,
+            "on_order_form": 7,
+            "on_next_container": 8,
+            "shipped_container": 9,
+            "suggested_order": 10,
+            "at_risk": 11,
         }
+        self.order_analysis_sort_column = self.order_analysis_columns["suggested_order"]
+        self.order_analysis_sort_descending = True
 
         self.setup_navigation()
         self.add_left_shipments_nav_button()
@@ -2588,27 +2644,32 @@ class MainWindow(QMainWindow):
         self.ensure_on_order_meta_table()
         self.ensure_supplier_master_table()
         self.ensure_shipment_tables()
+        self.ensure_item_planning_status_column()
         self.load_reference_lists()
 
         self.setup_customer_autocomplete()
         self.setup_item_autocomplete()
         self.setup_item_summary_combine_checkbox()
+        self.setup_item_status_controls()
         self.setup_supplier_autocomplete()
         self.setup_date_ranges()
         self.setup_sales_table()
         self.setup_customer_info_table()
         self.setup_customer_purchase_table()
+        self.setup_customer_summary_layout()
         self.setup_update_page()
         self.setup_order_table()
         self.setup_on_order_page()
         self.load_saved_order_lines()
         self.load_saved_on_order_lines()
         self.load_on_order_general_comments()
+        self.setup_order_analysis_filter_bar()
         self.setup_order_analysis_table()
         self.setup_saba_review_page()
         self.setup_container_table()
         self.setup_containers_list_table()
         self.add_shipments_button()
+        self.add_container_management_buttons()
         self.setup_order_entry()
         self.setup_container_entry()
         self.setup_logo()
@@ -2847,30 +2908,203 @@ class MainWindow(QMainWindow):
         self.left_shipments_button = button
 
     def add_shipments_button(self):
-        if getattr(self, "shipments_button", None) is not None:
+        existing_button = getattr(self, "shipments_button", None)
+        if existing_button is not None:
+            try:
+                existing_button.hide()
+            except Exception:
+                pass
+        self.shipments_button = None
+        return
+
+    def add_container_management_buttons(self):
+        if getattr(self, "container_action_panel", None) is not None:
             return
 
         layout = getattr(self.ui, "horizontalLayout_18", None)
         table = getattr(self.ui, "containers_tableWidget", None)
         frame = getattr(self.ui, "frame_46", None)
-        if layout is None or table is None:
+        export_button = getattr(self.ui, "exportEmail_pushButton", None)
+        if layout is None or table is None or export_button is None:
             return
 
-        button = QPushButton("Shipments", frame or self)
-        button.setObjectName("shipments_pushButton")
-        export_button = getattr(self.ui, "exportEmail_pushButton", None)
-        if export_button is not None:
-            button.setFont(export_button.font())
-        button.setMinimumWidth(120)
-        button.clicked.connect(self.open_shipments_window)
+        try:
+            layout.removeWidget(export_button)
+        except Exception:
+            pass
+
+        panel = QWidget(frame or self)
+        panel.setObjectName("container_management_panel")
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(0, 0, 0, 0)
+        panel_layout.setSpacing(6)
+
+        self.container_action_panel = panel
+        self.load_container_button = QPushButton("Load / New", panel)
+        self.load_container_button.setObjectName("loadContainer_pushButton")
+        self.close_container_button = QPushButton("Close Current", panel)
+        self.close_container_button.setObjectName("closeContainer_pushButton")
+        self.email_container_button = QPushButton("Email", panel)
+        self.email_container_button.setObjectName("emailContainer_pushButton")
+
+        export_button.setText("Export")
+        export_button.setObjectName("exportContainer_pushButton")
+        self.export_container_button = export_button
+
+        buttons = (
+            self.load_container_button,
+            self.close_container_button,
+            self.export_container_button,
+            self.email_container_button,
+        )
+        for button in buttons:
+            try:
+                button.setFont(export_button.font())
+            except Exception:
+                pass
+            button.setMinimumWidth(150)
+            button.setMaximumWidth(150)
+            button.setMinimumHeight(34)
+            button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            panel_layout.addWidget(button)
+
+        panel_layout.addStretch(1)
+
+        try:
+            frame.setMinimumSize(QSize(450, 198))
+            frame.setMaximumSize(QSize(450, 198))
+        except Exception:
+            pass
+
+        try:
+            table.setMinimumWidth(235)
+            table.setMaximumWidth(16777215)
+        except Exception:
+            pass
 
         insert_index = layout.indexOf(table)
         if insert_index >= 0:
-            layout.insertWidget(insert_index + 1, button)
+            layout.insertWidget(insert_index, panel)
         else:
-            layout.addWidget(button)
+            layout.addWidget(panel)
+        layout.addWidget(table, 1)
 
-        self.shipments_button = button
+        self.load_container_button.clicked.connect(self.load_or_start_container)
+        self.close_container_button.clicked.connect(self.close_current_container)
+
+    def prompt_for_container_selection(self, title="Load or Start Container", initial_ref=""):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.resize(420, 140)
+        layout = QVBoxLayout(dialog)
+        form = QFormLayout()
+
+        container_combo = QComboBox(dialog)
+        container_combo.setEditable(True)
+        saved_refs = self.get_saved_container_refs()
+        container_combo.addItems(saved_refs)
+        container_combo.setCurrentIndex(-1)
+        try:
+            container_combo.setInsertPolicy(QComboBox.NoInsert)
+            container_combo.setMaxVisibleItems(20)
+        except Exception:
+            pass
+        completer = QCompleter(saved_refs, dialog)
+        completer.setCaseSensitivity(Qt.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchStartsWith)
+        completer.setCompletionMode(QCompleter.PopupCompletion)
+        completer.setModelSorting(QCompleter.CaseInsensitivelySortedModel)
+        container_combo.setCompleter(completer)
+        if container_combo.lineEdit() is not None:
+            container_combo.lineEdit().setPlaceholderText("Select an existing container or type a new one")
+        if initial_ref:
+            container_combo.setCurrentText(initial_ref)
+        form.addRow("Container", container_combo)
+        layout.addLayout(form)
+
+        helper = QLabel("Choose an existing container to load, or type a new reference to start one.", dialog)
+        helper.setWordWrap(True)
+        layout.addWidget(helper)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=dialog)
+        ok_button = buttons.button(QDialogButtonBox.Ok)
+        if ok_button is not None:
+            ok_button.setEnabled(bool((initial_ref or "").strip()))
+        layout.addWidget(buttons)
+
+        def update_ok_state(*_args):
+            has_container = bool((container_combo.currentText() or "").strip())
+            if ok_button is not None:
+                ok_button.setEnabled(has_container)
+
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        if container_combo.lineEdit() is not None:
+            container_combo.lineEdit().textChanged.connect(update_ok_state)
+            container_combo.lineEdit().setFocus()
+            container_combo.lineEdit().selectAll()
+        update_ok_state()
+
+        if dialog.exec() != QDialog.Accepted:
+            return None
+
+        selected_ref = (container_combo.currentText() or "").strip()
+        return selected_ref or None
+
+    def clear_container_page_state(self, focus_ref=True):
+        self.current_container_ref = None
+        self.current_container_notes = ""
+        self.set_container_ref_text("")
+        self.set_container_meta_widgets(updated_display="", eta_iso=date.today().isoformat(), additional_value=0, dog_leads=False)
+        self.populate_container_table([])
+
+        for widget_name in ("orderNumberContainer_line", "itemNumberContainer_line", "qtyContainder_line"):
+            widget = getattr(self.ui, widget_name, None)
+            if widget is not None:
+                widget.clear()
+
+        self.refresh_container_totals()
+        self.refresh_item_summary_context_boxes()
+
+        ref_widget = getattr(self.ui, "nextContainer_box", None)
+        if focus_ref and ref_widget is not None:
+            ref_widget.setFocus()
+
+    def close_current_container(self):
+        current_ref = (self.current_container_ref or self.get_container_ref_text() or "").strip()
+        has_content = bool(current_ref or self.get_container_line_dicts() or (self.current_container_notes or "").strip())
+        if not has_content:
+            self.clear_container_page_state()
+            return
+
+        message = "Close the current container?"
+        if current_ref:
+            message = f"Close {current_ref}?"
+        answer = QMessageBox.question(
+            self,
+            "Close Container",
+            message + "\n\nThe current state will be saved before closing.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        if current_ref:
+            self.save_current_container_state()
+        self.clear_container_page_state()
+
+    def load_or_start_container(self):
+        current_ref = (self.current_container_ref or self.get_container_ref_text() or "").strip()
+        if current_ref:
+            self.save_current_container_state()
+
+        selected_ref = self.prompt_for_container_selection(initial_ref=current_ref)
+        if not selected_ref:
+            return
+
+        self.set_container_ref_text(selected_ref)
+        self.handle_container_reference_submit()
 
     def show_shipments_nav_context_menu(self, button, pos):
         if button is None:
@@ -2973,10 +3207,10 @@ class MainWindow(QMainWindow):
 
         supplier_edit = self.get_order_analysis_supplier_edit()
         if supplier_edit is not None:
-            supplier_edit.returnPressed.connect(self.load_order_analysis)
-            completer = supplier_edit.completer()
-            if completer is not None:
-                completer.activated.connect(lambda *_args: self.load_order_analysis())
+            try:
+                supplier_edit.returnPressed.disconnect()
+            except Exception:
+                pass
 
         order_analysis_table = self.get_order_analysis_table()
         if order_analysis_table is not None:
@@ -3004,6 +3238,10 @@ class MainWindow(QMainWindow):
             self.item_start_picker.dateChanged.connect(self.rerun_item_if_ready)
         if self.item_end_picker:
             self.item_end_picker.dateChanged.connect(self.rerun_item_if_ready)
+        if self.order_analysis_start_picker:
+            pass
+        if self.order_analysis_end_picker:
+            pass
         if self.lead_time_picker:
             self.lead_time_picker.valueChanged.connect(self.rerun_item_if_ready)
         if hasattr(self.ui, "loadFile"):
@@ -3050,7 +3288,11 @@ class MainWindow(QMainWindow):
 
         export_button = getattr(self.ui, "exportEmail_pushButton", None)
         if export_button is not None:
-            export_button.clicked.connect(self.export_container_to_excel_and_email)
+            export_button.clicked.connect(self.export_container_to_excel)
+
+        email_button = getattr(self, "email_container_button", None)
+        if email_button is not None:
+            email_button.clicked.connect(self.email_container_export)
 
         containers_list = getattr(self.ui, "containers_tableWidget", None)
         if containers_list is not None:
@@ -3243,6 +3485,198 @@ class MainWindow(QMainWindow):
             return []
         cur = self.db_conn.cursor()
         return [row[1] for row in cur.execute(f"PRAGMA table_info({table_name})").fetchall()]
+
+    def ensure_item_planning_status_column(self):
+        if self.db_conn is None or not self.has_table("items"):
+            return
+        existing_columns = {str(name).lower(): name for name in self.get_table_columns("items")}
+        if "planning_status" in existing_columns:
+            return
+        cur = self.db_conn.cursor()
+        if self.db_engine == "sqlserver":
+            cur.execute("ALTER TABLE items ADD [planning_status] NVARCHAR(40) NULL")
+        else:
+            cur.execute("ALTER TABLE items ADD COLUMN planning_status TEXT")
+        self.db_conn.commit()
+
+    def normalise_planning_status(self, value):
+        text_value = str(value or "").strip().upper()
+        if text_value in {"", "ACTIVE", "NORMAL", "STANDARD"}:
+            return PLANNING_STATUS_ACTIVE
+        text_value = text_value.replace("-", "_").replace(" ", "_")
+        aliases = {
+            "SPECIAL": PLANNING_STATUS_SPECIAL_ORDER,
+            "SPECIAL_ORDER_ONLY": PLANNING_STATUS_SPECIAL_ORDER,
+            "SPECIALONLY": PLANNING_STATUS_SPECIAL_ORDER,
+            "SPECIAL_ORDER": PLANNING_STATUS_SPECIAL_ORDER,
+            "PHASEOUT": PLANNING_STATUS_PHASE_OUT,
+            "PHASED_OUT": PLANNING_STATUS_PHASE_OUT,
+            "PHASE_OUT": PLANNING_STATUS_PHASE_OUT,
+            "OBSOLETE": PLANNING_STATUS_OBSOLETE,
+            "INACTIVE": PLANNING_STATUS_OBSOLETE,
+            "DISCONTINUED": PLANNING_STATUS_OBSOLETE,
+        }
+        return aliases.get(text_value, PLANNING_STATUS_ACTIVE)
+
+    def planning_status_display_text(self, status):
+        return PLANNING_STATUS_DISPLAY.get(self.normalise_planning_status(status), PLANNING_STATUS_DISPLAY[PLANNING_STATUS_ACTIVE])
+
+    def planning_status_colors(self, status):
+        return PLANNING_STATUS_COLORS.get(self.normalise_planning_status(status), PLANNING_STATUS_COLORS[PLANNING_STATUS_ACTIVE])
+
+    def get_item_planning_status(self, item_number=None, item_row=None):
+        if isinstance(item_row, dict):
+            for key in ("planning_status", "Planning Status"):
+                if key in item_row:
+                    return self.normalise_planning_status(item_row.get(key))
+        item_number = (item_number or "").strip()
+        if not item_number or self.db_conn is None:
+            return PLANNING_STATUS_ACTIVE
+        row = self.row_to_dict(
+            self.db_one(
+                "SELECT planning_status FROM items WHERE UPPER(TRIM(item_number)) = UPPER(TRIM(?)) LIMIT 1",
+                (item_number,),
+            )
+        )
+        return self.normalise_planning_status((row or {}).get("planning_status"))
+
+    def set_item_planning_status(self, item_number, status):
+        item_number = (item_number or "").strip()
+        if not item_number or self.db_conn is None:
+            return False
+        status = self.normalise_planning_status(status)
+        cur = self.db_conn.cursor()
+        cur.execute(
+            "UPDATE items SET planning_status = ? WHERE UPPER(TRIM(item_number)) = UPPER(TRIM(?))",
+            (status, item_number),
+        )
+        self.db_conn.commit()
+        return True
+
+    def passes_order_analysis_status_filters(self, status):
+        status = self.normalise_planning_status(status)
+        if status == PLANNING_STATUS_ACTIVE:
+            return True
+        if status == PLANNING_STATUS_SPECIAL_ORDER:
+            return bool(self.order_analysis_show_special_checkbox is not None and self.order_analysis_show_special_checkbox.isChecked())
+        if status == PLANNING_STATUS_PHASE_OUT:
+            return bool(self.order_analysis_show_phase_out_checkbox is not None and self.order_analysis_show_phase_out_checkbox.isChecked())
+        if status == PLANNING_STATUS_OBSOLETE:
+            return bool(self.order_analysis_show_obsolete_checkbox is not None and self.order_analysis_show_obsolete_checkbox.isChecked())
+        return True
+
+    def apply_order_analysis_filters(self):
+        rows = list(getattr(self, "_order_analysis_all_rows", []) or [])
+        filtered_rows = [row for row in rows if self.passes_order_analysis_status_filters(row.get("planning_status"))]
+        self.populate_order_analysis_table(filtered_rows)
+
+    def update_order_analysis_status_cache(self, item_number, status):
+        item_number = (item_number or "").strip()
+        if not item_number:
+            return
+        normalised_status = self.normalise_planning_status(status)
+        changed = False
+        for row in getattr(self, "_order_analysis_all_rows", []) or []:
+            if (row.get("item_number", "") or "").strip().upper() != item_number.upper():
+                continue
+            row["planning_status"] = normalised_status
+            changed = True
+        if changed:
+            self.apply_order_analysis_filters()
+
+    def update_item_status_controls(self, status=None):
+        status = self.normalise_planning_status(status or self.current_item_planning_status)
+        self.current_item_planning_status = status
+        colors = self.planning_status_colors(status)
+        for checkbox, checkbox_status in self.item_status_checkbox_map.items():
+            checkbox.blockSignals(True)
+            checkbox.setChecked(status == checkbox_status)
+            checkbox.blockSignals(False)
+        if self.item_status_value_label is not None:
+            self.item_status_value_label.setText(self.planning_status_display_text(status))
+        if self.item_status_frame is not None:
+            self.item_status_frame.setStyleSheet(
+                f"QFrame#itemStatus_frame {{ background-color: {colors['bg']}; border: 2px solid {colors['border']}; border-radius: 8px; }}"
+                f"QLabel {{ color: {colors['fg']}; font-weight: 600; }}"
+                f"QCheckBox {{ color: {colors['fg']}; spacing: 6px; }}"
+                f"QCheckBox::indicator {{ width: 16px; height: 16px; }}"
+            )
+
+    def toggle_item_planning_status(self, status):
+        if not self.current_item_number:
+            return
+        status = self.normalise_planning_status(status)
+        current_status = self.normalise_planning_status(self.current_item_planning_status)
+        new_status = PLANNING_STATUS_ACTIVE if current_status == status else status
+        if not self.set_item_planning_status(self.current_item_number, new_status):
+            return
+        self.current_item_planning_status = new_status
+        self.update_item_status_controls(new_status)
+        self.update_order_analysis_status_cache(self.current_item_number, new_status)
+
+    def setup_item_status_controls(self):
+        top_frame = getattr(self.ui, "frame_18", None)
+        layout = top_frame.layout() if top_frame is not None else None
+        if top_frame is None or layout is None:
+            return
+
+        try:
+            top_frame.setMaximumWidth(16777215)
+            top_frame.setMinimumWidth(1056)
+            size_policy = top_frame.sizePolicy()
+            size_policy.setHorizontalPolicy(QSizePolicy.Expanding)
+            top_frame.setSizePolicy(size_policy)
+        except Exception:
+            pass
+
+        if self.item_status_frame is not None:
+            self.update_item_status_controls(self.current_item_planning_status)
+            return
+
+        try:
+            layout.addStretch(1)
+        except Exception:
+            pass
+
+        status_frame = QFrame(top_frame)
+        status_frame.setObjectName("itemStatus_frame")
+        status_layout = QVBoxLayout(status_frame)
+        status_layout.setContentsMargins(10, 8, 10, 8)
+        status_layout.setSpacing(6)
+
+        title_label = QLabel("Planning Status", status_frame)
+        title_label.setObjectName("itemStatus_title")
+        status_layout.addWidget(title_label)
+
+        value_label = QLabel(self.planning_status_display_text(PLANNING_STATUS_ACTIVE), status_frame)
+        value_label.setObjectName("itemStatus_value")
+        status_layout.addWidget(value_label)
+
+        checkbox_row = QHBoxLayout()
+        checkbox_row.setContentsMargins(0, 0, 0, 0)
+        checkbox_row.setSpacing(12)
+
+        self.item_status_checkboxes = {}
+        self.item_status_checkbox_map = {}
+        for status, text_label in (
+            (PLANNING_STATUS_SPECIAL_ORDER, "Special Order"),
+            (PLANNING_STATUS_PHASE_OUT, "Phase Out"),
+            (PLANNING_STATUS_OBSOLETE, "Obsolete"),
+        ):
+            checkbox = QCheckBox(text_label, status_frame)
+            checkbox.setToolTip("Double-click to set this status. Double-click again to return the item to Active.")
+            checkbox.installEventFilter(self)
+            self.item_status_checkboxes[status] = checkbox
+            self.item_status_checkbox_map[checkbox] = status
+            checkbox_row.addWidget(checkbox)
+
+        checkbox_row.addStretch(1)
+        status_layout.addLayout(checkbox_row)
+
+        layout.addWidget(status_frame, 0, Qt.AlignRight)
+        self.item_status_frame = status_frame
+        self.item_status_value_label = value_label
+        self.update_item_status_controls(PLANNING_STATUS_ACTIVE)
 
 
     def ensure_supplier_master_table(self):
@@ -5263,12 +5697,214 @@ class MainWindow(QMainWindow):
                 start_qdate = QDate(min_date.year, min_date.month, 1)
                 end_qdate = QDate(max_date.year, max_date.month, 1)
 
-        for picker in (self.customer_start_picker, self.item_start_picker):
+        self.default_period_start_qdate = start_qdate
+        self.default_period_end_qdate = end_qdate
+
+        for picker in (self.customer_start_picker, self.item_start_picker, self.order_analysis_start_picker):
             if picker is not None:
                 picker.setDate(start_qdate)
-        for picker in (self.customer_end_picker, self.item_end_picker):
+        for picker in (self.customer_end_picker, self.item_end_picker, self.order_analysis_end_picker):
             if picker is not None:
                 picker.setDate(end_qdate)
+
+    def set_month_year_picker_compact(self, picker, month_width=114, year_width=84, control_height=30):
+        if picker is None:
+            return
+        try:
+            picker.monthCombo.setFixedWidth(month_width)
+            picker.yearCombo.setFixedWidth(year_width)
+            picker.monthCombo.setMinimumHeight(control_height)
+            picker.monthCombo.setMaximumHeight(control_height)
+            picker.yearCombo.setMinimumHeight(control_height)
+            picker.yearCombo.setMaximumHeight(control_height)
+        except Exception:
+            pass
+        try:
+            layout = picker.layout()
+            if layout is not None:
+                layout.setContentsMargins(0, 0, 0, 0)
+                layout.setSpacing(6)
+        except Exception:
+            pass
+
+    def setup_customer_summary_layout(self):
+        frame = getattr(self.ui, "frame_4", None)
+        if frame is not None:
+            try:
+                frame.setMinimumHeight(188)
+                frame.setMaximumHeight(188)
+                frame.setMaximumWidth(16777215)
+            except Exception:
+                pass
+
+        layout = getattr(self.ui, "horizontalLayout_3", None)
+        if layout is not None:
+            try:
+                layout.setContentsMargins(10, 10, 10, 10)
+                layout.setSpacing(12)
+                layout.setStretch(0, 3)
+                layout.setStretch(1, 5)
+                layout.setStretch(2, 2)
+            except Exception:
+                pass
+
+        info_table = getattr(self.ui, "customer_Info", None)
+        if info_table is not None:
+            try:
+                info_table.setMinimumWidth(260)
+                info_table.setMinimumHeight(150)
+                info_table.verticalHeader().setDefaultSectionSize(24)
+                info_table.setWordWrap(False)
+            except Exception:
+                pass
+
+        customer_edit = getattr(self.ui, "customerEdit", None)
+        if customer_edit is not None:
+            try:
+                customer_edit.setMinimumWidth(420)
+                customer_edit.setMinimumHeight(34)
+            except Exception:
+                pass
+
+        filter_row = getattr(self.ui, "horizontalLayout_2", None)
+        if filter_row is not None:
+            try:
+                filter_row.setContentsMargins(0, 0, 0, 0)
+                filter_row.setSpacing(8)
+            except Exception:
+                pass
+
+        for picker in (self.customer_start_picker, self.customer_end_picker):
+            self.set_month_year_picker_compact(picker, month_width=110, year_width=82, control_height=30)
+
+        search_button = getattr(self.ui, "searchButton", None)
+        if search_button is not None:
+            try:
+                search_button.setMinimumHeight(32)
+                search_button.setMaximumHeight(32)
+                search_button.setMinimumWidth(96)
+                search_button.setMaximumWidth(110)
+            except Exception:
+                pass
+
+        load_button = getattr(self.ui, "loadFile", None)
+        if load_button is not None:
+            try:
+                load_button.setMinimumHeight(32)
+                load_button.setMaximumHeight(32)
+                load_button.setMinimumWidth(180)
+                load_button.setMaximumWidth(220)
+            except Exception:
+                pass
+
+        freight_box = getattr(self.ui, "chargeFreight_textBrowser", None)
+        if freight_box is not None:
+            try:
+                freight_box.setMinimumSize(190, 128)
+                freight_box.setMaximumSize(190, 128)
+                freight_box.document().setDocumentMargin(0)
+                freight_box.setAlignment(Qt.AlignCenter)
+            except Exception:
+                pass
+
+    def setup_order_analysis_filter_bar(self):
+        supplier_edit = self.get_order_analysis_supplier_edit()
+        if supplier_edit is None:
+            return
+        parent = supplier_edit.parentWidget()
+        layout = parent.layout() if parent is not None else None
+        if parent is None or layout is None:
+            return
+
+        try:
+            parent.setMinimumHeight(92)
+            parent.setMaximumHeight(92)
+            parent.setMaximumWidth(16777215)
+        except Exception:
+            pass
+        try:
+            layout.setContentsMargins(10, 8, 10, 8)
+            layout.setSpacing(8)
+        except Exception:
+            pass
+
+        label = getattr(self.ui, "enterSupplier_label", None)
+        if label is not None:
+            try:
+                label.setMinimumWidth(150)
+                label.setMaximumWidth(180)
+            except Exception:
+                pass
+
+        try:
+            supplier_edit.setMinimumWidth(280)
+            supplier_edit.setMaximumWidth(360)
+            supplier_edit.setMinimumHeight(34)
+        except Exception:
+            pass
+
+        if getattr(self, "_order_analysis_controls_frame", None) is None:
+            try:
+                layout.addStretch(1)
+            except Exception:
+                pass
+            controls_frame = QFrame(parent)
+            controls_frame.setObjectName("orderAnalysisControls_frame")
+            controls_layout = QHBoxLayout(controls_frame)
+            controls_layout.setContentsMargins(0, 0, 0, 0)
+            controls_layout.setSpacing(8)
+
+            start_picker = MonthYearPicker(controls_frame)
+            start_picker.setObjectName("orderAnalysisStartPicker")
+            end_picker = MonthYearPicker(controls_frame)
+            end_picker.setObjectName("orderAnalysisEndPicker")
+            self.set_month_year_picker_compact(start_picker, month_width=110, year_width=82, control_height=30)
+            self.set_month_year_picker_compact(end_picker, month_width=110, year_width=82, control_height=30)
+            try:
+                start_picker.setDate(self.default_period_start_qdate)
+                end_picker.setDate(self.default_period_end_qdate)
+            except Exception:
+                pass
+
+            controls_layout.addWidget(start_picker)
+            controls_layout.addWidget(end_picker)
+
+            load_button = QPushButton("Show Data", controls_frame)
+            load_button.setObjectName("orderAnalysisLoad_button")
+            load_button.setMinimumHeight(32)
+            load_button.setMaximumHeight(32)
+            load_button.clicked.connect(self.load_order_analysis)
+            controls_layout.addWidget(load_button)
+
+            filter_frame = QFrame(controls_frame)
+            filter_layout = QHBoxLayout(filter_frame)
+            filter_layout.setContentsMargins(8, 0, 0, 0)
+            filter_layout.setSpacing(10)
+            filter_label = QLabel("Show", filter_frame)
+            filter_layout.addWidget(filter_label)
+            show_special = QCheckBox("Special Order", filter_frame)
+            show_phase_out = QCheckBox("Phase Out", filter_frame)
+            show_obsolete = QCheckBox("Obsolete", filter_frame)
+            for checkbox in (show_special, show_phase_out, show_obsolete):
+                checkbox.setChecked(False)
+                checkbox.toggled.connect(self.apply_order_analysis_filters)
+                filter_layout.addWidget(checkbox)
+            controls_layout.addWidget(filter_frame)
+
+            layout.addWidget(controls_frame)
+            self._order_analysis_controls_frame = controls_frame
+            self.order_analysis_start_picker = start_picker
+            self.order_analysis_end_picker = end_picker
+            self.order_analysis_load_button = load_button
+            self.order_analysis_show_special_checkbox = show_special
+            self.order_analysis_show_phase_out_checkbox = show_phase_out
+            self.order_analysis_show_obsolete_checkbox = show_obsolete
+
+    def get_order_analysis_start_picker(self):
+        return self.order_analysis_start_picker
+
+    def get_order_analysis_end_picker(self):
+        return self.order_analysis_end_picker
 
     def setup_sales_table(self):
         table = getattr(self.ui, "salesTable", None)
@@ -5300,7 +5936,9 @@ class MainWindow(QMainWindow):
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         table.setAlternatingRowColors(False)
         table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        table.verticalHeader().setDefaultSectionSize(24)
+        table.setWordWrap(False)
 
     def setup_customer_purchase_table(self):
         table = getattr(self.ui, "customerPurchase_table", None)
@@ -5519,7 +6157,9 @@ class MainWindow(QMainWindow):
 
         item_row = self.get_item_master_row(item_number)
         description = self.get_first(item_row, "item_name", "Item Name", "description", "Description")
-        carton_size = self.get_item_carton_size(item_row)
+        carton_size, item_row = self.ensure_item_carton_size(item_number, item_row=item_row)
+        if not carton_size:
+            return False
         requested_qty = self.parse_float(qty_value)
         if requested_qty <= 0:
             raise ValueError("Quantity must be greater than 0.")
@@ -5734,6 +6374,7 @@ class MainWindow(QMainWindow):
         headers = [
             "Item Number",
             "Item Name",
+            "Status",
             "Sales for Period",
             "Avg Monthly Sales",
             "SOH",
@@ -5751,13 +6392,29 @@ class MainWindow(QMainWindow):
         table.setSelectionBehavior(QAbstractItemView.SelectRows)
         table.setSelectionMode(QAbstractItemView.SingleSelection)
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setSortingEnabled(False)
         table.verticalHeader().setVisible(False)
-        table.horizontalHeader().setSectionResizeMode(self.on_order_order_number_column, QHeaderView.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(self.on_order_item_column, QHeaderView.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(self.on_order_description_column, QHeaderView.Stretch)
-        table.horizontalHeader().setSectionResizeMode(self.on_order_comments_column, QHeaderView.Stretch)
-        for col in (self.on_order_qty_column, self.on_order_supplier_column, self.on_order_ready_date_column, self.on_order_status_column, self.on_order_add_column, self.on_order_remove_column):
-            table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        table.setContextMenuPolicy(Qt.CustomContextMenu)
+        header = table.horizontalHeader()
+        header.setSectionsClickable(True)
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(self.order_analysis_columns["item_number"], QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(self.order_analysis_columns["item_name"], QHeaderView.Stretch)
+        header.setSectionResizeMode(self.order_analysis_columns["planning_status"], QHeaderView.ResizeToContents)
+        for col in range(table.columnCount()):
+            if col in {
+                self.order_analysis_columns["item_number"],
+                self.order_analysis_columns["item_name"],
+                self.order_analysis_columns["planning_status"],
+            }:
+                continue
+            header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        if not table.property("_order_analysis_header_sort_connected"):
+            header.sectionDoubleClicked.connect(self.handle_order_analysis_header_double_click)
+            table.setProperty("_order_analysis_header_sort_connected", True)
+        if not table.property("_order_analysis_context_menu_connected"):
+            table.customContextMenuRequested.connect(self.show_order_analysis_context_menu)
+            table.setProperty("_order_analysis_context_menu_connected", True)
 
         self.setup_order_analysis_clear_button()
         self.setup_order_analysis_export_button()
@@ -5766,7 +6423,7 @@ class MainWindow(QMainWindow):
         supplier_edit = self.get_order_analysis_supplier_edit()
         if supplier_edit is None:
             return
-        parent = supplier_edit.parentWidget()
+        parent = getattr(self, "_order_analysis_controls_frame", None) or supplier_edit.parentWidget()
         layout = parent.layout() if parent is not None else None
         if layout is None:
             return
@@ -5774,6 +6431,8 @@ class MainWindow(QMainWindow):
         if existing is None:
             clear_button = QPushButton("Clear", parent)
             clear_button.setObjectName("orderAnalysisClear_button")
+            clear_button.setMinimumHeight(32)
+            clear_button.setMaximumHeight(32)
             clear_button.clicked.connect(self.clear_order_analysis_page)
             layout.addWidget(clear_button)
             self.ui.orderAnalysisClear_button = clear_button
@@ -5782,7 +6441,7 @@ class MainWindow(QMainWindow):
         supplier_edit = self.get_order_analysis_supplier_edit()
         if supplier_edit is None:
             return
-        parent = supplier_edit.parentWidget()
+        parent = getattr(self, "_order_analysis_controls_frame", None) or supplier_edit.parentWidget()
         layout = parent.layout() if parent is not None else None
         if layout is None:
             return
@@ -5790,9 +6449,33 @@ class MainWindow(QMainWindow):
         if existing is None:
             export_button = QPushButton("Export to Excel", parent)
             export_button.setObjectName("orderAnalysisExport_button")
+            export_button.setMinimumHeight(32)
+            export_button.setMaximumHeight(32)
             export_button.clicked.connect(self.export_order_analysis_to_excel)
             layout.addWidget(export_button)
             self.ui.orderAnalysisExport_button = export_button
+
+    def handle_order_analysis_header_double_click(self, logical_index):
+        table = self.get_order_analysis_table()
+        if table is None or logical_index < 0 or logical_index >= table.columnCount():
+            return
+        if self.order_analysis_sort_column == logical_index:
+            self.order_analysis_sort_descending = not self.order_analysis_sort_descending
+        else:
+            self.order_analysis_sort_column = logical_index
+            self.order_analysis_sort_descending = logical_index in {
+                self.order_analysis_columns["sales_for_period"],
+                self.order_analysis_columns["avg_monthly_sales"],
+                self.order_analysis_columns["soh"],
+                self.order_analysis_columns["stock_on_order"],
+                self.order_analysis_columns["on_order_form"],
+                self.order_analysis_columns["on_next_container"],
+                self.order_analysis_columns["shipped_container"],
+                self.order_analysis_columns["suggested_order"],
+                self.order_analysis_columns["at_risk"],
+            }
+        order = Qt.DescendingOrder if self.order_analysis_sort_descending else Qt.AscendingOrder
+        table.sortItems(logical_index, order)
 
     def clear_order_analysis_page(self):
         supplier_edit = self.get_order_analysis_supplier_edit()
@@ -5804,6 +6487,7 @@ class MainWindow(QMainWindow):
             table.setRowCount(0)
             table.clearSelection()
         self.current_order_analysis_supplier = None
+        self._order_analysis_all_rows = []
 
     def export_order_analysis_to_excel(self):
         if Workbook is None:
@@ -5830,8 +6514,8 @@ class MainWindow(QMainWindow):
         if not export_path.lower().endswith(".xlsx"):
             export_path += ".xlsx"
 
-        start_picker = getattr(self, "item_start_picker", None) or getattr(self, "item_end_picker", None)
-        end_picker = getattr(self, "item_end_picker", None) or getattr(self, "item_start_picker", None)
+        start_picker = self.get_order_analysis_start_picker()
+        end_picker = self.get_order_analysis_end_picker()
         period_from = self.month_start_from_picker(start_picker) if start_picker is not None else None
         period_to = self.month_end_from_picker(end_picker) if end_picker is not None else None
         months_in_period = 0
@@ -6111,14 +6795,19 @@ class MainWindow(QMainWindow):
             return
         table.clear()
         table.setColumnCount(2)
-        table.setHorizontalHeaderLabels(["Container", "ETA"])
+        table.setHorizontalHeaderLabels(["Name", "Due Date"])
         table.setRowCount(0)
         table.setSelectionBehavior(QAbstractItemView.SelectRows)
         table.setSelectionMode(QAbstractItemView.SingleSelection)
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         table.verticalHeader().setVisible(False)
-        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        try:
+            table.setWordWrap(False)
+        except Exception:
+            pass
         self.refresh_containers_list()
 
     def setup_container_entry(self):
@@ -6184,15 +6873,20 @@ class MainWindow(QMainWindow):
             return
 
         text_value = (raw_value or "").strip()
+        try:
+            box.document().setDocumentMargin(0)
+            box.setAlignment(Qt.AlignCenter)
+        except Exception:
+            pass
         if should_charge:
-            box.setHtml('<div style="text-align:center; margin-top:38px; font-size:22px; font-weight:700; color:#8b0000;">Charge Freight</div>')
+            box.setHtml('<div style="text-align:center; font-size:18px; font-weight:700; color:#8b0000; margin-top:42px;">Charge Freight</div>')
             box.setStyleSheet(
                 "QTextBrowser {"
                 "background: #fff1f1;"
                 "color: #8b0000;"
-                "border: 4px solid #d62828;"
+                "border: 3px solid #d62828;"
                 "border-radius: 8px;"
-                "padding: 10px;"
+                "padding: 8px;"
                 "}"
             )
             box.setToolTip(f"Freight flag: {text_value or 'Yes'}")
@@ -6204,7 +6898,7 @@ class MainWindow(QMainWindow):
                 "color: inherit;"
                 "border: 1px solid #b7bcc2;"
                 "border-radius: 8px;"
-                "padding: 10px;"
+                "padding: 8px;"
                 "}"
             )
             box.setToolTip(f"Freight flag: {text_value or 'No'}")
@@ -6353,6 +7047,68 @@ class MainWindow(QMainWindow):
             return False
         self.container_item_completion_selected(item_number)
         return True
+
+    def get_items_carton_column_name(self):
+        available_columns = {name.lower(): name for name in self.get_table_columns("items")}
+        for candidate in ("carton", "CARTON", "carton_qty", "cartonqty", "box_qty", "box"):
+            actual = available_columns.get(candidate.lower())
+            if actual:
+                return actual
+        return None
+
+    def prompt_and_save_item_carton_qty(self, item_number, item_row=None):
+        item_number = (item_number or "").strip()
+        if not item_number or self.db_conn is None:
+            return None
+
+        item_row = item_row or self.get_item_master_row(item_number)
+        current_value = self.parse_float(self.get_first(item_row, "carton", "CARTON", default=0))
+        column_name = self.get_items_carton_column_name()
+        if not column_name:
+            QMessageBox.warning(self, "Missing carton field", "Could not find the carton quantity column in the items table.")
+            return None
+
+        new_value, accepted = QInputDialog.getDouble(
+            self,
+            "Missing carton qty",
+            f"{item_number} has no carton qty saved.\n\nEnter carton qty:",
+            current_value if current_value > 0 else 1.0,
+            0.001,
+            999999999.0,
+            3,
+        )
+        if not accepted:
+            return None
+
+        new_value = float(new_value)
+        if new_value <= 0:
+            QMessageBox.warning(self, "Invalid carton qty", "Carton qty must be greater than 0.")
+            return None
+
+        cur = self.db_conn.cursor()
+        cur.execute(
+            f"UPDATE items SET [{column_name}] = ? WHERE UPPER(TRIM(item_number)) = UPPER(TRIM(?))",
+            (new_value, item_number),
+        )
+        self.db_conn.commit()
+
+        updated_row = dict(item_row or {})
+        updated_row[column_name] = new_value
+        updated_row["carton"] = new_value
+        return updated_row
+
+    def ensure_item_carton_size(self, item_number, item_row=None):
+        item_row = item_row or self.get_item_master_row(item_number)
+        carton_size = self.parse_float(self.get_first(item_row, "carton", "CARTON", default=0))
+        if carton_size > 0:
+            return carton_size, item_row
+
+        updated_row = self.prompt_and_save_item_carton_qty(item_number, item_row=item_row)
+        if updated_row is None:
+            return None, item_row
+
+        carton_size = self.parse_float(self.get_first(updated_row, "carton", "CARTON", default=0))
+        return (carton_size if carton_size > 0 else None), updated_row
 
     def get_item_carton_size(self, item_row):
         carton_size = self.parse_float(self.get_first(item_row, "carton", "CARTON", default=0))
@@ -6580,7 +7336,12 @@ class MainWindow(QMainWindow):
 
         item_row = self.get_item_master_row(item_number)
         description = self.get_first(item_row, "item_name", "Item Name", "description", "Description")
-        carton_size = self.get_item_carton_size(item_row)
+        carton_size, item_row = self.ensure_item_carton_size(item_number, item_row=item_row)
+        if not carton_size:
+            if qty_widget is not None:
+                qty_widget.setFocus()
+                qty_widget.selectAll()
+            return
         cartons = max(1, math.ceil(requested_qty / carton_size))
         rounded_qty = cartons * carton_size
 
@@ -6627,7 +7388,9 @@ class MainWindow(QMainWindow):
 
         if column == self.container_columns["qty"]:
             item_row = self.get_item_master_row(line.get("item_number", ""))
-            carton_size = self.get_item_carton_size(item_row)
+            carton_size, item_row = self.ensure_item_carton_size(line.get("item_number", ""), item_row=item_row)
+            if not carton_size:
+                return
             current_qty = self.parse_float(line.get("qty", 0))
             new_qty, accepted = QInputDialog.getDouble(
                 self,
@@ -6814,8 +7577,16 @@ class MainWindow(QMainWindow):
         for row_data in rows:
             row = table.rowCount()
             table.insertRow(row)
-            table.setItem(row, 0, self.make_container_table_item(row_data["container_ref"]))
-            table.setItem(row, 1, self.make_container_table_item(self.iso_to_display_date(row_data["eta_date"]), align=Qt.AlignCenter))
+            name_text = row_data["container_ref"] or ""
+            due_text = self.iso_to_display_date(row_data["eta_date"])
+            updated_text = self.iso_to_display_date(row_data["updated_on"])
+            name_item = self.make_container_table_item(name_text)
+            due_item = self.make_container_table_item(due_text, align=Qt.AlignCenter)
+            tooltip = f"Name: {name_text}\nDue Date: {due_text or '-'}\nUpdated: {updated_text or '-'}"
+            name_item.setToolTip(tooltip)
+            due_item.setToolTip(tooltip)
+            table.setItem(row, 0, name_item)
+            table.setItem(row, 1, due_item)
         table.resizeRowsToContents()
 
     def reload_current_container_state(self):
@@ -6959,6 +7730,13 @@ class MainWindow(QMainWindow):
                 return self.handle_order_qty_keypress(event)
             if obj is container_ref_widget and event.key() in (Qt.Key_Return, Qt.Key_Enter):
                 self.handle_container_reference_submit()
+                return True
+
+        if obj in self.item_status_checkbox_map:
+            if event.type() in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease):
+                return True
+            if event.type() == QEvent.MouseButtonDblClick:
+                self.toggle_item_planning_status(self.item_status_checkbox_map[obj])
                 return True
 
         if event.type() == QEvent.MouseButtonDblClick:
@@ -8629,6 +9407,8 @@ class MainWindow(QMainWindow):
         header_fill = PatternFill("solid", fgColor="D9E1F2") if PatternFill is not None else None
         title_fill = PatternFill("solid", fgColor="B8CCE4") if PatternFill is not None else None
         note_fill = PatternFill("solid", fgColor="F6F1C1") if PatternFill is not None else None
+        urgent_fill = PatternFill("solid", fgColor="FFC9C9") if PatternFill is not None else None
+        additional_fill = PatternFill("solid", fgColor="FFF5B1") if PatternFill is not None else None
         bold_font = Font(bold=True) if Font is not None else None
         title_font = Font(bold=True, size=14) if Font is not None else None
         thin_side = Side(style="thin", color="000000") if Side is not None else None
@@ -8679,6 +9459,9 @@ class MainWindow(QMainWindow):
             first_item = table.item(table_row, 0)
             meta = first_item.data(Qt.UserRole) if first_item is not None else None
             is_note_row = isinstance(meta, dict) and meta.get("note_row")
+            is_urgent_row = isinstance(meta, dict) and bool(meta.get("urgent"))
+            is_additional_row = isinstance(meta, dict) and bool(meta.get("additional"))
+            row_fill = urgent_fill if is_urgent_row else (additional_fill if is_additional_row else None)
 
             if is_note_row:
                 note_text = first_item.text() if first_item is not None else ""
@@ -8706,6 +9489,8 @@ class MainWindow(QMainWindow):
                 else:
                     cell_value = item.text() if item is not None else ""
                 worksheet.cell(row=row_index, column=export_col, value=cell_value)
+                if row_fill is not None:
+                    worksheet.cell(row=row_index, column=export_col).fill = row_fill
                 if Alignment is not None:
                     align_horizontal = "right" if export_col in (4, 5) else "left"
                     worksheet.cell(row=row_index, column=export_col).alignment = Alignment(horizontal=align_horizontal, vertical="center")
@@ -8713,21 +9498,39 @@ class MainWindow(QMainWindow):
                     worksheet.cell(row=row_index, column=export_col).border = cell_border
             row_index += 1
 
+        standard_cartons = 0.0
+        urgent_cartons = 0.0
+        additional_cartons = 0.0
+        for line in self.get_container_line_dicts():
+            cartons_value = float(line.get("cartons", 0) or 0)
+            if bool(line.get("urgent")):
+                urgent_cartons += cartons_value
+            elif bool(line.get("additional")):
+                additional_cartons += float(line.get("additional_cartons", cartons_value) or cartons_value)
+            else:
+                standard_cartons += cartons_value
+        total_rows = [
+            ("Standard Cartons", standard_cartons),
+            ("Urgent Cartons", urgent_cartons),
+            ("Additional Cartons", additional_cartons),
+            ("Total Cartons", standard_cartons + urgent_cartons + additional_cartons),
+        ]
         total_row = row_index + 1
-        total_label_cell = worksheet.cell(row=total_row, column=4, value="Total Cartons")
-        total_value_cell = worksheet.cell(row=total_row, column=5, value=total_cartons)
-        if bold_font is not None:
-            total_label_cell.font = bold_font
-            total_value_cell.font = bold_font
-        if header_fill is not None:
-            total_label_cell.fill = header_fill
-            total_value_cell.fill = header_fill
-        if Alignment is not None:
-            total_label_cell.alignment = Alignment(horizontal="right", vertical="center")
-            total_value_cell.alignment = Alignment(horizontal="right", vertical="center")
-        if cell_border is not None:
-            total_label_cell.border = cell_border
-            total_value_cell.border = cell_border
+        for offset, (label_text, value) in enumerate(total_rows):
+            label_cell = worksheet.cell(row=total_row + offset, column=4, value=label_text)
+            value_cell = worksheet.cell(row=total_row + offset, column=5, value=value)
+            if bold_font is not None:
+                label_cell.font = bold_font
+                value_cell.font = bold_font
+            if header_fill is not None:
+                label_cell.fill = header_fill
+                value_cell.fill = header_fill
+            if Alignment is not None:
+                label_cell.alignment = Alignment(horizontal="right", vertical="center")
+                value_cell.alignment = Alignment(horizontal="right", vertical="center")
+            if cell_border is not None:
+                label_cell.border = cell_border
+                value_cell.border = cell_border
 
         for column in range(1, len(export_headers) + 1):
             max_length = 0
@@ -8802,24 +9605,69 @@ $mail.Display()
             message = message.replace("\r\n", "\n").strip()
             raise RuntimeError(message)
 
-    def export_container_to_excel_and_email(self):
+    def create_container_export(self, show_message=False):
         table = getattr(self.ui, "container_table", None)
         if table is None or table.rowCount() == 0:
             QMessageBox.warning(self, "Export Container", "There are no container rows to export.")
-            return
+            return None
 
         container_ref = self.get_container_ref_text() or (self.current_container_ref or "")
         if not container_ref:
             QMessageBox.warning(self, "Export Container", "Enter or load a container reference first.")
-            return
+            return None
 
         export_path = self.build_container_export_path()
         try:
             self.write_container_export_workbook(export_path)
         except Exception as exc:
             QMessageBox.critical(self, "Export Container", f"Could not create Excel export.\n\n{exc}")
+            return None
+
+        if show_message:
+            QMessageBox.information(
+                self,
+                "Export Container",
+                f"Excel export created successfully.\n\nFile: {export_path}"
+            )
+        return export_path
+
+    def export_container_to_excel(self):
+        self.create_container_export(show_message=True)
+
+    def email_container_export(self):
+        export_path = self.create_container_export(show_message=False)
+        if export_path is None:
             return
 
+        container_ref = self.get_container_ref_text() or (self.current_container_ref or "")
+        eta_widget = getattr(self.ui, "eta_dateEdit", None)
+        eta_display = eta_widget.date().toString("dd/MM/yyyy") if eta_widget is not None and eta_widget.date().isValid() else date.today().strftime("%d/%m/%Y")
+
+        try:
+            self.create_outlook_container_email(export_path, container_ref, eta_display)
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Exported, but email not created",
+                f"The Excel file was created here:\n{export_path}\n\n"
+                f"But the email draft could not be opened.\n\n"
+                f"{exc}\n\n"
+                "The export still succeeded."
+            )
+            return
+
+        QMessageBox.information(
+            self,
+            "Email Container",
+            f"A new email draft was created with the latest export attached.\n\nFile: {export_path}"
+        )
+
+    def export_container_to_excel_and_email(self):
+        export_path = self.create_container_export(show_message=False)
+        if export_path is None:
+            return
+
+        container_ref = self.get_container_ref_text() or (self.current_container_ref or "")
         eta_widget = getattr(self.ui, "eta_dateEdit", None)
         eta_display = eta_widget.date().toString("dd/MM/yyyy") if eta_widget is not None and eta_widget.date().isValid() else date.today().strftime("%d/%m/%Y")
 
@@ -9144,14 +9992,8 @@ $mail.Display()
         return None
 
     def rerun_order_analysis_if_ready(self, *_args):
-        supplier_edit = self.get_order_analysis_supplier_edit()
-        if supplier_edit is None:
-            return
-        typed = supplier_edit.text().strip()
-        if not typed:
-            return
-        if self.find_supplier_name(typed):
-            self.load_order_analysis(show_warning=False)
+        # Order Analysis now runs only when the user clicks Show Data.
+        return
 
     def sql_in_clause(self, values):
         if not values:
@@ -9673,6 +10515,8 @@ $mail.Display()
 
     def clear_item_summary_fields(self):
         self.current_item_number = None
+        self.current_item_planning_status = PLANNING_STATUS_ACTIVE
+        self.update_item_status_controls(PLANNING_STATUS_ACTIVE)
         label_names = [
             "itemNumber_box", "itemName_box", "itemGroup_box", "rollSpool_box", "mtUnit_box",
             "box_box", "palletCarton_box", "totalQtySold_box", "avrMonthlySales_box",
@@ -10068,6 +10912,11 @@ $mail.Display()
 
         table.setModel(model)
         table.resizeRowsToContents()
+        try:
+            for row_index in range(model.rowCount()):
+                table.setRowHeight(row_index, 24)
+        except Exception:
+            pass
 
     def get_customer_files_root(self):
         root_text = str(self.settings.value("customerFilesRoot", "") or "").strip()
@@ -10788,8 +11637,8 @@ $mail.Display()
             self.clear_item_summary_fields()
             return
 
-        start_date = self.month_start_from_picker(self.item_start_picker or self.item_end_picker)
-        end_date = self.month_end_from_picker(self.item_end_picker or self.item_start_picker)
+        start_date = self.month_start_from_picker(self.item_start_picker)
+        end_date = self.month_end_from_picker(self.item_end_picker)
         if start_date > end_date:
             QMessageBox.warning(self, "Invalid date range", "Start month cannot be after end month.")
             return
@@ -10838,6 +11687,7 @@ $mail.Display()
                 (valid_item,),
             )
         )
+        planning_status = self.get_item_planning_status(valid_item, item_row)
         stock_row = self.row_to_dict(
             self.db_one(
                 "SELECT * FROM stock WHERE UPPER(TRIM(item_number)) = UPPER(TRIM(?)) LIMIT 1",
@@ -10875,6 +11725,8 @@ $mail.Display()
         adjusted_order = self.round_order_quantity(adjusted_order, carton_size, pallet_size)
 
         self.current_item_number = valid_item
+        self.current_item_planning_status = planning_status
+        self.update_item_status_controls(planning_status)
         self.set_label_text("itemNumber_box", valid_item)
         self.set_label_text("itemName_box", self.get_first(item_row, "item_name", "Item Name", "description", "Description"))
         self.set_label_text("itemGroup_box", self.get_first(item_row, "Custom List 1", default=""))
@@ -11135,8 +11987,8 @@ $mail.Display()
         supplier_edit.setText(supplier_name)
         self.current_order_analysis_supplier = supplier_name
 
-        start_date = self.month_start_from_picker(self.item_start_picker or self.item_end_picker)
-        end_date = self.month_end_from_picker(self.item_end_picker or self.item_start_picker)
+        start_date = self.month_start_from_picker(self.get_order_analysis_start_picker())
+        end_date = self.month_end_from_picker(self.get_order_analysis_end_picker())
         if start_date > end_date:
             if show_warning:
                 QMessageBox.warning(self, "Invalid date range", "Start month cannot be after end month.")
@@ -11155,7 +12007,8 @@ $mail.Display()
                 COALESCE(NULLIF(TRIM(item_name), ''), NULLIF(TRIM(description), ''), '') AS item_name,
                 COALESCE({supplier_expr}, '') AS supplier_name,
                 COALESCE(carton, 0) AS carton,
-                COALESCE(pallet, 0) AS pallet
+                COALESCE(pallet, 0) AS pallet,
+                COALESCE(NULLIF(TRIM(planning_status), ''), 'ACTIVE') AS planning_status
             FROM items
             WHERE TRIM(COALESCE(item_number, '')) <> ''
               AND ({supplier_match_clause})
@@ -11206,6 +12059,7 @@ $mail.Display()
                     rows_to_show.append({
                         "item_number": item_number,
                         "item_name": (item_row["item_name"] or "").strip(),
+                        "planning_status": self.normalise_planning_status(item_row.get("planning_status")),
                         "sales_for_period": total_qty,
                         "avg_monthly_sales": avg_monthly_qty,
                         "soh": on_hand,
@@ -11230,7 +12084,8 @@ $mail.Display()
             )
         )
 
-        self.populate_order_analysis_table(rows_to_show)
+        self._order_analysis_all_rows = rows_to_show
+        self.apply_order_analysis_filters()
 
     def populate_order_analysis_table(self, rows):
         table = self.get_order_analysis_table()
@@ -11253,9 +12108,11 @@ $mail.Display()
         for row_data in rows:
             row = table.rowCount()
             table.insertRow(row)
+            planning_status = self.normalise_planning_status(row_data.get("planning_status"))
             values = [
                 row_data.get("item_number", ""),
                 row_data.get("item_name", ""),
+                self.planning_status_display_text(planning_status),
                 self.format_value(row_data.get("sales_for_period", 0)),
                 self.format_value(row_data.get("avg_monthly_sales", 0)),
                 self.format_value(row_data.get("soh", 0)),
@@ -11266,14 +12123,89 @@ $mail.Display()
                 self.format_value(row_data.get("suggested_order", 0)),
                 self.format_value(row_data.get("at_risk", 0)),
             ]
+            raw_sort_values = [
+                (row_data.get("item_number", "") or "").strip().lower(),
+                (row_data.get("item_name", "") or "").strip().lower(),
+                self.planning_status_display_text(planning_status).lower(),
+                self.parse_float(row_data.get("sales_for_period", 0)),
+                self.parse_float(row_data.get("avg_monthly_sales", 0)),
+                self.parse_float(row_data.get("soh", 0)),
+                self.parse_float(row_data.get("stock_on_order", 0)),
+                self.parse_float(row_data.get("on_order_form", 0)),
+                self.parse_float(row_data.get("on_next_container", 0)),
+                self.parse_float(row_data.get("shipped_container", 0)),
+                self.parse_float(row_data.get("suggested_order", 0)),
+                self.parse_float(row_data.get("at_risk", 0)),
+            ]
             for col, value in enumerate(values):
-                item = QTableWidgetItem(str(value))
+                item = SortableTableWidgetItem(str(value))
                 item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                item.setData(Qt.UserRole, raw_sort_values[col])
                 if col in numeric_columns:
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 table.setItem(row, col, item)
 
+            self.apply_order_analysis_row_style(row, planning_status)
+
         table.resizeRowsToContents()
+        if self.order_analysis_sort_column is not None and table.rowCount() > 0:
+            order = Qt.DescendingOrder if self.order_analysis_sort_descending else Qt.AscendingOrder
+            table.sortItems(self.order_analysis_sort_column, order)
+
+    def apply_order_analysis_row_style(self, row, planning_status):
+        table = self.get_order_analysis_table()
+        if table is None or row < 0:
+            return
+        planning_status = self.normalise_planning_status(planning_status)
+        if planning_status == PLANNING_STATUS_ACTIVE:
+            return
+        colors = self.planning_status_colors(planning_status)
+        bg = QColor(colors["bg"])
+        fg = QColor(colors["fg"])
+        for col in range(table.columnCount()):
+            item = table.item(row, col)
+            if item is None:
+                continue
+            item.setBackground(QBrush(bg))
+            item.setForeground(QBrush(fg))
+
+    def show_order_analysis_context_menu(self, pos):
+        table = self.get_order_analysis_table()
+        if table is None:
+            return
+        item = table.itemAt(pos)
+        if item is None:
+            return
+        row = item.row()
+        item_cell = table.item(row, self.order_analysis_columns["item_number"])
+        item_number = item_cell.text().strip() if item_cell is not None and item_cell.text() else ""
+        if not item_number:
+            return
+
+        menu = QMenu(table)
+        status_menu = menu.addMenu("Set Planning Status")
+        current_status = self.get_item_planning_status(item_number)
+        actions = {}
+        for status in PLANNING_STATUSES:
+            action = status_menu.addAction(self.planning_status_display_text(status))
+            action.setCheckable(True)
+            action.setChecked(self.normalise_planning_status(current_status) == status)
+            actions[action] = status
+        menu.addSeparator()
+        open_item_action = menu.addAction("Open Item Summary")
+
+        chosen = menu.exec(table.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen == open_item_action:
+            self.open_item_summary_from_order_analysis(item_number)
+            return
+        if chosen in actions:
+            if self.set_item_planning_status(item_number, actions[chosen]):
+                self.update_order_analysis_status_cache(item_number, actions[chosen])
+                if self.current_item_number and self.current_item_number.strip().upper() == item_number.upper():
+                    self.current_item_planning_status = self.normalise_planning_status(actions[chosen])
+                    self.update_item_status_controls(self.current_item_planning_status)
 
     def handle_order_analysis_table_double_click(self, row, column):
         table = self.get_order_analysis_table()
