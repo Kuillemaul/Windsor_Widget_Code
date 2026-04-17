@@ -1440,8 +1440,8 @@ class Ui_MainWindow(object):
         self.frame_39.setObjectName(u"frame_39")
         sizePolicy2.setHeightForWidth(self.frame_39.sizePolicy().hasHeightForWidth())
         self.frame_39.setSizePolicy(sizePolicy2)
-        self.frame_39.setMinimumSize(QSize(528, 70))
-        self.frame_39.setMaximumSize(QSize(528, 70))
+        self.frame_39.setMinimumSize(QSize(0, 92))
+        self.frame_39.setMaximumSize(QSize(16777215, 120))
         self.frame_39.setFrameShape(QFrame.Shape.StyledPanel)
         self.frame_39.setFrameShadow(QFrame.Shadow.Raised)
         self.horizontalLayout_14 = QHBoxLayout(self.frame_39)
@@ -1459,6 +1459,7 @@ class Ui_MainWindow(object):
         self.customerSaba_lineEdit.setObjectName(u"customerSaba_lineEdit")
         sizePolicy.setHeightForWidth(self.customerSaba_lineEdit.sizePolicy().hasHeightForWidth())
         self.customerSaba_lineEdit.setSizePolicy(sizePolicy)
+        self.customerSaba_lineEdit.setMinimumSize(QSize(360, 0))
 
         self.horizontalLayout_14.addWidget(self.customerSaba_lineEdit)
 
@@ -2140,7 +2141,7 @@ class Ui_MainWindow(object):
 "li.unchecked::marker { content: \"\\2610\"; }\n"
 "li.checked::marker { content: \"\\2612\"; }\n"
 "</style></head><body style=\" font-family:'Segoe UI'; font-size:9pt; font-weight:400; font-style:normal;\">\n"
-"<p style=\" margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;\">Widget Version 1.0b Written and Designed by Bradley Mayze</p></body></html>", None))
+"<p style=\" margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;\">Widget Version 1.2.0 Written and Designed by Bradley Mayze</p></body></html>", None))
         self.searchButton.setText(QCoreApplication.translate("MainWindow", u"Show data", None))
         self.loadFile.setText(QCoreApplication.translate("MainWindow", u"Load Customer File", None))
         self.combineStateAccountsCheck.setText(QCoreApplication.translate("MainWindow", u"Combine", None))
