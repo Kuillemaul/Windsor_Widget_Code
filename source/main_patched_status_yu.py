@@ -4132,7 +4132,7 @@ class MainWindow(QMainWindow):
             self.ui.radioHighContrast.toggled.connect(lambda checked: checked and self.apply_theme("high"))
 
         if self.lead_time_picker is not None:
-            self.lead_time_picker.setRange(1, 18)
+            self.lead_time_picker.setRange(1, 24)
             self.lead_time_picker.setSingleStep(1)
             self.lead_time_picker.setValue(14)
             self.lead_time_picker.setAlignment(Qt.AlignCenter)
