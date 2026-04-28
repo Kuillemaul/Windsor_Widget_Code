@@ -59,6 +59,7 @@ from PySide6.QtWidgets import (QFrame, QTextEdit,
     QDialogButtonBox,
     QStyledItemDelegate,
     QMenu,
+    QFontDialog,
 )
 from PySide6.QtCharts import (
     QChart,
@@ -75,6 +76,7 @@ from yu_order_workflow import YUOrderEntryDialog, load_yu_review_module
 
 TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
 TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
+TABLE_FORMAT_SETTINGS_PREFIX = "table_format"
 APP_VERSION = "1.1.8"
 APP_DESIGNER = "Bradley Mayze"
 
@@ -257,13 +259,798 @@ def reset_table_font_size(table, settings=None, scope_key=None):
     apply_table_font_size(table, default_size, settings=settings, scope_key=scope_key, persist=False)
 
 
-def install_table_font_context_menu(owner, table, settings, scope_key, settings_token=None):
+def table_format_settings_key(scope_key, table, option):
+    token = _safe_table_settings_token(table, scope_key)
+    option = re.sub(r"[^A-Za-z0-9_-]+", "_", str(option or "").strip()) or "option"
+    return f"{TABLE_FORMAT_SETTINGS_PREFIX}/{scope_key}/{token}/{option}"
+
+
+def _settings_bool(settings, key, default=False):
+    if settings is None:
+        return bool(default)
+    try:
+        value = settings.value(key, default)
+    except Exception:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return bool(default)
+
+
+def _settings_text(settings, key, default=""):
+    if settings is None:
+        return default
+    try:
+        value = settings.value(key, default)
+    except Exception:
+        return default
+    return default if value is None else str(value)
+
+
+def _persist_table_format_value(settings, scope_key, table, option, value):
+    if settings is None or not scope_key or table is None:
+        return
+    try:
+        settings.setValue(table_format_settings_key(scope_key, table, option), value)
+    except Exception:
+        pass
+
+
+def _table_format_theme_name(owner=None):
+    try:
+        if owner is not None and hasattr(owner, "ui"):
+            ui = owner.ui
+            if getattr(ui, "radioHighContrast", None) is not None and ui.radioHighContrast.isChecked():
+                return "high"
+            if getattr(ui, "radioLight", None) is not None and ui.radioLight.isChecked():
+                return "light"
+            if getattr(ui, "radioDark", None) is not None and ui.radioDark.isChecked():
+                return "dark"
+        main_window = getattr(owner, "main_window", None)
+        if main_window is not None:
+            return _table_format_theme_name(main_window)
+        settings = getattr(owner, "settings", None)
+        if settings is not None:
+            return str(settings.value("theme", "dark") or "dark")
+    except Exception:
+        pass
+    return "dark"
+
+
+def _table_format_colors(owner=None):
+    theme = _table_format_theme_name(owner)
+    if theme == "light":
+        return {
+            "alternate": "#eef4fb",
+            "grid": "#aeb8c3",
+        }
+    if theme == "high":
+        return {
+            "alternate": "#111900",
+            "grid": "#ffff00",
+        }
+    return {
+        "alternate": "#303338",
+        "grid": "#5f6368",
+    }
+
+
+def _ensure_table_format_defaults(table):
     if table is None:
         return
-    if table.property("_table_font_menu_installed"):
-        saved_size = stored_table_font_size(settings, scope_key, table)
-        if saved_size:
-            apply_table_font_size(table, saved_size, settings=settings, scope_key=scope_key, persist=False)
+    if table.property("_table_format_defaults_stored"):
+        return
+    table.setProperty("_table_format_defaults_stored", True)
+    try:
+        table.setProperty("_table_format_default_stylesheet", table.styleSheet() or "")
+    except Exception:
+        table.setProperty("_table_format_default_stylesheet", "")
+    try:
+        font = table.font()
+        table.setProperty("_table_format_default_font_family", font.family())
+        table.setProperty("_table_format_default_font_size", int(font.pointSize() or 10))
+        table.setProperty("_table_format_default_font_bold", bool(font.bold()))
+        table.setProperty("_table_format_default_font_italic", bool(font.italic()))
+    except Exception:
+        table.setProperty("_table_format_default_font_family", "")
+        table.setProperty("_table_format_default_font_size", 10)
+        table.setProperty("_table_format_default_font_bold", False)
+        table.setProperty("_table_format_default_font_italic", False)
+    try:
+        table.setProperty("_table_format_default_alternating", bool(table.alternatingRowColors()))
+    except Exception:
+        table.setProperty("_table_format_default_alternating", False)
+    try:
+        table.setProperty("_table_format_default_grid", bool(table.showGrid()))
+    except Exception:
+        table.setProperty("_table_format_default_grid", True)
+    try:
+        table.setProperty("_table_format_default_word_wrap", bool(table.wordWrap()))
+    except Exception:
+        table.setProperty("_table_format_default_word_wrap", True)
+
+
+def sync_table_item_font(table, font):
+    if table is None or not isinstance(table, QTableWidget):
+        return
+    blocker = QSignalBlocker(table)
+    try:
+        for row in range(table.rowCount()):
+            for column in range(table.columnCount()):
+                item = table.item(row, column)
+                if item is None:
+                    continue
+                item.setFont(QFont(font))
+    finally:
+        del blocker
+
+
+def apply_table_font_choice(table, font, settings=None, scope_key=None, persist=True):
+    if table is None or font is None:
+        return
+    try:
+        font = QFont(font)
+        table.setFont(font)
+        sync_table_item_font(table, font)
+        if table.verticalHeader() is not None:
+            table.verticalHeader().setDefaultSectionSize(max(24, int(font.pointSize() or 10) * 2 + 8))
+        try:
+            table.resizeRowsToContents()
+        except Exception:
+            pass
+        try:
+            table.viewport().update()
+        except Exception:
+            pass
+    except Exception:
+        return
+
+    if persist and settings is not None and scope_key:
+        _persist_table_format_value(settings, scope_key, table, "font_family", font.family())
+        _persist_table_format_value(settings, scope_key, table, "font_size", int(font.pointSize() or 10))
+        _persist_table_format_value(settings, scope_key, table, "font_bold", bool(font.bold()))
+        _persist_table_format_value(settings, scope_key, table, "font_italic", bool(font.italic()))
+        try:
+            settings.setValue(table_font_settings_key(scope_key, table), int(font.pointSize() or 10))
+        except Exception:
+            pass
+
+
+def apply_table_row_height_mode(table, mode, settings=None, scope_key=None, persist=True):
+    if table is None:
+        return
+    mode = str(mode or "normal").strip().lower()
+    if mode not in {"compact", "normal", "tall", "fit"}:
+        mode = "normal"
+    try:
+        header = table.verticalHeader()
+        size = current_table_font_size(table)
+        if mode == "compact":
+            header.setDefaultSectionSize(max(18, size + 12))
+        elif mode == "tall":
+            header.setDefaultSectionSize(max(34, size * 3 + 8))
+        elif mode == "fit":
+            table.resizeRowsToContents()
+        else:
+            header.setDefaultSectionSize(max(24, size * 2 + 8))
+        table.setProperty("_table_format_row_height_mode", mode)
+        table.viewport().update()
+    except Exception:
+        pass
+    if persist and settings is not None and scope_key:
+        _persist_table_format_value(settings, scope_key, table, "row_height_mode", mode)
+
+
+def apply_table_format_styles(table, owner=None):
+    if table is None:
+        return
+    _ensure_table_format_defaults(table)
+    colors = _table_format_colors(owner)
+    base = str(table.property("_table_format_default_stylesheet") or "")
+    format_style = f"""
+QTableWidget, QTableView {{
+    alternate-background-color: {colors["alternate"]};
+    gridline-color: {colors["grid"]};
+}}
+"""
+    try:
+        table.setStyleSheet((base + "\n" + format_style).strip())
+    except Exception:
+        pass
+
+
+def set_table_alternating_rows(table, enabled, settings=None, scope_key=None, owner=None, persist=True):
+    if table is None:
+        return
+    _ensure_table_format_defaults(table)
+    try:
+        table.setAlternatingRowColors(bool(enabled))
+        apply_table_format_styles(table, owner=owner)
+        table.viewport().update()
+    except Exception:
+        pass
+    if persist and settings is not None and scope_key:
+        _persist_table_format_value(settings, scope_key, table, "alternating_rows", bool(enabled))
+
+
+def set_table_gridlines(table, enabled, settings=None, scope_key=None, owner=None, persist=True):
+    if table is None:
+        return
+    _ensure_table_format_defaults(table)
+    try:
+        table.setShowGrid(bool(enabled))
+        apply_table_format_styles(table, owner=owner)
+        table.viewport().update()
+    except Exception:
+        pass
+    if persist and settings is not None and scope_key:
+        _persist_table_format_value(settings, scope_key, table, "gridlines", bool(enabled))
+
+
+def set_table_word_wrap(table, enabled, settings=None, scope_key=None, persist=True):
+    if table is None:
+        return
+    try:
+        table.setWordWrap(bool(enabled))
+        if enabled:
+            table.resizeRowsToContents()
+        table.viewport().update()
+    except Exception:
+        pass
+    if persist and settings is not None and scope_key:
+        _persist_table_format_value(settings, scope_key, table, "word_wrap", bool(enabled))
+
+
+def apply_saved_table_format(table, settings=None, scope_key=None, owner=None):
+    if table is None:
+        return
+    _ensure_table_format_defaults(table)
+
+    saved_size = stored_table_font_size(settings, scope_key, table) if settings is not None and scope_key else None
+
+    family = _settings_text(settings, table_format_settings_key(scope_key, table, "font_family"), "") if settings is not None and scope_key else ""
+    format_size = _settings_text(settings, table_format_settings_key(scope_key, table, "font_size"), "") if settings is not None and scope_key else ""
+    bold = _settings_bool(settings, table_format_settings_key(scope_key, table, "font_bold"), False) if settings is not None and scope_key else False
+    italic = _settings_bool(settings, table_format_settings_key(scope_key, table, "font_italic"), False) if settings is not None and scope_key else False
+
+    if family or format_size:
+        font = QFont(table.font())
+        if family:
+            font.setFamily(family)
+        try:
+            size = int(format_size or saved_size or font.pointSize() or 10)
+            if size > 0:
+                font.setPointSize(size)
+        except Exception:
+            pass
+        font.setBold(bold)
+        font.setItalic(italic)
+        apply_table_font_choice(table, font, settings=settings, scope_key=scope_key, persist=False)
+    elif saved_size:
+        apply_table_font_size(table, saved_size, settings=settings, scope_key=scope_key, persist=False)
+
+    default_alt = bool(table.property("_table_format_default_alternating") or False)
+    default_grid = bool(table.property("_table_format_default_grid") if table.property("_table_format_default_grid") is not None else True)
+    default_wrap = bool(table.property("_table_format_default_word_wrap") if table.property("_table_format_default_word_wrap") is not None else True)
+
+    alternating = _settings_bool(settings, table_format_settings_key(scope_key, table, "alternating_rows"), default_alt) if settings is not None and scope_key else default_alt
+    gridlines = _settings_bool(settings, table_format_settings_key(scope_key, table, "gridlines"), default_grid) if settings is not None and scope_key else default_grid
+    word_wrap = _settings_bool(settings, table_format_settings_key(scope_key, table, "word_wrap"), default_wrap) if settings is not None and scope_key else default_wrap
+    row_height_mode = _settings_text(settings, table_format_settings_key(scope_key, table, "row_height_mode"), "normal") if settings is not None and scope_key else "normal"
+
+    set_table_alternating_rows(table, alternating, settings=settings, scope_key=scope_key, owner=owner, persist=False)
+    set_table_gridlines(table, gridlines, settings=settings, scope_key=scope_key, owner=owner, persist=False)
+    set_table_word_wrap(table, word_wrap, settings=settings, scope_key=scope_key, persist=False)
+    apply_table_row_height_mode(table, row_height_mode, settings=settings, scope_key=scope_key, persist=False)
+
+
+def reset_table_format(table, settings=None, scope_key=None, owner=None):
+    if table is None:
+        return
+    _ensure_table_format_defaults(table)
+    if settings is not None and scope_key:
+        try:
+            settings.remove(f"{TABLE_FORMAT_SETTINGS_PREFIX}/{scope_key}/{_safe_table_settings_token(table, scope_key)}")
+        except Exception:
+            pass
+        try:
+            settings.remove(table_font_settings_key(scope_key, table))
+        except Exception:
+            pass
+
+    try:
+        base = str(table.property("_table_format_default_stylesheet") or "")
+        table.setStyleSheet(base)
+    except Exception:
+        pass
+
+    try:
+        font = QFont()
+        family = str(table.property("_table_format_default_font_family") or "")
+        size = int(table.property("_table_format_default_font_size") or 10)
+        if family:
+            font.setFamily(family)
+        font.setPointSize(size)
+        font.setBold(bool(table.property("_table_format_default_font_bold") or False))
+        font.setItalic(bool(table.property("_table_format_default_font_italic") or False))
+        table.setFont(font)
+        sync_table_item_font(table, font)
+    except Exception:
+        reset_table_font_size(table, settings=settings, scope_key=scope_key)
+
+    try:
+        table.setAlternatingRowColors(bool(table.property("_table_format_default_alternating") or False))
+    except Exception:
+        pass
+    try:
+        table.setShowGrid(bool(table.property("_table_format_default_grid") if table.property("_table_format_default_grid") is not None else True))
+    except Exception:
+        pass
+    try:
+        table.setWordWrap(bool(table.property("_table_format_default_word_wrap") if table.property("_table_format_default_word_wrap") is not None else True))
+    except Exception:
+        pass
+    apply_table_row_height_mode(table, "normal", settings=settings, scope_key=scope_key, persist=False)
+    try:
+        table.viewport().update()
+    except Exception:
+        pass
+
+
+def choose_table_font(owner, table, settings, scope_key):
+    if table is None:
+        return
+    parent = owner if isinstance(owner, QWidget) else table
+    try:
+        selected_font, ok = QFontDialog.getFont(QFont(table.font()), parent, "Choose Table Font")
+    except Exception:
+        return
+    if ok:
+        apply_table_font_choice(table, selected_font, settings=settings, scope_key=scope_key, persist=True)
+
+
+def _table_display_name(table):
+    if table is None:
+        return "Table"
+    name = ""
+    try:
+        name = str(table.objectName() or "").strip()
+    except Exception:
+        name = ""
+    if not name:
+        try:
+            name = str(table.windowTitle() or "").strip()
+        except Exception:
+            name = ""
+    if not name:
+        return "Table"
+    name = re.sub(r"[_-]+", " ", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    return name[:1].upper() + name[1:] if name else "Table"
+
+
+def _copy_table_text_to_clipboard(table):
+    if table is None:
+        return
+    ranges = []
+    try:
+        ranges = table.selectedRanges() if isinstance(table, QTableWidget) else []
+    except Exception:
+        ranges = []
+
+    if not ranges:
+        row_start = 0
+        row_end = table.rowCount() - 1
+        col_start = 0
+        col_end = table.columnCount() - 1
+    else:
+        selected_range = ranges[0]
+        row_start = selected_range.topRow()
+        row_end = selected_range.bottomRow()
+        col_start = selected_range.leftColumn()
+        col_end = selected_range.rightColumn()
+
+    lines = []
+    headers = []
+    for col in range(col_start, col_end + 1):
+        header_item = table.horizontalHeaderItem(col) if hasattr(table, "horizontalHeaderItem") else None
+        headers.append(header_item.text() if header_item is not None else "")
+    if headers:
+        lines.append("\t".join(headers))
+
+    for row in range(row_start, row_end + 1):
+        values = []
+        for col in range(col_start, col_end + 1):
+            item = table.item(row, col) if hasattr(table, "item") else None
+            values.append(item.text() if item is not None else "")
+        lines.append("\t".join(values))
+
+    try:
+        QApplication.clipboard().setText("\n".join(lines))
+    except Exception:
+        pass
+
+
+class TablePopoutDialog(QDialog):
+    """Read-only pop-out snapshot of any table with the same formatting controls."""
+
+    def __init__(self, owner, source_table, settings=None, scope_key="table", parent=None):
+        super().__init__(parent if parent is not None else (owner if isinstance(owner, QWidget) else None))
+        self.owner = owner
+        self.main_window = getattr(owner, "main_window", owner)
+        self.source_table = source_table
+        self.settings = settings
+        self.scope_key = f"{scope_key}_popout"
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
+        self.setWindowTitle(f"Pop-out - {_table_display_name(source_table)}")
+        self.resize(1450, 850)
+        self.build_ui()
+        self.populate_from_source()
+
+    def build_ui(self):
+        layout = QVBoxLayout(self)
+        top_row = QHBoxLayout()
+        self.info_label = QLabel("Table snapshot. Use Refresh Snapshot to pull through current table data.", self)
+        self.info_label.setWordWrap(True)
+        top_row.addWidget(self.info_label, 1)
+
+        self.refresh_button = QPushButton("Refresh Snapshot", self)
+        self.refresh_button.clicked.connect(self.populate_from_source)
+        top_row.addWidget(self.refresh_button)
+
+        self.copy_button = QPushButton("Copy", self)
+        self.copy_button.clicked.connect(lambda: _copy_table_text_to_clipboard(self.table))
+        top_row.addWidget(self.copy_button)
+
+        self.close_button = QPushButton("Close", self)
+        self.close_button.clicked.connect(self.close)
+        top_row.addWidget(self.close_button)
+        layout.addLayout(top_row)
+
+        self.table = QTableWidget(self)
+        self.table.setObjectName(f"{str(getattr(self.source_table, 'objectName', lambda: '')() or 'table')}_popout")
+        self.table.setProperty("_table_popout_disable", True)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self.show_context_menu)
+        layout.addWidget(self.table, 1)
+
+    def _model_header_text(self, model, orientation, index):
+        if model is None:
+            return ""
+        try:
+            value = model.headerData(index, orientation, Qt.DisplayRole)
+            return "" if value is None else str(value)
+        except Exception:
+            return ""
+
+    def _source_row_count(self):
+        if self.source_table is None:
+            return 0
+        try:
+            return int(self.source_table.rowCount())
+        except Exception:
+            model = getattr(self.source_table, "model", lambda: None)()
+            return int(model.rowCount()) if model is not None else 0
+
+    def _source_column_count(self):
+        if self.source_table is None:
+            return 0
+        try:
+            return int(self.source_table.columnCount())
+        except Exception:
+            model = getattr(self.source_table, "model", lambda: None)()
+            return int(model.columnCount()) if model is not None else 0
+
+    def _make_snapshot_item(self, row, col):
+        source = self.source_table
+        source_item = None
+        if isinstance(source, QTableWidget):
+            try:
+                source_item = source.item(row, col)
+            except Exception:
+                source_item = None
+            if source_item is not None:
+                try:
+                    item = QTableWidgetItem(source_item)
+                except Exception:
+                    item = QTableWidgetItem(source_item.text())
+                item.setFlags((item.flags() | Qt.ItemIsSelectable | Qt.ItemIsEnabled) & ~Qt.ItemIsEditable)
+                return item
+
+        model = getattr(source, "model", lambda: None)() if source is not None else None
+        if model is None:
+            return QTableWidgetItem("")
+
+        try:
+            index = model.index(row, col)
+        except Exception:
+            return QTableWidgetItem("")
+
+        try:
+            display_value = index.data(Qt.DisplayRole)
+            item = QTableWidgetItem("" if display_value is None else str(display_value))
+        except Exception:
+            item = QTableWidgetItem("")
+
+        for role, setter in (
+            (Qt.FontRole, item.setFont),
+            (Qt.ForegroundRole, item.setForeground),
+            (Qt.BackgroundRole, item.setBackground),
+            (Qt.TextAlignmentRole, item.setTextAlignment),
+        ):
+            try:
+                value = index.data(role)
+                if value is not None:
+                    setter(value)
+            except Exception:
+                pass
+        item.setFlags((item.flags() | Qt.ItemIsSelectable | Qt.ItemIsEnabled) & ~Qt.ItemIsEditable)
+        return item
+
+    def populate_from_source(self):
+        source = self.source_table
+        if source is None:
+            return
+        row_count = self._source_row_count()
+        col_count = self._source_column_count()
+        model = getattr(source, "model", lambda: None)()
+
+        self.table.setSortingEnabled(False)
+        self.table.clear()
+        self.table.setRowCount(row_count)
+        self.table.setColumnCount(col_count)
+
+        for col in range(col_count):
+            header_item = None
+            if isinstance(source, QTableWidget):
+                try:
+                    header_item = source.horizontalHeaderItem(col)
+                except Exception:
+                    header_item = None
+            header_text = header_item.text() if header_item is not None else self._model_header_text(model, Qt.Horizontal, col)
+            self.table.setHorizontalHeaderItem(col, QTableWidgetItem(header_text))
+
+        for row in range(row_count):
+            v_header_item = None
+            if isinstance(source, QTableWidget):
+                try:
+                    v_header_item = source.verticalHeaderItem(row)
+                except Exception:
+                    v_header_item = None
+            v_header_text = v_header_item.text() if v_header_item is not None else self._model_header_text(model, Qt.Vertical, row)
+            if v_header_text:
+                self.table.setVerticalHeaderItem(row, QTableWidgetItem(v_header_text))
+
+        for row in range(row_count):
+            for col in range(col_count):
+                self.table.setItem(row, col, self._make_snapshot_item(row, col))
+
+        try:
+            self.table.setFont(QFont(source.font()))
+        except Exception:
+            pass
+        try:
+            self.table.setStyleSheet(source.styleSheet() or "")
+        except Exception:
+            pass
+        try:
+            self.table.setAlternatingRowColors(bool(source.alternatingRowColors()))
+        except Exception:
+            pass
+        try:
+            self.table.setShowGrid(bool(source.showGrid()))
+        except Exception:
+            pass
+        try:
+            self.table.setWordWrap(bool(source.wordWrap()))
+        except Exception:
+            pass
+        try:
+            self.table.verticalHeader().setVisible(bool(source.verticalHeader().isVisible()))
+        except Exception:
+            self.table.verticalHeader().setVisible(False)
+
+        source_header = getattr(source, "horizontalHeader", lambda: None)()
+        target_header = self.table.horizontalHeader()
+        target_header.setStretchLastSection(False)
+        for col in range(col_count):
+            try:
+                self.table.setColumnHidden(col, bool(source.isColumnHidden(col)))
+            except Exception:
+                pass
+            try:
+                self.table.setColumnWidth(col, max(40, int(source.columnWidth(col))))
+            except Exception:
+                pass
+            try:
+                target_header.setSectionResizeMode(col, QHeaderView.Interactive)
+            except Exception:
+                pass
+        if source_header is not None:
+            try:
+                target_header.setSortIndicatorShown(source_header.isSortIndicatorShown())
+                target_header.setSortIndicator(source_header.sortIndicatorSection(), source_header.sortIndicatorOrder())
+            except Exception:
+                pass
+
+        for row in range(row_count):
+            try:
+                self.table.setRowHidden(row, bool(source.isRowHidden(row)))
+            except Exception:
+                pass
+            try:
+                self.table.setRowHeight(row, max(18, int(source.rowHeight(row))))
+            except Exception:
+                pass
+
+        apply_saved_table_format(self.table, settings=self.settings, scope_key=self.scope_key, owner=self)
+        try:
+            self.table.setSortingEnabled(True)
+        except Exception:
+            pass
+
+    def show_context_menu(self, pos):
+        menu = QMenu(self.table)
+        copy_action = menu.addAction("Copy Selection")
+        menu.addSeparator()
+        add_table_format_menu(self, menu, self.table, self.settings, self.scope_key)
+        viewport = self.table.viewport()
+        chosen_action = menu.exec(viewport.mapToGlobal(pos) if viewport is not None else self.table.mapToGlobal(pos))
+        if chosen_action == copy_action:
+            _copy_table_text_to_clipboard(self.table)
+
+
+def open_table_popout(owner, table, settings=None, scope_key="table"):
+    if table is None:
+        return
+    dialog = TablePopoutDialog(owner, table, settings=settings, scope_key=scope_key)
+    app = QApplication.instance()
+    if app is not None:
+        windows = getattr(app, "_windsor_table_popout_windows", None)
+        if windows is None:
+            windows = []
+            setattr(app, "_windsor_table_popout_windows", windows)
+        windows.append(dialog)
+
+        def _forget_window(*_args, dlg=dialog, collection=windows):
+            try:
+                if dlg in collection:
+                    collection.remove(dlg)
+            except Exception:
+                pass
+
+        dialog.destroyed.connect(_forget_window)
+    dialog.show()
+    try:
+        dialog.raise_()
+        dialog.activateWindow()
+    except Exception:
+        pass
+
+
+def add_table_format_menu(owner, menu, table, settings, scope_key):
+    if menu is None or table is None:
+        return None
+
+    _ensure_table_format_defaults(table)
+    apply_saved_table_format(table, settings=settings, scope_key=scope_key, owner=owner)
+
+    if not bool(table.property("_table_popout_disable")):
+        popout_action = menu.addAction("Pop Out Table")
+        popout_action.triggered.connect(
+            lambda _checked=False, own=owner, tbl=table, s=settings, scope=scope_key: open_table_popout(own, tbl, s, scope)
+        )
+        menu.addSeparator()
+
+    format_menu = menu.addMenu("Format Table")
+
+    font_menu = format_menu.addMenu("Font Size")
+    current_size = current_table_font_size(table)
+    for size in TABLE_FONT_SIZE_OPTIONS:
+        action = font_menu.addAction(str(size))
+        action.setCheckable(True)
+        action.setChecked(size == current_size)
+        action.triggered.connect(
+            lambda _checked=False, tbl=table, selected_size=size, s=settings, scope=scope_key: apply_table_font_size(
+                tbl,
+                selected_size,
+                settings=s,
+                scope_key=scope,
+                persist=True,
+            )
+        )
+
+    choose_font_action = format_menu.addAction("Choose Font...")
+    choose_font_action.triggered.connect(
+        lambda _checked=False, own=owner, tbl=table, s=settings, scope=scope_key: choose_table_font(own, tbl, s, scope)
+    )
+
+    format_menu.addSeparator()
+
+    alternating_action = format_menu.addAction("Alternating Row Shading")
+    alternating_action.setCheckable(True)
+    alternating_action.setChecked(bool(table.alternatingRowColors()))
+    alternating_action.triggered.connect(
+        lambda checked=False, tbl=table, s=settings, scope=scope_key, own=owner: set_table_alternating_rows(
+            tbl, checked, settings=s, scope_key=scope, owner=own, persist=True
+        )
+    )
+
+    grid_action = format_menu.addAction("Gridlines")
+    grid_action.setCheckable(True)
+    try:
+        grid_action.setChecked(bool(table.showGrid()))
+    except Exception:
+        grid_action.setChecked(True)
+    grid_action.triggered.connect(
+        lambda checked=False, tbl=table, s=settings, scope=scope_key, own=owner: set_table_gridlines(
+            tbl, checked, settings=s, scope_key=scope, owner=own, persist=True
+        )
+    )
+
+    wrap_action = format_menu.addAction("Word Wrap")
+    wrap_action.setCheckable(True)
+    try:
+        wrap_action.setChecked(bool(table.wordWrap()))
+    except Exception:
+        wrap_action.setChecked(True)
+    wrap_action.triggered.connect(
+        lambda checked=False, tbl=table, s=settings, scope=scope_key: set_table_word_wrap(
+            tbl, checked, settings=s, scope_key=scope, persist=True
+        )
+    )
+
+    row_height_menu = format_menu.addMenu("Row Height")
+    row_mode = str(table.property("_table_format_row_height_mode") or "normal")
+    row_options = [
+        ("Compact", "compact"),
+        ("Normal", "normal"),
+        ("Tall", "tall"),
+        ("Fit Contents", "fit"),
+    ]
+    for label, mode in row_options:
+        action = row_height_menu.addAction(label)
+        action.setCheckable(True)
+        action.setChecked(row_mode == mode)
+        action.triggered.connect(
+            lambda _checked=False, tbl=table, selected_mode=mode, s=settings, scope=scope_key: apply_table_row_height_mode(
+                tbl, selected_mode, settings=s, scope_key=scope, persist=True
+            )
+        )
+
+    format_menu.addSeparator()
+
+    auto_columns_action = format_menu.addAction("Auto-size Columns")
+    auto_columns_action.triggered.connect(lambda _checked=False, tbl=table: tbl.resizeColumnsToContents())
+
+    auto_rows_action = format_menu.addAction("Auto-size Rows")
+    auto_rows_action.triggered.connect(lambda _checked=False, tbl=table: tbl.resizeRowsToContents())
+
+    reset_action = format_menu.addAction("Reset Table Formatting")
+    reset_action.triggered.connect(
+        lambda _checked=False, tbl=table, s=settings, scope=scope_key, own=owner: reset_table_format(
+            tbl,
+            settings=s,
+            scope_key=scope,
+            owner=own,
+        )
+    )
+
+    return format_menu
+
+
+def install_table_font_context_menu(owner, table, settings, scope_key, settings_token=None):
+    if table is None:
         return
 
     if settings_token:
@@ -271,17 +1058,19 @@ def install_table_font_context_menu(owner, table, settings, scope_key, settings_
     elif not str(table.objectName() or "").strip():
         table.setObjectName(_safe_table_settings_token(table, scope_key))
 
-    table.setProperty("_table_font_menu_installed", True)
+    _ensure_table_format_defaults(table)
     table.setProperty("_table_font_scope_key", scope_key)
     table.setProperty("_table_font_default_size", current_table_font_size(table))
+    apply_saved_table_format(table, settings=settings, scope_key=scope_key, owner=owner)
+
+    if table.property("_table_font_menu_installed"):
+        return
+
+    table.setProperty("_table_font_menu_installed", True)
     table.setContextMenuPolicy(Qt.CustomContextMenu)
     table.customContextMenuRequested.connect(
         lambda pos, tbl=table, own=owner, s=settings, scope=scope_key: show_table_font_context_menu(own, tbl, pos, s, scope)
     )
-
-    saved_size = stored_table_font_size(settings, scope_key, table)
-    if saved_size:
-        apply_table_font_size(table, saved_size, settings=settings, scope_key=scope_key, persist=False)
 
 
 def show_table_font_context_menu(owner, table, pos, settings, scope_key):
@@ -289,24 +1078,7 @@ def show_table_font_context_menu(owner, table, pos, settings, scope_key):
         return
 
     menu = QMenu(table)
-    font_menu = menu.addMenu("Font Size")
-    current_size = current_table_font_size(table)
-
-    for size in TABLE_FONT_SIZE_OPTIONS:
-        action = font_menu.addAction(str(size))
-        action.setCheckable(True)
-        action.setChecked(size == current_size)
-        action.triggered.connect(
-            lambda _checked=False, tbl=table, selected_size=size, s=settings, scope=scope_key: apply_table_font_size(
-                tbl, selected_size, settings=s, scope_key=scope, persist=True
-            )
-        )
-
-    font_menu.addSeparator()
-    reset_action = font_menu.addAction("Reset")
-    reset_action.triggered.connect(
-        lambda _checked=False, tbl=table, s=settings, scope=scope_key: reset_table_font_size(tbl, settings=s, scope_key=scope)
-    )
+    add_table_format_menu(owner, menu, table, settings, scope_key)
 
     viewport = getattr(table, "viewport", lambda: None)()
     if viewport is not None:
@@ -782,6 +1554,7 @@ class ShipmentsWindow(QMainWindow):
         self._loading_table_data = False
         self._handling_table_change = False
         self.supplier_names = []
+        self.product_group_names = []
         self._qty_delegate = ShipmentComboBoxDelegate(SHIPMENT_QTY_OPTIONS, self)
         self._status_delegate = ShipmentComboBoxDelegate(SHIPMENT_STATUS_OPTIONS, self)
         self._type_delegate = ShipmentComboBoxDelegate(SHIPMENT_TYPE_OPTIONS, self)
@@ -971,15 +1744,12 @@ class ShipmentsWindow(QMainWindow):
             table.setContextMenuPolicy(Qt.CustomContextMenu)
             table.customContextMenuRequested.connect(self.show_shipments_table_context_menu)
 
-        saved_size = stored_table_font_size(self.main_window.settings, "shipments_window", table)
-        if saved_size:
-            apply_table_font_size(
-                table,
-                saved_size,
-                settings=self.main_window.settings,
-                scope_key="shipments_window",
-                persist=False,
-            )
+        apply_saved_table_format(
+            table,
+            settings=self.main_window.settings,
+            scope_key="shipments_window",
+            owner=self,
+        )
 
     def handle_shipment_header_double_click(self, table, logical_index):
         if table is None or logical_index is None or logical_index < 0:
@@ -1034,31 +1804,7 @@ class ShipmentsWindow(QMainWindow):
             open_container_action.setEnabled(bool(container_no))
             menu.addSeparator()
 
-        font_menu = menu.addMenu("Font Size")
-        current_size = current_table_font_size(table)
-        for size in TABLE_FONT_SIZE_OPTIONS:
-            action = font_menu.addAction(str(size))
-            action.setCheckable(True)
-            action.setChecked(size == current_size)
-            action.triggered.connect(
-                lambda _checked=False, tbl=table, selected_size=size: apply_table_font_size(
-                    tbl,
-                    selected_size,
-                    settings=self.main_window.settings,
-                    scope_key="shipments_window",
-                    persist=True,
-                )
-            )
-
-        font_menu.addSeparator()
-        reset_action = font_menu.addAction("Reset")
-        reset_action.triggered.connect(
-            lambda _checked=False, tbl=table: reset_table_font_size(
-                tbl,
-                settings=self.main_window.settings,
-                scope_key="shipments_window",
-            )
-        )
+        add_table_format_menu(self, menu, table, self.main_window.settings, "shipments_window")
 
         viewport = getattr(table, "viewport", lambda: None)()
         global_pos = viewport.mapToGlobal(pos) if viewport is not None else table.mapToGlobal(pos)
@@ -3029,6 +3775,7 @@ class MainWindow(QMainWindow):
         self.customer_file_preview_dialog = None
         self.sales_table_frozen_helper = None
         self.customer_purchase_frozen_helper = None
+        self.current_item_purchase_months = []
 
         self.customer_start_picker = getattr(self.ui, "startMonthPickerCustomer_2", None)
         self.customer_end_picker = getattr(self.ui, "endMonthPickerCustomer", None)
@@ -3045,6 +3792,7 @@ class MainWindow(QMainWindow):
         self._logo_label = None
         self.order_item_completer = None
         self.order_analysis_supplier_completer = None
+        self.order_analysis_group_completer = None
         self.saba_customer_completer = None
         self.saba_show_all_checkbox = None
         self.saba_pack_filter_checkboxes = {}
@@ -3053,6 +3801,9 @@ class MainWindow(QMainWindow):
         self.combine_threads_checkbox = None
         self.current_saba_customer = None
         self.current_order_analysis_supplier = None
+        self.current_order_analysis_mode = "supplier"
+        self.current_order_analysis_filter_value = None
+        self.order_analysis_mode_buttons = {}
         self.current_item_planning_status = PLANNING_STATUS_ACTIVE
         self.item_status_checkboxes = {}
         self.item_status_checkbox_map = {}
@@ -3133,6 +3884,8 @@ class MainWindow(QMainWindow):
         self.ensure_on_order_lines_table()
         self.ensure_on_order_meta_table()
         self.ensure_supplier_master_table()
+        self.ensure_sales_optional_columns()
+        self.ensure_customer_flag_columns()
         self.ensure_shipment_tables()
         self.ensure_item_planning_status_column()
         self.load_reference_lists()
@@ -3450,7 +4203,34 @@ class MainWindow(QMainWindow):
                     continue
                 tables.append(table)
 
+        custom_context_tables = {
+            "order_table",
+            "onOrder_table",
+            "container_table",
+            "tableWidget",  # order analysis table
+        }
+
         for table in tables:
+            if not str(table.property("_table_font_settings_token") or "").strip():
+                table.setProperty("_table_font_settings_token", f"main_window/{table.objectName()}")
+
+            apply_saved_table_format(
+                table,
+                settings=self.settings,
+                scope_key="main_window",
+                owner=self,
+            )
+
+            # Some tables already have a business-specific right-click menu.
+            # Those menus call add_table_format_menu() themselves, so do not attach
+            # a second generic menu to the same right-click event.
+            if table.objectName() in custom_context_tables:
+                continue
+            if bool(table.property("_container_context_menu_connected")):
+                continue
+            if bool(table.property("_order_analysis_context_menu_connected")):
+                continue
+
             install_table_font_context_menu(
                 self,
                 table,
@@ -3458,6 +4238,26 @@ class MainWindow(QMainWindow):
                 "main_window",
                 settings_token=f"main_window/{table.objectName()}",
             )
+
+    def apply_saved_table_format_to_all_tables(self):
+        seen_ids = set()
+        for table_class in (QTableWidget, QTableView):
+            for table in self.findChildren(table_class):
+                if table is None or id(table) in seen_ids:
+                    continue
+                seen_ids.add(id(table))
+                object_name = str(table.objectName() or "").strip()
+                if not object_name or object_name.startswith("qt_") or object_name.endswith("_frozen"):
+                    continue
+                if not str(table.property("_table_font_settings_token") or "").strip():
+                    table.setProperty("_table_font_settings_token", f"main_window/{object_name}")
+                apply_saved_table_format(
+                    table,
+                    settings=self.settings,
+                    scope_key="main_window",
+                    owner=self,
+                )
+
 
     def install_all_table_header_double_click_sort(self):
         tables = []
@@ -4491,6 +5291,35 @@ class MainWindow(QMainWindow):
             cur.execute("ALTER TABLE items ADD COLUMN planning_status TEXT")
         self.db_conn.commit()
 
+    def db_identifier(self, name):
+        text = str(name or "").replace("]", "]]" ).strip()
+        return f"[{text}]"
+
+    def ensure_customer_flag_columns(self):
+        if self.db_conn is None or not self.has_table("customers"):
+            return
+
+        existing_columns = {str(name).lower(): name for name in self.get_table_columns("customers")}
+        desired_columns = [
+            ("charge_freight", "NVARCHAR(10) NULL", "TEXT"),
+            ("card_on_file", "NVARCHAR(10) NULL", "TEXT"),
+            ("send_proforma", "NVARCHAR(10) NULL", "TEXT"),
+        ]
+
+        cur = self.db_conn.cursor()
+        changed = False
+        for column_name, sqlserver_type, sqlite_type in desired_columns:
+            if column_name.lower() in existing_columns:
+                continue
+            if self.db_engine == "sqlserver":
+                cur.execute(f"ALTER TABLE customers ADD {self.db_identifier(column_name)} {sqlserver_type}")
+            else:
+                cur.execute(f"ALTER TABLE customers ADD COLUMN {column_name} {sqlite_type}")
+            changed = True
+
+        if changed:
+            self.db_conn.commit()
+
     def normalise_planning_status(self, value):
         text_value = str(value or "").strip().upper()
         if text_value in {"", "ACTIVE", "NORMAL", "STANDARD"}:
@@ -4514,7 +5343,31 @@ class MainWindow(QMainWindow):
         return PLANNING_STATUS_DISPLAY.get(self.normalise_planning_status(status), PLANNING_STATUS_DISPLAY[PLANNING_STATUS_ACTIVE])
 
     def planning_status_colors(self, status):
-        return PLANNING_STATUS_COLORS.get(self.normalise_planning_status(status), PLANNING_STATUS_COLORS[PLANNING_STATUS_ACTIVE])
+        normalised_status = self.normalise_planning_status(status)
+        theme_name = self.current_theme_name() if hasattr(self, "current_theme_name") else "dark"
+
+        if theme_name == "light":
+            light_colors = {
+                PLANNING_STATUS_ACTIVE: {"bg": "#f4f7fa", "fg": "#111111", "border": "#667789", "check_bg": "#ffffff", "check_border": "#667789"},
+                PLANNING_STATUS_SPECIAL_ORDER: {"bg": "#dceeff", "fg": "#093a65", "border": "#2f80d0", "check_bg": "#ffffff", "check_border": "#2f80d0"},
+                PLANNING_STATUS_PHASE_OUT: {"bg": "#fff2cc", "fg": "#5f3b00", "border": "#d49a00", "check_bg": "#ffffff", "check_border": "#d49a00"},
+                PLANNING_STATUS_OBSOLETE: {"bg": "#ffe1e1", "fg": "#7b0000", "border": "#cf3030", "check_bg": "#ffffff", "check_border": "#cf3030"},
+            }
+            return light_colors.get(normalised_status, light_colors[PLANNING_STATUS_ACTIVE])
+
+        if theme_name == "high":
+            high_colors = {
+                PLANNING_STATUS_ACTIVE: {"bg": "#000000", "fg": "#ffff00", "border": "#ffff00", "check_bg": "#000000", "check_border": "#ffff00"},
+                PLANNING_STATUS_SPECIAL_ORDER: {"bg": "#000000", "fg": "#00ffff", "border": "#00ffff", "check_bg": "#000000", "check_border": "#00ffff"},
+                PLANNING_STATUS_PHASE_OUT: {"bg": "#000000", "fg": "#ffcc00", "border": "#ffcc00", "check_bg": "#000000", "check_border": "#ffcc00"},
+                PLANNING_STATUS_OBSOLETE: {"bg": "#000000", "fg": "#ff66ff", "border": "#ff66ff", "check_bg": "#000000", "check_border": "#ff66ff"},
+            }
+            return high_colors.get(normalised_status, high_colors[PLANNING_STATUS_ACTIVE])
+
+        dark_colors = dict(PLANNING_STATUS_COLORS.get(normalised_status, PLANNING_STATUS_COLORS[PLANNING_STATUS_ACTIVE]))
+        dark_colors.setdefault("check_bg", "#202124")
+        dark_colors.setdefault("check_border", dark_colors.get("border", "#5A5F69"))
+        return dark_colors
 
     def get_item_planning_status(self, item_number=None, item_row=None):
         if isinstance(item_row, dict):
@@ -4587,11 +5440,14 @@ class MainWindow(QMainWindow):
         if self.item_status_value_label is not None:
             self.item_status_value_label.setText(self.planning_status_display_text(status))
         if self.item_status_frame is not None:
+            check_bg = colors.get("check_bg", colors.get("bg", "#ffffff"))
+            check_border = colors.get("check_border", colors.get("border", "#5A5F69"))
             self.item_status_frame.setStyleSheet(
                 f"QFrame#itemStatus_frame {{ background-color: {colors['bg']}; border: 2px solid {colors['border']}; border-radius: 8px; }}"
-                f"QLabel {{ color: {colors['fg']}; font-weight: 600; }}"
-                f"QCheckBox {{ color: {colors['fg']}; spacing: 6px; }}"
-                f"QCheckBox::indicator {{ width: 16px; height: 16px; }}"
+                f"QFrame#itemStatus_frame QLabel {{ color: {colors['fg']}; font-weight: 800; background-color: transparent; }}"
+                f"QFrame#itemStatus_frame QCheckBox {{ color: {colors['fg']}; spacing: 6px; font-weight: 700; background-color: transparent; }}"
+                f"QFrame#itemStatus_frame QCheckBox::indicator {{ width: 15px; height: 15px; border: 1px solid {check_border}; background-color: {check_bg}; }}"
+                f"QFrame#itemStatus_frame QCheckBox::indicator:checked {{ background-color: {colors['border']}; border: 1px solid {colors['fg']}; }}"
             )
 
     def toggle_item_planning_status(self, status):
@@ -5805,30 +6661,7 @@ class MainWindow(QMainWindow):
         remove_action.setEnabled(bool(has_row))
         menu.addSeparator()
 
-        font_menu = menu.addMenu("Font Size")
-        current_size = current_table_font_size(table)
-        for size in TABLE_FONT_SIZE_OPTIONS:
-            action = font_menu.addAction(str(size))
-            action.setCheckable(True)
-            action.setChecked(size == current_size)
-            action.triggered.connect(
-                lambda _checked=False, tbl=table, selected_size=size: apply_table_font_size(
-                    tbl,
-                    selected_size,
-                    settings=self.settings,
-                    scope_key="main_window",
-                    persist=True,
-                )
-            )
-        font_menu.addSeparator()
-        reset_action = font_menu.addAction("Reset")
-        reset_action.triggered.connect(
-            lambda _checked=False, tbl=table: reset_table_font_size(
-                tbl,
-                settings=self.settings,
-                scope_key="main_window",
-            )
-        )
+        add_table_format_menu(self, menu, table, self.settings, "main_window")
 
         viewport = getattr(table, "viewport", lambda: None)()
         global_pos = viewport.mapToGlobal(pos) if viewport is not None else table.mapToGlobal(pos)
@@ -6183,7 +7016,9 @@ class MainWindow(QMainWindow):
                 month_key TEXT,
                 quantity REAL,
                 price REAL,
-                extended REAL
+                extended REAL,
+                invoice_no TEXT,
+                freight_amount REAL
             )
             """
         )
@@ -6197,6 +7032,8 @@ class MainWindow(QMainWindow):
             ("quantity", "REAL"),
             ("price", "REAL"),
             ("extended", "REAL"),
+            ("invoice_no", "TEXT"),
+            ("freight_amount", "REAL"),
         ]
         existing_columns = {row[1] for row in cur.execute("PRAGMA table_info(sales)").fetchall()}
         for column_name, ddl in desired_columns:
@@ -6206,6 +7043,30 @@ class MainWindow(QMainWindow):
         cur.execute("CREATE INDEX IF NOT EXISTS idx_sales_item_date ON sales(item_number, sale_date)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_sales_customer_date ON sales(customer_name, sale_date)")
         self.db_conn.commit()
+
+    def ensure_sales_optional_columns(self):
+        if self.db_conn is None or not self.has_table("sales"):
+            return
+
+        existing_columns = {str(name).lower(): name for name in self.get_table_columns("sales")}
+        desired_columns = [
+            ("invoice_no", "NVARCHAR(80) NULL", "TEXT"),
+            ("freight_amount", "FLOAT NULL", "REAL"),
+        ]
+
+        cur = self.db_conn.cursor()
+        changed = False
+        for column_name, sqlserver_type, sqlite_type in desired_columns:
+            if column_name.lower() in existing_columns:
+                continue
+            if self.db_engine == "sqlserver":
+                cur.execute(f"ALTER TABLE sales ADD {self.db_identifier(column_name)} {sqlserver_type}")
+            else:
+                cur.execute(f"ALTER TABLE sales ADD COLUMN {column_name} {sqlite_type}")
+            changed = True
+
+        if changed:
+            self.db_conn.commit()
 
     def ensure_stock_table(self):
         if self.db_engine == "sqlserver":
@@ -6506,6 +7367,30 @@ class MainWindow(QMainWindow):
             supplier_names.append(supplier_name)
 
         self.supplier_names = sorted(supplier_names, key=lambda value: value.casefold())
+
+        product_group_names = []
+        group_seen = set()
+        group_columns = self.get_items_group_column_names() if self.has_table("items") else []
+        if group_columns:
+            group_selects = []
+            for column_name in group_columns:
+                quoted = self.db_identifier(column_name)
+                group_selects.append(
+                    f"SELECT DISTINCT TRIM({quoted}) AS product_group FROM items WHERE TRIM(COALESCE({quoted}, '')) <> ''"
+                )
+            group_rows = self.db_all(
+                "\nUNION\n".join(group_selects) + "\nORDER BY product_group COLLATE NOCASE"
+            )
+            for row in group_rows:
+                product_group = (row["product_group"] or "").strip()
+                if not product_group:
+                    continue
+                key = product_group.casefold()
+                if key in group_seen:
+                    continue
+                group_seen.add(key)
+                product_group_names.append(product_group)
+        self.product_group_names = sorted(product_group_names, key=lambda value: value.casefold())
 
     # -----------------------------
     # UI configuration
@@ -6911,7 +7796,10 @@ class MainWindow(QMainWindow):
         return getattr(self.ui, "sabaSales_table", None)
 
     def build_items_group_expression(self, alias=False):
-        candidate_names = ["item_group", "group_name", "group", "itemgroup", "Item Group", "Group"]
+        candidate_names = [
+            "Custom List 1", "custom_list_1", "customlist1", "custom list 1",
+            "item_group", "group_name", "group", "itemgroup", "Item Group", "Group"
+        ]
         available_columns = {name.lower(): name for name in self.get_table_columns("items")}
         parts = []
         for candidate in candidate_names:
@@ -6922,6 +7810,32 @@ class MainWindow(QMainWindow):
             return "''" if alias else "''"
         expr = f"COALESCE({', '.join(parts)}, '')"
         return f"{expr} AS item_group" if alias else expr
+
+    def get_items_group_column_names(self):
+        candidate_names = [
+            "Custom List 1", "custom_list_1", "customlist1", "custom list 1",
+            "item_group", "group_name", "group", "itemgroup", "Item Group", "Group"
+        ]
+        available_columns = {name.lower(): name for name in self.get_table_columns("items")}
+        resolved = []
+        seen = set()
+        for candidate in candidate_names:
+            actual = available_columns.get(candidate.lower())
+            if not actual:
+                continue
+            key = actual.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            resolved.append(actual)
+        return resolved
+
+    def build_items_group_match_clause(self):
+        columns = self.get_items_group_column_names()
+        if not columns:
+            return "", []
+        conditions = [f"UPPER(TRIM(COALESCE({self.db_identifier(column_name)}, ''))) = UPPER(TRIM(?))" for column_name in columns]
+        return " OR ".join(conditions), columns
 
     def build_items_supplier_expression(self, alias=False):
         candidate_names = ["supplier_name", "supplier_code", "Column1", "Supplier"]
@@ -6997,11 +7911,21 @@ class MainWindow(QMainWindow):
         return True
 
     def setup_supplier_autocomplete(self):
+        self.setup_order_analysis_autocomplete()
+
+    def setup_order_analysis_autocomplete(self):
         edit = self.get_order_analysis_supplier_edit()
         if edit is None:
             return
-        supplier_values = sorted({(name or "").strip() for name in self.supplier_names if (name or "").strip()}, key=lambda value: value.casefold())
-        completer = QCompleter(supplier_values, self)
+
+        if self.get_order_analysis_mode() == "group":
+            values = sorted({(name or "").strip() for name in self.product_group_names if (name or "").strip()}, key=lambda value: value.casefold())
+            placeholder = "Enter product group"
+        else:
+            values = sorted({(name or "").strip() for name in self.supplier_names if (name or "").strip()}, key=lambda value: value.casefold())
+            placeholder = "Enter supplier"
+
+        completer = QCompleter(values, self)
         completer.setCaseSensitivity(Qt.CaseInsensitive)
         completer.setFilterMode(Qt.MatchStartsWith)
         completer.setCompletionMode(QCompleter.PopupCompletion)
@@ -7011,7 +7935,49 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         edit.setCompleter(completer)
-        self.order_analysis_supplier_completer = completer
+        edit.setPlaceholderText(placeholder)
+
+        if self.get_order_analysis_mode() == "group":
+            self.order_analysis_group_completer = completer
+        else:
+            self.order_analysis_supplier_completer = completer
+
+    def get_order_analysis_mode(self):
+        mode = str(getattr(self, "current_order_analysis_mode", "supplier") or "supplier").strip().lower()
+        return "group" if mode == "group" else "supplier"
+
+    def set_order_analysis_mode(self, mode, clear_text=True):
+        new_mode = "group" if str(mode or "").strip().lower() == "group" else "supplier"
+        if self.get_order_analysis_mode() == new_mode and not clear_text:
+            return
+
+        self.current_order_analysis_mode = new_mode
+        edit = self.get_order_analysis_supplier_edit()
+        if edit is not None and clear_text:
+            edit.clear()
+            edit.setFocus()
+        self.setup_order_analysis_autocomplete()
+        self.update_order_analysis_mode_button_styles()
+
+    def update_order_analysis_mode_button_styles(self):
+        buttons = getattr(self, "order_analysis_mode_buttons", {}) or {}
+        active_mode = self.get_order_analysis_mode()
+        for mode, button in buttons.items():
+            if button is None:
+                continue
+            is_active = mode == active_mode
+            button.setChecked(is_active)
+            if is_active:
+                button.setStyleSheet(
+                    "QPushButton { background:#d62828; color:white; border:2px solid #ff4b4b; "
+                    "border-radius:6px; padding:4px 8px; font-size:13px; font-weight:700; }"
+                )
+            else:
+                button.setStyleSheet(
+                    "QPushButton { background:#3a3f46; color:white; border:1px solid #5b626b; "
+                    "border-radius:6px; padding:4px 8px; font-size:13px; font-weight:600; }"
+                    "QPushButton:hover { background:#4b525c; }"
+                )
 
     def setup_date_ranges(self):
         row = self.db_one(
@@ -7145,6 +8111,8 @@ class MainWindow(QMainWindow):
                 freight_box.setMaximumSize(190, 128)
                 freight_box.document().setDocumentMargin(0)
                 freight_box.setAlignment(Qt.AlignCenter)
+                freight_box.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                freight_box.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
             except Exception:
                 pass
 
@@ -7158,8 +8126,8 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            parent.setMinimumHeight(92)
-            parent.setMaximumHeight(92)
+            parent.setMinimumHeight(104)
+            parent.setMaximumHeight(104)
             parent.setMaximumWidth(16777215)
         except Exception:
             pass
@@ -7172,10 +8140,40 @@ class MainWindow(QMainWindow):
         label = getattr(self.ui, "enterSupplier_label", None)
         if label is not None:
             try:
-                label.setMinimumWidth(150)
-                label.setMaximumWidth(180)
+                label.hide()
             except Exception:
                 pass
+
+        if getattr(self, "_order_analysis_mode_frame", None) is None:
+            mode_frame = QFrame(parent)
+            mode_frame.setObjectName("orderAnalysisMode_frame")
+            mode_layout = QVBoxLayout(mode_frame)
+            mode_layout.setContentsMargins(0, 0, 0, 0)
+            mode_layout.setSpacing(5)
+
+            supplier_button = QPushButton("Enter Supplier", mode_frame)
+            supplier_button.setObjectName("orderAnalysisSupplierMode_button")
+            group_button = QPushButton("Enter Groups", mode_frame)
+            group_button.setObjectName("orderAnalysisGroupMode_button")
+            for button in (supplier_button, group_button):
+                button.setCheckable(True)
+                button.setMinimumWidth(150)
+                button.setMaximumWidth(160)
+                button.setMinimumHeight(34)
+                button.setMaximumHeight(34)
+                mode_layout.addWidget(button)
+
+            supplier_button.clicked.connect(lambda _checked=False: self.set_order_analysis_mode("supplier"))
+            group_button.clicked.connect(lambda _checked=False: self.set_order_analysis_mode("group"))
+            self.order_analysis_mode_buttons = {"supplier": supplier_button, "group": group_button}
+            self._order_analysis_mode_frame = mode_frame
+
+            insert_index = layout.indexOf(label) if label is not None else 0
+            if insert_index < 0:
+                insert_index = 0
+            layout.insertWidget(insert_index, mode_frame)
+
+        self.update_order_analysis_mode_button_styles()
 
         try:
             supplier_edit.setMinimumWidth(280)
@@ -7247,6 +8245,40 @@ class MainWindow(QMainWindow):
     def get_order_analysis_end_picker(self):
         return self.order_analysis_end_picker
 
+    def configure_monthly_sales_table_visibility(self, table, graph_widget=None, table_min_height=170, table_max_height=235, graph_min_height=210, graph_max_height=285):
+        """Keep monthly sales tables usable at the default window size.
+
+        The generated UI was giving the graph/table area too much vertical minimum size.
+        That pushes the horizontal scroll bar below the visible page until the window is
+        maximised.  These runtime constraints keep the scrollbar visible without needing
+        to edit the .ui generated file directly.
+        """
+        if table is not None:
+            try:
+                table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+                table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+                table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+                table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+                table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+                table.setMinimumHeight(table_min_height)
+                if table_max_height is None:
+                    table.setMaximumHeight(16777215)
+                else:
+                    table.setMaximumHeight(table_max_height)
+            except Exception:
+                pass
+
+        if graph_widget is not None:
+            try:
+                graph_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+                graph_widget.setMinimumHeight(graph_min_height)
+                if graph_max_height is None:
+                    graph_widget.setMaximumHeight(16777215)
+                else:
+                    graph_widget.setMaximumHeight(graph_max_height)
+            except Exception:
+                pass
+
     def setup_sales_table(self):
         table = getattr(self.ui, "salesTable", None)
         if table is None:
@@ -7257,6 +8289,34 @@ class MainWindow(QMainWindow):
         table.setSelectionMode(QAbstractItemView.SingleSelection)
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         table.verticalHeader().setVisible(False)
+        self.configure_monthly_sales_table_visibility(
+            table,
+            getattr(self.ui, "sales_graph", None),
+            table_min_height=175,
+            table_max_height=None,
+            graph_min_height=205,
+            graph_max_height=260,
+        )
+        try:
+            frame = getattr(self.ui, "frame_21", None)
+            if frame is not None:
+                frame.setMinimumHeight(420)
+                frame.setMaximumHeight(16777215)
+                frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            page_frame = getattr(self.ui, "frame_5", None)
+            if page_frame is not None:
+                page_frame.setMaximumHeight(16777215)
+                page_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            frame_layout = getattr(self.ui, "verticalLayout_2", None)
+            if frame_layout is not None:
+                frame_layout.setStretch(0, 0)
+                frame_layout.setStretch(1, 1)
+            page_layout = getattr(self.ui, "verticalLayout_3", None)
+            if page_layout is not None:
+                page_layout.setStretch(0, 0)
+                page_layout.setStretch(1, 1)
+        except Exception:
+            pass
         header = table.horizontalHeader()
         header.setStretchLastSection(False)
         header.setSectionResizeMode(QHeaderView.Interactive)
@@ -7293,6 +8353,21 @@ class MainWindow(QMainWindow):
         table.setSelectionMode(QAbstractItemView.SingleSelection)
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         table.setWordWrap(False)
+        self.configure_monthly_sales_table_visibility(
+            table,
+            getattr(self.ui, "itemSales_graph", None),
+            table_min_height=155,
+            table_max_height=225,
+            graph_min_height=205,
+            graph_max_height=265,
+        )
+        try:
+            for object_name, minimum_height in (("frame_13", 420), ("frame_19", 505)):
+                frame = getattr(self.ui, object_name, None)
+                if frame is not None:
+                    frame.setMinimumHeight(minimum_height)
+        except Exception:
+            pass
         header = table.horizontalHeader()
         header.setStretchLastSection(False)
         header.setSectionsClickable(True)
@@ -7331,7 +8406,7 @@ class MainWindow(QMainWindow):
                 freight_box.viewport().setCursor(Qt.PointingHandCursor)
             except Exception:
                 pass
-            freight_box.setToolTip("Double-click to toggle Charge Freight for the current customer.")
+            freight_box.setToolTip("Double-click a row to toggle Charge Freight, Card on File, or Send Proforma for the current customer.")
 
     def setup_order_table(self):
         table = getattr(self.ui, "order_table", None)
@@ -7805,30 +8880,7 @@ class MainWindow(QMainWindow):
         move_action.setEnabled(bool(has_row))
         menu.addSeparator()
 
-        font_menu = menu.addMenu("Font Size")
-        current_size = current_table_font_size(table)
-        for size in TABLE_FONT_SIZE_OPTIONS:
-            action = font_menu.addAction(str(size))
-            action.setCheckable(True)
-            action.setChecked(size == current_size)
-            action.triggered.connect(
-                lambda _checked=False, tbl=table, selected_size=size: apply_table_font_size(
-                    tbl,
-                    selected_size,
-                    settings=self.settings,
-                    scope_key="main_window",
-                    persist=True,
-                )
-            )
-        font_menu.addSeparator()
-        reset_action = font_menu.addAction("Reset")
-        reset_action.triggered.connect(
-            lambda _checked=False, tbl=table: reset_table_font_size(
-                tbl,
-                settings=self.settings,
-                scope_key="main_window",
-            )
-        )
+        add_table_format_menu(self, menu, table, self.settings, "main_window")
 
         viewport = getattr(table, "viewport", lambda: None)()
         global_pos = viewport.mapToGlobal(pos) if viewport is not None else table.mapToGlobal(pos)
@@ -8014,30 +9066,7 @@ class MainWindow(QMainWindow):
         add_to_on_order_action.setEnabled(bool(has_row))
         menu.addSeparator()
 
-        font_menu = menu.addMenu("Font Size")
-        current_size = current_table_font_size(table)
-        for size in TABLE_FONT_SIZE_OPTIONS:
-            action = font_menu.addAction(str(size))
-            action.setCheckable(True)
-            action.setChecked(size == current_size)
-            action.triggered.connect(
-                lambda _checked=False, tbl=table, selected_size=size: apply_table_font_size(
-                    tbl,
-                    selected_size,
-                    settings=self.settings,
-                    scope_key="main_window",
-                    persist=True,
-                )
-            )
-        font_menu.addSeparator()
-        reset_action = font_menu.addAction("Reset")
-        reset_action.triggered.connect(
-            lambda _checked=False, tbl=table: reset_table_font_size(
-                tbl,
-                settings=self.settings,
-                scope_key="main_window",
-            )
-        )
+        add_table_format_menu(self, menu, table, self.settings, "main_window")
 
         viewport = getattr(table, "viewport", lambda: None)()
         global_pos = viewport.mapToGlobal(pos) if viewport is not None else table.mapToGlobal(pos)
@@ -8195,6 +9224,7 @@ class MainWindow(QMainWindow):
             table.setRowCount(0)
             table.clearSelection()
         self.current_order_analysis_supplier = None
+        self.current_order_analysis_filter_value = None
         self._order_analysis_all_rows = []
 
     def export_order_analysis_to_excel(self):
@@ -8207,8 +9237,9 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Export Order Analysis", "There is no order analysis data to export.")
             return
 
-        supplier_name = (self.current_order_analysis_supplier or "").strip()
-        safe_supplier = re.sub(r"[^A-Za-z0-9._-]+", "_", supplier_name or "order_analysis").strip("_") or "order_analysis"
+        mode_label = "Product Group" if self.get_order_analysis_mode() == "group" else "Supplier"
+        selected_name = (self.current_order_analysis_filter_value or self.current_order_analysis_supplier or "").strip()
+        safe_supplier = re.sub(r"[^A-Za-z0-9._-]+", "_", selected_name or "order_analysis").strip("_") or "order_analysis"
         default_filename = f"{safe_supplier}_order_analysis.xlsx"
         home_dir = str(Path.home() / default_filename)
         export_path, _ = QFileDialog.getSaveFileName(
@@ -8240,7 +9271,7 @@ class MainWindow(QMainWindow):
             headers.append(header_item.text() if header_item is not None and header_item.text() else f"Column {column + 1}")
 
         meta_rows = [
-            ("Supplier", supplier_name or ""),
+            (mode_label, selected_name or ""),
             ("Period From", period_from.strftime("%d/%m/%Y") if period_from is not None else ""),
             ("Period To", period_to.strftime("%d/%m/%Y") if period_to is not None else ""),
             ("Months in Period", months_in_period if months_in_period else ""),
@@ -8741,78 +9772,284 @@ class MainWindow(QMainWindow):
             item.setData(Qt.UserRole, data)
         return item
 
-    def update_charge_freight_box(self, should_charge, raw_value=""):
+    CUSTOMER_FLAG_DEFINITIONS = {
+        "charge_freight": {
+            "label": "Charge Freight",
+            "aliases": ("charge_freight", "freight", "freight_flag", "Charge Freight", "Freight", "Freight Flag"),
+            "active_bg": "#fff1f1",
+            "active_fg": "#8b0000",
+            "active_border": "#d62828",
+        },
+        "card_on_file": {
+            "label": "Card on File",
+            "aliases": ("card_on_file", "card on file", "Card on File", "card_file", "cardfile"),
+            "active_bg": "#fff8e6",
+            "active_fg": "#7a4a00",
+            "active_border": "#e0a21a",
+        },
+        "send_proforma": {
+            "label": "Send Proforma",
+            "aliases": ("send_proforma", "send proforma", "Send Proforma", "proforma", "Proforma"),
+            "active_bg": "#eef5ff",
+            "active_fg": "#154a7a",
+            "active_border": "#2f80d0",
+        },
+    }
+
+    def current_theme_name(self):
+        if hasattr(self.ui, "radioHighContrast") and self.ui.radioHighContrast.isChecked():
+            return "high"
+        if hasattr(self.ui, "radioLight") and self.ui.radioLight.isChecked():
+            return "light"
+        return "dark"
+
+    def customer_flag_inactive_colors(self):
+        theme_name = self.current_theme_name()
+        if theme_name == "light":
+            return {"bg": "#f4f7fa", "fg": "#26313d", "border": "#93a1af", "frame": "#8b98a7"}
+        if theme_name == "high":
+            return {"bg": "#000000", "fg": "#ffff00", "border": "#ffff00", "frame": "#ffff00"}
+        return {"bg": "#24272b", "fg": "#c9d5e3", "border": "#66707c", "frame": "#b7bcc2"}
+
+    def customer_flag_frame_style(self):
+        colors = self.customer_flag_inactive_colors()
+        theme_name = self.current_theme_name()
+        selector = "QTextBrowser#chargeFreight_textBrowser"
+        if theme_name == "high":
+            return (
+                f"{selector} {{"
+                "background-color: #000000;"
+                "border: 2px solid #ffff00;"
+                "border-radius: 8px;"
+                "}"
+            )
+        if theme_name == "light":
+            return (
+                f"{selector} {{"
+                "background-color: #eef2f5;"
+                f"border: 1px solid {colors['frame']};"
+                "border-radius: 8px;"
+                "}"
+            )
+        return (
+            f"{selector} {{"
+            "background-color: #202124;"
+            f"border: 1px solid {colors['frame']};"
+            "border-radius: 8px;"
+            "}"
+        )
+
+    def ensure_customer_flag_labels(self):
+        box = getattr(self.ui, "chargeFreight_textBrowser", None)
+        if box is None:
+            return {}
+        labels = getattr(self, "_customer_flag_labels", None)
+        if labels:
+            return labels
+
+        labels = {}
+        parent = box.viewport()
+        for flag_key in ("charge_freight", "card_on_file", "send_proforma"):
+            label = QLabel(parent)
+            label.setObjectName(f"customerFlag_{flag_key}_label")
+            label.setAlignment(Qt.AlignCenter)
+            label.setWordWrap(False)
+            label.setTextInteractionFlags(Qt.NoTextInteraction)
+            label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            label.show()
+            labels[flag_key] = label
+
+        self._customer_flag_labels = labels
+        return labels
+
+    def position_customer_flag_labels(self):
+        box = getattr(self.ui, "chargeFreight_textBrowser", None)
+        labels = getattr(self, "_customer_flag_labels", None)
+        if box is None or not labels:
+            return
+        try:
+            viewport = box.viewport()
+            width = max(40, viewport.width())
+            height = max(60, viewport.height())
+        except Exception:
+            viewport = box
+            width = max(40, box.width())
+            height = max(60, box.height())
+
+        outer_margin = 6
+        gap = 5
+        available_height = max(30, height - (outer_margin * 2) - (gap * 2))
+        base_height = max(24, available_height // 3)
+        remainder = max(0, available_height - base_height * 3)
+        row_heights = [base_height, base_height, base_height]
+        for index in range(min(remainder, 3)):
+            row_heights[index] += 1
+
+        row_width = max(40, width - outer_margin * 2)
+        y = outer_margin
+        for index, flag_key in enumerate(("charge_freight", "card_on_file", "send_proforma")):
+            label = labels.get(flag_key)
+            if label is None:
+                continue
+            row_height = row_heights[index]
+            label.setGeometry(outer_margin, y, row_width, row_height)
+            font = label.font()
+            # Keep it readable but avoid clipping in the narrow flag panel.
+            font_size = max(9, min(14, int(row_height * 0.42), int(row_width / 12)))
+            font.setPointSize(font_size)
+            font.setBold(True)
+            label.setFont(font)
+            y += row_height + gap
+
+    def refresh_customer_flag_label_styles(self):
+        labels = self.ensure_customer_flag_labels()
+        if not labels:
+            return
+        state = getattr(self, "_customer_flag_box_state", None) or {
+            "charge_freight": False,
+            "card_on_file": False,
+            "send_proforma": False,
+        }
+        inactive = self.customer_flag_inactive_colors()
+        for flag_key in ("charge_freight", "card_on_file", "send_proforma"):
+            definition = self.CUSTOMER_FLAG_DEFINITIONS[flag_key]
+            active = bool(state.get(flag_key, False))
+            label = definition["label"] if active else f"No {definition['label']}"
+            if active and self.current_theme_name() == "high":
+                high_active = {
+                    "charge_freight": ("#ffff00", "#000000", "#ffffff"),
+                    "card_on_file": ("#00ffff", "#000000", "#ffffff"),
+                    "send_proforma": ("#ff66ff", "#000000", "#ffffff"),
+                }
+                bg, fg, border = high_active.get(flag_key, ("#ffff00", "#000000", "#ffffff"))
+            else:
+                bg = definition["active_bg"] if active else inactive["bg"]
+                fg = definition["active_fg"] if active else inactive["fg"]
+                border = definition["active_border"] if active else inactive["border"]
+            border_width = 2 if active else 1
+            weight = "900" if active else "800"
+            label_widget = labels.get(flag_key)
+            if label_widget is None:
+                continue
+            label_widget.setText(label)
+            label_widget.setStyleSheet(
+                "QLabel {"
+                f"background: {bg};"
+                f"color: {fg};"
+                f"border: {border_width}px solid {border};"
+                "border-radius: 3px;"
+                "padding: 0px 4px;"
+                f"font-weight: {weight};"
+                "}"
+            )
+
+    def refresh_customer_flag_box_theme(self):
+        box = getattr(self.ui, "chargeFreight_textBrowser", None)
+        if box is None:
+            return
+        try:
+            box.setStyleSheet(self.customer_flag_frame_style())
+        except Exception:
+            pass
+        self.refresh_customer_flag_label_styles()
+        self.position_customer_flag_labels()
+
+    def update_charge_freight_box(self, should_charge=False, raw_value="", card_on_file=False, card_raw_value="", send_proforma=False, proforma_raw_value=""):
         box = getattr(self.ui, "chargeFreight_textBrowser", None)
         if box is None:
             return
 
-        text_value = (raw_value or "").strip()
+        states = {
+            "charge_freight": bool(should_charge),
+            "card_on_file": bool(card_on_file),
+            "send_proforma": bool(send_proforma),
+        }
+        raw_values = {
+            "charge_freight": raw_value,
+            "card_on_file": card_raw_value,
+            "send_proforma": proforma_raw_value,
+        }
+        self._customer_flag_box_state = states
+
         try:
             box.document().setDocumentMargin(0)
+            box.setPlainText("")
             box.setAlignment(Qt.AlignCenter)
+            box.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            box.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         except Exception:
             pass
-        if should_charge:
-            box.setHtml('<div style="text-align:center; font-size:18px; font-weight:700; color:#8b0000; margin-top:42px;">Charge Freight</div>')
-            box.setStyleSheet(
-                "QTextBrowser {"
-                "background: #fff1f1;"
-                "color: #8b0000;"
-                "border: 3px solid #d62828;"
-                "border-radius: 8px;"
-                "padding: 8px;"
-                "}"
-            )
-            box.setToolTip(f"Freight flag: {text_value or 'Yes'}")
-        else:
-            box.clear()
-            box.setStyleSheet(
-                "QTextBrowser {"
-                "background: transparent;"
-                "color: inherit;"
-                "border: 1px solid #b7bcc2;"
-                "border-radius: 8px;"
-                "padding: 8px;"
-                "}"
-            )
-            box.setToolTip(f"Freight flag: {text_value or 'No'}")
+
+        self.ensure_customer_flag_labels()
+        self.refresh_customer_flag_box_theme()
+        box.setToolTip(
+            "Double-click a row to toggle it.\n"
+            f"Charge Freight: {raw_values.get('charge_freight') or ('Yes' if states['charge_freight'] else 'No')}\n"
+            f"Card on File: {raw_values.get('card_on_file') or ('Yes' if states['card_on_file'] else 'No')}\n"
+            f"Send Proforma: {raw_values.get('send_proforma') or ('Yes' if states['send_proforma'] else 'No')}"
+        )
 
     def is_yes_like(self, value):
         text_value = str(value or "").strip().lower()
-        return text_value in {"1", "true", "t", "y", "yes", "charge freight", "charged"}
+        return text_value in {"1", "true", "t", "y", "yes", "charge freight", "charged", "card on file", "send proforma", "proforma"}
 
-    def get_customer_freight_value(self, row):
-        return self.get_first(
-            row,
-            "freight",
-            "Freight",
-            "charge_freight",
-            "Charge Freight",
-            "freight_flag",
-            "Freight Flag",
-            default="",
-        )
-
-
-    def get_customer_freight_column_name(self):
+    def get_customer_flag_column_name(self, flag_key):
+        definition = self.CUSTOMER_FLAG_DEFINITIONS.get(flag_key, {})
         columns = {name.lower(): name for name in self.get_table_columns("customers")}
-        for candidate in ("charge_freight", "freight", "freight_flag", "charge freight", "freight flag"):
-            actual = columns.get(candidate.lower())
+        for candidate in definition.get("aliases", (flag_key,)):
+            actual = columns.get(str(candidate).lower())
             if actual:
                 return actual
         return None
 
-    def toggle_charge_freight_for_current_customer(self):
+    def get_customer_flag_value(self, row, flag_key):
+        definition = self.CUSTOMER_FLAG_DEFINITIONS.get(flag_key, {})
+        return self.get_first(row, *definition.get("aliases", (flag_key,)), default="")
+
+    def get_customer_freight_value(self, row):
+        return self.get_customer_flag_value(row, "charge_freight")
+
+    def get_customer_freight_column_name(self):
+        return self.get_customer_flag_column_name("charge_freight")
+
+    def customer_flag_from_y_position(self, obj, event):
+        box = getattr(self.ui, "chargeFreight_textBrowser", None)
+        if box is None:
+            return "charge_freight"
+        viewport = box.viewport()
+        height = 0
+        y_pos = 0
+        try:
+            if obj is viewport:
+                height = viewport.height()
+                y_pos = event.position().toPoint().y()
+            else:
+                height = box.height()
+                y_pos = event.position().toPoint().y()
+        except Exception:
+            try:
+                height = viewport.height()
+                y_pos = event.pos().y()
+            except Exception:
+                return "charge_freight"
+        if height <= 0:
+            return "charge_freight"
+        section = int(max(0, min(2, (y_pos / height) * 3)))
+        return ("charge_freight", "card_on_file", "send_proforma")[section]
+
+    def toggle_customer_flag_for_current_customer(self, flag_key):
         customer_name = (self.current_customer_name or "").strip()
         if not customer_name:
             return False
 
-        column_name = self.get_customer_freight_column_name()
+        column_name = self.get_customer_flag_column_name(flag_key)
+        definition = self.CUSTOMER_FLAG_DEFINITIONS.get(flag_key, {})
+        label = definition.get("label", flag_key)
         if not column_name:
             QMessageBox.warning(
                 self,
-                "Charge Freight",
-                "Could not find a freight flag column in the customers table.",
+                label,
+                f"Could not find or create a {label} column in the customers table.",
             )
             return True
 
@@ -8822,17 +10059,20 @@ class MainWindow(QMainWindow):
                 (customer_name,),
             )
         )
-        current_value = self.get_customer_freight_value(row)
+        current_value = self.get_customer_flag_value(row, flag_key)
         new_value = "No" if self.is_yes_like(current_value) else "Yes"
 
         cur = self.db_conn.cursor()
         cur.execute(
-            f"UPDATE customers SET [{column_name}] = ? WHERE LOWER(TRIM(customer_name)) = LOWER(TRIM(?))",
+            f"UPDATE customers SET {self.db_identifier(column_name)} = ? WHERE LOWER(TRIM(customer_name)) = LOWER(TRIM(?))",
             (new_value, customer_name),
         )
         self.db_conn.commit()
         self.populate_customer_info(customer_name)
         return True
+
+    def toggle_charge_freight_for_current_customer(self):
+        return self.toggle_customer_flag_for_current_customer("charge_freight")
 
     def get_container_ref_text(self):
         widget = getattr(self.ui, "nextContainer_box", None)
@@ -9694,6 +10934,14 @@ class MainWindow(QMainWindow):
         freight_box = getattr(self.ui, "chargeFreight_textBrowser", None)
         freight_viewport = freight_box.viewport() if freight_box is not None else None
 
+        if event.type() == QEvent.Resize:
+            if obj is freight_box or obj is freight_viewport:
+                try:
+                    QTimer.singleShot(0, self.position_customer_flag_labels)
+                except Exception:
+                    pass
+                return False
+
         if event.type() == QEvent.KeyPress:
             if obj is item_edit:
                 return self.handle_order_item_keypress(event)
@@ -9712,7 +10960,8 @@ class MainWindow(QMainWindow):
 
         if event.type() == QEvent.MouseButtonDblClick:
             if obj is freight_box or obj is freight_viewport:
-                return self.toggle_charge_freight_for_current_customer()
+                flag_key = self.customer_flag_from_y_position(obj, event)
+                return self.toggle_customer_flag_for_current_customer(flag_key)
             for object_name in self.item_summary_editable_fields:
                 if obj is getattr(self.ui, object_name, None):
                     self.edit_item_summary_field(object_name)
@@ -10209,8 +11458,8 @@ class MainWindow(QMainWindow):
                 """
                 INSERT INTO sales (
                     sale_date, customer_name, item_number, description,
-                    month_key, quantity, price, extended
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    month_key, quantity, price, extended, invoice_no, freight_amount
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows_to_insert,
             )
@@ -10235,6 +11484,10 @@ class MainWindow(QMainWindow):
             "quantity": ["quantity", "qty"],
             "price": ["price", "unitprice", "sellprice"],
         }
+        optional_aliases = {
+            "invoice_no": ["invoiceno", "invoice", "invno", "invoicenumber", "taxinvoice"],
+            "freight_amount": ["freightamount", "freight", "freightamt", "freightvalue", "shippingamount"],
+        }
         resolved = {}
         missing = []
         for field_name, options in aliases.items():
@@ -10248,6 +11501,11 @@ class MainWindow(QMainWindow):
             raise ValueError(
                 f"Missing required column(s): {missing_text}. Expected columns like Date, Co./Last Name, Item Number, Quantity, Price."
             )
+
+        for field_name, options in optional_aliases.items():
+            matched = next((normalized[key] for key in options if key in normalized), None)
+            if matched is not None:
+                resolved[field_name] = matched
         return resolved
 
     def normalize_sales_import_date(self, value):
@@ -10412,6 +11670,8 @@ class MainWindow(QMainWindow):
         item_number = str(row.get(column_map["item_number"], "") or "").strip()
         quantity_value = self.parse_float(row.get(column_map["quantity"], 0))
         price_value = self.parse_float(row.get(column_map["price"], 0))
+        invoice_no = str(row.get(column_map.get("invoice_no", ""), "") or "").strip() if column_map.get("invoice_no") else ""
+        freight_amount = self.parse_float(row.get(column_map.get("freight_amount", ""), 0)) if column_map.get("freight_amount") else 0.0
 
         if not sale_date and not customer_name and not item_number and quantity_value == 0 and price_value == 0:
             return None
@@ -10427,7 +11687,7 @@ class MainWindow(QMainWindow):
             description = item_number
         month_key = self.sales_month_key_from_date(sale_date)
         extended = quantity_value * price_value
-        return (sale_date, customer_name, item_number, description, month_key, quantity_value, price_value, extended)
+        return (sale_date, customer_name, item_number, description, month_key, quantity_value, price_value, extended, invoice_no, freight_amount)
 
     def import_stock_from_dialog(self):
         filters = "Stock files (*.xlsx *.xlsm *.csv *.txt);;Excel files (*.xlsx *.xlsm);;CSV files (*.csv *.txt);;All files (*.*)"
@@ -11962,6 +13222,21 @@ $mail.Display()
             return prefix_matches[0]
         return None
 
+    def find_product_group_name(self, typed_text):
+        typed = (typed_text or "").strip()
+        if not typed:
+            return None
+
+        typed_lower = typed.lower()
+        for group_name in self.product_group_names:
+            if group_name.lower() == typed_lower:
+                return group_name
+
+        prefix_matches = [name for name in self.product_group_names if name.lower().startswith(typed_lower)]
+        if len(prefix_matches) == 1:
+            return prefix_matches[0]
+        return None
+
     def rerun_order_analysis_if_ready(self, *_args):
         # Order Analysis now runs only when the user clicks Show Data.
         return
@@ -12511,6 +13786,120 @@ $mail.Display()
     # -----------------------------
     # Theme handling
     # -----------------------------
+    def theme_scrollbar_stylesheet(self, theme_name):
+        if theme_name == "light":
+            return """
+                QScrollBar:horizontal, QScrollBar:vertical {
+                    background: #d7dde4;
+                    border: 1px solid #9ca8b5;
+                    margin: 0px;
+                }
+                QScrollBar:horizontal { height: 18px; }
+                QScrollBar:vertical { width: 18px; }
+                QScrollBar::handle:horizontal, QScrollBar::handle:vertical {
+                    background: #77889a;
+                    border: 1px solid #566575;
+                    border-radius: 4px;
+                    min-width: 36px;
+                    min-height: 36px;
+                }
+                QScrollBar::handle:horizontal:hover, QScrollBar::handle:vertical:hover {
+                    background: #64778a;
+                }
+                QScrollBar::add-line, QScrollBar::sub-line {
+                    background: #c3cbd3;
+                    border: 1px solid #9ca8b5;
+                    width: 16px;
+                    height: 16px;
+                }
+                QScrollBar::add-page, QScrollBar::sub-page { background: #d7dde4; }
+                QCheckBox { spacing: 6px; color: #1b1f23; }
+                QCheckBox::indicator {
+                    width: 16px;
+                    height: 16px;
+                    border: 1px solid #697684;
+                    background: #f8fafb;
+                    border-radius: 3px;
+                }
+                QCheckBox::indicator:checked {
+                    background: #2f80d0;
+                    border: 1px solid #1f5f9f;
+                }
+            """
+        if theme_name == "high":
+            return """
+                QScrollBar:horizontal, QScrollBar:vertical {
+                    background: #000000;
+                    border: 2px solid #ffff00;
+                    margin: 0px;
+                }
+                QScrollBar:horizontal { height: 20px; }
+                QScrollBar:vertical { width: 20px; }
+                QScrollBar::handle:horizontal, QScrollBar::handle:vertical {
+                    background: #00ffff;
+                    border: 2px solid #ffffff;
+                    border-radius: 3px;
+                    min-width: 40px;
+                    min-height: 40px;
+                }
+                QScrollBar::add-line, QScrollBar::sub-line {
+                    background: #000000;
+                    border: 2px solid #ffff00;
+                    width: 18px;
+                    height: 18px;
+                }
+                QScrollBar::add-page, QScrollBar::sub-page { background: #000000; }
+                QCheckBox { spacing: 6px; color: #ffff00; }
+                QCheckBox::indicator {
+                    width: 17px;
+                    height: 17px;
+                    border: 2px solid #ffff00;
+                    background: #000000;
+                }
+                QCheckBox::indicator:checked {
+                    background: #00ffff;
+                    border: 2px solid #ffffff;
+                }
+            """
+        return """
+                QScrollBar:horizontal, QScrollBar:vertical {
+                    background: #24272b;
+                    border: 1px solid #5f6368;
+                    margin: 0px;
+                }
+                QScrollBar:horizontal { height: 18px; }
+                QScrollBar:vertical { width: 18px; }
+                QScrollBar::handle:horizontal, QScrollBar::handle:vertical {
+                    background: #8a949f;
+                    border: 1px solid #c1c7ce;
+                    border-radius: 4px;
+                    min-width: 36px;
+                    min-height: 36px;
+                }
+                QScrollBar::handle:horizontal:hover, QScrollBar::handle:vertical:hover {
+                    background: #a4afba;
+                }
+                QScrollBar::add-line, QScrollBar::sub-line {
+                    background: #303134;
+                    border: 1px solid #5f6368;
+                    width: 16px;
+                    height: 16px;
+                }
+                QScrollBar::add-page, QScrollBar::sub-page { background: #24272b; }
+                QCheckBox { spacing: 6px; color: #e8eaed; }
+                QCheckBox::indicator {
+                    width: 16px;
+                    height: 16px;
+                    border: 1px solid #9aa0a6;
+                    background: #202124;
+                    border-radius: 3px;
+                }
+                QCheckBox::indicator:checked {
+                    background: #8ab4f8;
+                    border: 1px solid #d2e3fc;
+                }
+            """
+
     def restore_theme(self):
         theme = self.settings.value("theme", "dark")
         if theme == "light" and hasattr(self.ui, "radioLight"):
@@ -12709,11 +14098,30 @@ $mail.Display()
                 }}
             """)
 
+        try:
+            app.setStyleSheet(app.styleSheet() + self.theme_scrollbar_stylesheet(theme_name))
+        except Exception:
+            pass
+
+        try:
+            self.refresh_customer_flag_box_theme()
+        except Exception:
+            pass
+
+        try:
+            self.update_item_status_controls(getattr(self, "current_item_planning_status", PLANNING_STATUS_ACTIVE))
+        except Exception:
+            pass
+
         for spin in (self.lead_time_picker, getattr(self.ui, 'additional_spinner', None)):
             if spin is not None:
                 spin.setButtonSymbols(QAbstractSpinBox.UpDownArrows)
                 spin.update()
 
+        try:
+            self.apply_saved_table_format_to_all_tables()
+        except Exception:
+            pass
         self.apply_item_summary_accent_styles()
         self.update_navigation_button_highlight()
         self.redraw_charts()
@@ -12859,8 +14267,17 @@ $mail.Display()
         )
         row = self.row_to_dict(row)
         self.current_customer_file_path = self.get_first(row, "matched_file", "Matched File", default="")
-        freight_value = self.get_customer_freight_value(row)
-        self.update_charge_freight_box(self.is_yes_like(freight_value), freight_value)
+        freight_value = self.get_customer_flag_value(row, "charge_freight")
+        card_value = self.get_customer_flag_value(row, "card_on_file")
+        proforma_value = self.get_customer_flag_value(row, "send_proforma")
+        self.update_charge_freight_box(
+            self.is_yes_like(freight_value),
+            freight_value,
+            self.is_yes_like(card_value),
+            card_value,
+            self.is_yes_like(proforma_value),
+            proforma_value,
+        )
 
         if row:
             values = [
@@ -13193,6 +14610,13 @@ $mail.Display()
 
                 table.resizeColumnsToContents()
                 table.horizontalHeader().setStretchLastSection(True)
+                install_table_font_context_menu(
+                    self,
+                    table,
+                    self.settings,
+                    "customer_file_preview",
+                    settings_token=f"customer_file_preview/excel/{path.name}/{sheet_name}",
+                )
 
                 tab_page = QWidget()
                 tab_layout = QVBoxLayout(tab_page)
@@ -13241,6 +14665,13 @@ $mail.Display()
 
         table.resizeColumnsToContents()
         table.horizontalHeader().setStretchLastSection(True)
+        install_table_font_context_menu(
+            self,
+            table,
+            self.settings,
+            "customer_file_preview",
+            settings_token=f"customer_file_preview/csv/{path.name}",
+        )
 
         container = QWidget()
         layout = QVBoxLayout(container)
@@ -13278,6 +14709,15 @@ $mail.Display()
         table = getattr(self.ui, "salesTable", None)
         if table is None:
             return
+
+        self.configure_monthly_sales_table_visibility(
+            table,
+            getattr(self.ui, "sales_graph", None),
+            table_min_height=175,
+            table_max_height=None,
+            graph_min_height=205,
+            graph_max_height=260,
+        )
 
         item_numbers = sorted(pivot.keys(), key=str.lower)
         headers = ["Item Number", "Description", "Last Sale Date", "Last Price", "Total Units"] + [m.strftime("%b %Y") for m in months]
@@ -13373,14 +14813,72 @@ $mail.Display()
             return
 
 
-    def fetch_customer_month_invoice_lines(self, customer_name, item_number, month_start, combine_accounts=False):
+    def sales_invoice_column_names(self):
+        candidates = [
+            "Invoice No", "invoice_no", "invoice no", "Invoice Number", "invoice_number",
+            "Invoice", "invoice", "Inv No", "inv_no", "Tax Invoice", "tax_invoice",
+        ]
+        columns = {name.lower(): name for name in self.get_table_columns("sales")}
+        resolved = []
+        seen = set()
+        for candidate in candidates:
+            actual = columns.get(candidate.lower())
+            if not actual:
+                continue
+            key = actual.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            resolved.append(actual)
+        return resolved
+
+    def sales_freight_column_names(self):
+        candidates = [
+            "Freight Amount", "freight_amount", "freight amount", "Freight", "freight",
+            "Freight Amt", "freight_amt", "Shipping Amount", "shipping_amount",
+        ]
+        columns = {name.lower(): name for name in self.get_table_columns("sales")}
+        resolved = []
+        seen = set()
+        for candidate in candidates:
+            actual = columns.get(candidate.lower())
+            if not actual:
+                continue
+            key = actual.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            resolved.append(actual)
+        return resolved
+
+    def build_sales_invoice_expression(self, alias=False):
+        parts = [f"NULLIF(TRIM(CAST({self.db_identifier(column_name)} AS TEXT)), '')" for column_name in self.sales_invoice_column_names()]
+        expr = f"COALESCE({', '.join(parts)}, '')" if parts else "''"
+        return f"{expr} AS invoice_no" if alias else expr
+
+    def build_sales_freight_expression(self, alias=False):
+        parts = [self.db_identifier(column_name) for column_name in self.sales_freight_column_names()]
+        expr = f"COALESCE({', '.join(parts)}, 0)" if parts else "0"
+        return f"{expr} AS freight_amount" if alias else expr
+
+    def fetch_sales_invoice_lines(self, customer_name, item_numbers, month_start, combine_accounts=False):
         month_start = self.parse_date_value(month_start)
         if month_start is None:
             return []
 
         matched_customers = self.find_matching_customers(customer_name, combine_accounts)
-        in_clause, in_params = self.sql_in_clause(matched_customers)
+        if not matched_customers:
+            matched_customers = [customer_name] if customer_name else []
+        customer_clause, customer_params = self.sql_in_clause(matched_customers)
         month_end = self.next_month(month_start) - timedelta(days=1)
+
+        item_clause = "1 = 1"
+        item_params = []
+        if item_numbers:
+            item_clause, item_params = self.build_sales_item_filter_clause(item_numbers)
+
+        invoice_expr = self.build_sales_invoice_expression(alias=True)
+        freight_expr = self.build_sales_freight_expression(alias=True)
 
         rows = self.db_all(
             f"""
@@ -13388,19 +14886,34 @@ $mail.Display()
                 DATE(sale_date) AS sale_date,
                 TRIM(customer_name) AS customer_name,
                 TRIM(item_number) AS item_number,
+                {invoice_expr},
                 COALESCE(NULLIF(TRIM(description), ''), TRIM(item_number)) AS description,
                 COALESCE(quantity, 0) AS quantity,
                 COALESCE(price, 0) AS price,
-                COALESCE(extended, COALESCE(quantity, 0) * COALESCE(price, 0)) AS extended
+                COALESCE(extended, COALESCE(quantity, 0) * COALESCE(price, 0)) AS extended,
+                {freight_expr}
             FROM sales
             WHERE DATE(sale_date) BETWEEN ? AND ?
-              AND customer_name IN {in_clause}
-              AND UPPER(TRIM(COALESCE(item_number, ''))) = UPPER(TRIM(?))
-            ORDER BY DATE(sale_date), customer_name COLLATE NOCASE, description COLLATE NOCASE
+              AND customer_name IN {customer_clause}
+              AND {item_clause}
+            ORDER BY DATE(sale_date), invoice_no, customer_name COLLATE NOCASE, item_number COLLATE NOCASE, description COLLATE NOCASE
             """,
-            [month_start.isoformat(), month_end.isoformat(), *in_params, item_number],
+            [month_start.isoformat(), month_end.isoformat(), *customer_params, *item_params],
         )
         return [self.row_to_dict(row) for row in rows]
+
+    def fetch_customer_month_invoice_lines(self, customer_name, item_number, month_start, combine_accounts=False):
+        return self.fetch_sales_invoice_lines(customer_name, [item_number], month_start, combine_accounts=combine_accounts)
+
+    def freight_total_from_rows(self, rows):
+        freight_values = [self.parse_float(row.get("freight_amount", 0)) for row in rows]
+        positive_values = [value for value in freight_values if abs(value) > 0.000001]
+        if not positive_values:
+            return 0.0
+        rounded_unique = {round(value, 6) for value in positive_values}
+        if len(rounded_unique) == 1 and len(positive_values) > 1:
+            return positive_values[0]
+        return sum(positive_values)
 
     def show_customer_month_invoice_lines(self, row, column):
         table = getattr(self.ui, "salesTable", None)
@@ -13426,34 +14939,52 @@ $mail.Display()
         )
 
         title_month = month_start.strftime("%b %Y")
-        dialog = QDialog(self)
-        dialog.setWindowTitle(f"Invoice Lines - {item_number} - {title_month}")
-        dialog.resize(980, 620)
-        layout = QVBoxLayout(dialog)
-
-        summary = QLabel(
+        summary = (
             f"Customer: {self.current_customer_name}\n"
             f"Item: {item_number}\n"
             f"Month: {title_month}"
             + ("\n(Combined state accounts)" if combine_accounts else "")
         )
+        self.show_sales_invoice_lines_dialog(
+            f"Invoice Lines - {item_number} - {title_month}",
+            summary,
+            detail_rows,
+        )
+
+    def show_sales_invoice_lines_dialog(self, title, summary_text, detail_rows):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.resize(1120, 650)
+        layout = QVBoxLayout(dialog)
+
+        summary = QLabel(summary_text)
         summary.setWordWrap(True)
         layout.addWidget(summary)
 
         detail_table = QTableWidget(dialog)
-        detail_table.setColumnCount(6)
+        detail_table.setColumnCount(8)
         detail_table.setHorizontalHeaderLabels([
             "Sale Date",
             "Customer",
+            "Invoice No",
             "Description / Invoice Line",
             "Qty",
             "Price",
             "Extended",
+            "Freight Amount",
         ])
         detail_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         detail_table.setSelectionMode(QAbstractItemView.SingleSelection)
         detail_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         detail_table.verticalHeader().setVisible(False)
+        detail_table.cellDoubleClicked.connect(lambda r, c, tbl=detail_table: self.handle_invoice_lines_table_double_click(tbl, r, c))
+        install_table_font_context_menu(
+            self,
+            detail_table,
+            self.settings,
+            "sales_invoice_dialogs",
+            settings_token="sales_invoice_dialogs/month_invoice_lines",
+        )
         layout.addWidget(detail_table, 1)
 
         total_qty = 0.0
@@ -13462,10 +14993,12 @@ $mail.Display()
         for row_index, line in enumerate(detail_rows):
             sale_date_text = self.format_short_date(line.get("sale_date"))
             customer_text = (line.get("customer_name") or "").strip()
+            invoice_text = (line.get("invoice_no") or "").strip()
             description_text = (line.get("description") or "").strip()
             qty_value = self.parse_float(line.get("quantity", 0))
             price_value = self.parse_float(line.get("price", 0))
             extended_value = self.parse_float(line.get("extended", qty_value * price_value))
+            freight_value = self.parse_float(line.get("freight_amount", 0))
 
             total_qty += qty_value
             total_value += extended_value
@@ -13473,14 +15006,20 @@ $mail.Display()
             values = [
                 sale_date_text,
                 customer_text,
+                invoice_text,
                 description_text,
                 self.format_value(qty_value),
                 self.format_price(price_value),
                 self.format_price(extended_value),
+                self.format_price(freight_value) if freight_value else "",
             ]
             for col_index, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                if col_index in (3, 4, 5):
+                if col_index == 2:
+                    item.setData(Qt.UserRole, invoice_text)
+                    if invoice_text:
+                        item.setToolTip("Double-click the invoice number to show all lines on this invoice.")
+                if col_index in (4, 5, 6, 7):
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 detail_table.setItem(row_index, col_index, item)
 
@@ -13488,16 +15027,151 @@ $mail.Display()
         header.setStretchLastSection(False)
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.Stretch)
-        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.Stretch)
+        for col in range(4, 8):
+            header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
         detail_table.resizeRowsToContents()
 
         footer = QLabel(
             f"Lines: {len(detail_rows)}    "
             f"Qty Total: {self.format_value(total_qty)}    "
-            f"Value Total: {self.format_price(total_value)}"
+            f"Value Total: {self.format_price(total_value)}    "
+            f"Freight: {self.format_price(self.freight_total_from_rows(detail_rows))}"
+        )
+        footer.setWordWrap(True)
+        layout.addWidget(footer)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        close_button = QPushButton("Close", dialog)
+        close_button.clicked.connect(dialog.accept)
+        button_row.addWidget(close_button)
+        layout.addLayout(button_row)
+
+        dialog.exec()
+
+    def handle_invoice_lines_table_double_click(self, table, row, column):
+        if table is None or row < 0:
+            return
+        if column != 2:
+            return
+        item = table.item(row, column)
+        invoice_no = (item.data(Qt.UserRole) if item is not None else "") or (item.text() if item is not None else "")
+        invoice_no = str(invoice_no or "").strip()
+        if not invoice_no:
+            QMessageBox.information(self, "Invoice", "This line has no invoice number.")
+            return
+        self.show_invoice_detail_dialog(invoice_no)
+
+    def fetch_invoice_lines_by_number(self, invoice_no):
+        invoice_no = str(invoice_no or "").strip()
+        if not invoice_no or not self.sales_invoice_column_names():
+            return []
+
+        invoice_expr = self.build_sales_invoice_expression(alias=False)
+        freight_expr = self.build_sales_freight_expression(alias=True)
+        rows = self.db_all(
+            f"""
+            SELECT
+                DATE(sale_date) AS sale_date,
+                TRIM(customer_name) AS customer_name,
+                TRIM(item_number) AS item_number,
+                {invoice_expr} AS invoice_no,
+                COALESCE(NULLIF(TRIM(description), ''), TRIM(item_number)) AS description,
+                COALESCE(quantity, 0) AS quantity,
+                COALESCE(price, 0) AS price,
+                COALESCE(extended, COALESCE(quantity, 0) * COALESCE(price, 0)) AS extended,
+                {freight_expr}
+            FROM sales
+            WHERE UPPER(TRIM({invoice_expr})) = UPPER(TRIM(?))
+            ORDER BY DATE(sale_date), customer_name COLLATE NOCASE, item_number COLLATE NOCASE, description COLLATE NOCASE
+            """,
+            (invoice_no,),
+        )
+        return [self.row_to_dict(row) for row in rows]
+
+    def show_invoice_detail_dialog(self, invoice_no):
+        rows = self.fetch_invoice_lines_by_number(invoice_no)
+        if not rows:
+            QMessageBox.information(self, "Invoice", f"No sales lines were found for invoice {invoice_no}.")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Invoice {invoice_no}")
+        dialog.resize(1120, 650)
+        layout = QVBoxLayout(dialog)
+
+        summary = QLabel(f"Invoice: {invoice_no}\nAll sales lines found for this invoice.")
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+
+        table = QTableWidget(dialog)
+        table.setColumnCount(8)
+        table.setHorizontalHeaderLabels([
+            "Sale Date",
+            "Customer",
+            "Item Number",
+            "Description",
+            "Qty",
+            "Price",
+            "Extended",
+            "Freight Amount",
+        ])
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
+        install_table_font_context_menu(
+            self,
+            table,
+            self.settings,
+            "sales_invoice_dialogs",
+            settings_token="sales_invoice_dialogs/invoice_detail",
+        )
+        layout.addWidget(table, 1)
+
+        total_qty = 0.0
+        total_value = 0.0
+        table.setRowCount(len(rows))
+        for row_index, line in enumerate(rows):
+            qty_value = self.parse_float(line.get("quantity", 0))
+            price_value = self.parse_float(line.get("price", 0))
+            extended_value = self.parse_float(line.get("extended", qty_value * price_value))
+            freight_value = self.parse_float(line.get("freight_amount", 0))
+            total_qty += qty_value
+            total_value += extended_value
+            values = [
+                self.format_short_date(line.get("sale_date")),
+                (line.get("customer_name") or "").strip(),
+                (line.get("item_number") or "").strip(),
+                (line.get("description") or "").strip(),
+                self.format_value(qty_value),
+                self.format_price(price_value),
+                self.format_price(extended_value),
+                self.format_price(freight_value) if freight_value else "",
+            ]
+            for col_index, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if col_index in (4, 5, 6, 7):
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                table.setItem(row_index, col_index, item)
+
+        header = table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.Stretch)
+        for col in range(4, 8):
+            header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        table.resizeRowsToContents()
+
+        footer = QLabel(
+            f"Lines: {len(rows)}    "
+            f"Qty Total: {self.format_value(total_qty)}    "
+            f"Value Total: {self.format_price(total_value)}    "
+            f"Freight: {self.format_price(self.freight_total_from_rows(rows))}"
         )
         footer.setWordWrap(True)
         layout.addWidget(footer)
@@ -13544,8 +15218,8 @@ $mail.Display()
         if not index.isValid():
             return
 
-        model = getattr(self.ui, "customerPurchase_table", None)
-        if model is None:
+        table = getattr(self.ui, "customerPurchase_table", None)
+        if table is None:
             return
 
         customer_index = index.siblingAtColumn(0)
@@ -13554,7 +15228,41 @@ $mail.Display()
         if not customer_name:
             return
 
-        self.open_customer_summary_from_item(customer_name)
+        if index.column() == 0:
+            self.open_customer_summary_from_item(customer_name)
+            return
+
+        months = list(getattr(self, "current_item_purchase_months", []) or [])
+        month_column_start = 3
+        month_column_end = month_column_start + len(months)
+        if month_column_start <= index.column() < month_column_end:
+            month_start = months[index.column() - month_column_start]
+            self.show_item_customer_month_invoice_lines(customer_name, month_start)
+            return
+
+    def show_item_customer_month_invoice_lines(self, customer_name, month_start):
+        item_number = (self.current_item_number or "").strip()
+        if not item_number:
+            return
+        item_numbers = self.get_thread_sales_item_numbers(item_number)
+        detail_rows = self.fetch_sales_invoice_lines(
+            customer_name,
+            item_numbers,
+            month_start,
+            combine_accounts=False,
+        )
+        title_month = month_start.strftime("%b %Y") if isinstance(month_start, date) else str(month_start)
+        summary = (
+            f"Customer: {customer_name}\n"
+            f"Item: {item_number}\n"
+            f"Month: {title_month}"
+            + ("\n(Combined thread item codes)" if len(item_numbers) > 1 else "")
+        )
+        self.show_sales_invoice_lines_dialog(
+            f"Invoice Lines - {customer_name} - {title_month}",
+            summary,
+            detail_rows,
+        )
 
     def open_customer_summary_from_item(self, customer_name):
         customer_page = getattr(self.ui, "customerSummary_page", None)
@@ -13863,11 +15571,21 @@ $mail.Display()
         if table is None:
             return
 
+        self.configure_monthly_sales_table_visibility(
+            table,
+            getattr(self.ui, "itemSales_graph", None),
+            table_min_height=155,
+            table_max_height=225,
+            graph_min_height=205,
+            graph_max_height=265,
+        )
+
         months = []
         rows = []
         if isinstance(summary, dict):
             months = summary.get("months") or []
             rows = summary.get("rows") or []
+        self.current_item_purchase_months = list(months)
 
         headers = ["Customer", "Last Sale Date", "Last Price"] + [month.strftime("%b %Y") for month in months] + ["Total"]
         model = QStandardItemModel(0, len(headers), self)
@@ -13908,6 +15626,11 @@ $mail.Display()
         if len(headers) > 2:
             table.setColumnWidth(2, max(table.columnWidth(2), 95))
         table.resizeRowsToContents()
+        try:
+            table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+            table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        except Exception:
+            pass
 
 
     def create_order_analysis_progress_dialog(self, total_items, supplier_name):
@@ -13943,20 +15666,35 @@ $mail.Display()
 
 
     def load_order_analysis(self, show_warning=True):
-        supplier_edit = self.get_order_analysis_supplier_edit()
+        selector_edit = self.get_order_analysis_supplier_edit()
         table = self.get_order_analysis_table()
-        if supplier_edit is None or table is None:
+        if selector_edit is None or table is None:
             return
 
-        typed_supplier = supplier_edit.text().strip()
-        supplier_name = self.find_supplier_name(typed_supplier)
-        if not supplier_name:
+        mode = self.get_order_analysis_mode()
+        typed_value = selector_edit.text().strip()
+        if mode == "group":
+            selected_value = self.find_product_group_name(typed_value)
+            mode_label = "Product Group"
+            invalid_message = "Please enter a valid product group name or a unique product group prefix."
+            filter_expr = self.build_items_group_expression(alias=False)
+            filter_match_clause, filter_columns = self.build_items_group_match_clause()
+        else:
+            selected_value = self.find_supplier_name(typed_value)
+            mode_label = "Supplier"
+            invalid_message = "Please enter a valid supplier name or a unique supplier prefix."
+            filter_expr = self.build_items_supplier_expression(alias=False)
+            filter_match_clause, filter_columns = self.build_items_supplier_match_clause()
+
+        if not selected_value:
             if show_warning:
-                QMessageBox.warning(self, "Invalid supplier", "Please enter a valid supplier name or a unique supplier prefix.")
+                QMessageBox.warning(self, f"Invalid {mode_label.lower()}", invalid_message)
             return
 
-        supplier_edit.setText(supplier_name)
-        self.current_order_analysis_supplier = supplier_name
+        selector_edit.setText(selected_value)
+        self.current_order_analysis_supplier = selected_value
+        self.current_order_analysis_filter_value = selected_value
+        self.current_order_analysis_mode = mode
 
         start_date = self.month_start_from_picker(self.get_order_analysis_start_picker())
         end_date = self.month_end_from_picker(self.get_order_analysis_end_picker())
@@ -13965,10 +15703,14 @@ $mail.Display()
                 QMessageBox.warning(self, "Invalid date range", "Start month cannot be after end month.")
             return
 
-        supplier_expr = self.build_items_supplier_expression(alias=False)
-        supplier_match_clause, supplier_columns = self.build_items_supplier_match_clause()
-        if not supplier_expr or not supplier_match_clause:
+        if not filter_expr or not filter_match_clause:
             table.setRowCount(0)
+            if show_warning:
+                QMessageBox.warning(
+                    self,
+                    "Order Analysis",
+                    f"Could not find an item-data column for {mode_label.lower()} filtering.",
+                )
             return
 
         item_rows = self.db_all(
@@ -13976,29 +15718,30 @@ $mail.Display()
             SELECT
                 TRIM(item_number) AS item_number,
                 COALESCE(NULLIF(TRIM(item_name), ''), NULLIF(TRIM(description), ''), '') AS item_name,
-                COALESCE({supplier_expr}, '') AS supplier_name,
+                COALESCE({filter_expr}, '') AS filter_value,
                 COALESCE(carton, 0) AS carton,
                 COALESCE(pallet, 0) AS pallet,
                 COALESCE(NULLIF(TRIM(planning_status), ''), 'ACTIVE') AS planning_status
             FROM items
             WHERE TRIM(COALESCE(item_number, '')) <> ''
-              AND ({supplier_match_clause})
+              AND ({filter_match_clause})
             ORDER BY item_number COLLATE NOCASE
             """,
-            tuple([supplier_name] * len(supplier_columns)),
+            tuple([selected_value] * len(filter_columns)),
         )
 
         months = self.month_list_between(start_date, end_date)
         months_count = max(1, len(months))
         lead_days = self.get_lead_time_days()
         rows_to_show = []
-        progress = self.create_order_analysis_progress_dialog(len(item_rows), supplier_name)
+        progress_target = f"{mode_label}: {selected_value}"
+        progress = self.create_order_analysis_progress_dialog(len(item_rows), progress_target)
 
         try:
             for index, item_row in enumerate(item_rows, start=1):
                 item_number = (item_row["item_number"] or "").strip()
                 if not item_number:
-                    self.update_order_analysis_progress(progress, index, len(item_rows), supplier_name)
+                    self.update_order_analysis_progress(progress, index, len(item_rows), progress_target)
                     continue
 
                 monthly_qty = self.fetch_item_monthly_qty(item_number, start_date, end_date)
@@ -14042,9 +15785,9 @@ $mail.Display()
                         "at_risk": at_risk_qty,
                     })
 
-                self.update_order_analysis_progress(progress, index, len(item_rows), supplier_name)
+                self.update_order_analysis_progress(progress, index, len(item_rows), progress_target)
         finally:
-            self.update_order_analysis_progress(progress, len(item_rows), len(item_rows), supplier_name)
+            self.update_order_analysis_progress(progress, len(item_rows), len(item_rows), progress_target)
             progress.close()
 
         rows_to_show.sort(
@@ -14144,34 +15887,41 @@ $mail.Display()
         table = self.get_order_analysis_table()
         if table is None:
             return
+
         item = table.itemAt(pos)
-        if item is None:
-            return
-        row = item.row()
-        item_cell = table.item(row, self.order_analysis_columns["item_number"])
-        item_number = item_cell.text().strip() if item_cell is not None and item_cell.text() else ""
-        if not item_number:
-            return
+        row = item.row() if item is not None else -1
+        item_number = ""
+        if row >= 0:
+            item_cell = table.item(row, self.order_analysis_columns["item_number"])
+            item_number = item_cell.text().strip() if item_cell is not None and item_cell.text() else ""
+            if item_number:
+                table.selectRow(row)
 
         menu = QMenu(table)
-        status_menu = menu.addMenu("Set Planning Status")
-        current_status = self.get_item_planning_status(item_number)
         actions = {}
-        for status in PLANNING_STATUSES:
-            action = status_menu.addAction(self.planning_status_display_text(status))
-            action.setCheckable(True)
-            action.setChecked(self.normalise_planning_status(current_status) == status)
-            actions[action] = status
-        menu.addSeparator()
-        open_item_action = menu.addAction("Open Item Summary")
+        open_item_action = None
+
+        if item_number:
+            status_menu = menu.addMenu("Set Planning Status")
+            current_status = self.get_item_planning_status(item_number)
+            for status in PLANNING_STATUSES:
+                action = status_menu.addAction(self.planning_status_display_text(status))
+                action.setCheckable(True)
+                action.setChecked(self.normalise_planning_status(current_status) == status)
+                actions[action] = status
+            menu.addSeparator()
+            open_item_action = menu.addAction("Open Item Summary")
+            menu.addSeparator()
+
+        add_table_format_menu(self, menu, table, self.settings, "main_window")
 
         chosen = menu.exec(table.viewport().mapToGlobal(pos))
         if chosen is None:
             return
-        if chosen == open_item_action:
+        if open_item_action is not None and chosen == open_item_action and item_number:
             self.open_item_summary_from_order_analysis(item_number)
             return
-        if chosen in actions:
+        if item_number and chosen in actions:
             if self.set_item_planning_status(item_number, actions[chosen]):
                 self.update_order_analysis_status_cache(item_number, actions[chosen])
                 if self.current_item_number and self.current_item_number.strip().upper() == item_number.upper():
