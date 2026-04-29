@@ -1,0 +1,36 @@
+﻿Issue Type,Order No,Item Number,Packed Qty,MYOB Qty,Difference,Supplier Item,Colour,Notes
+OVERSUPPLY,250702,MTYC70736 B,5800.0,5000.0,800.0,Poly Mattress Tape,Solid Black,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,251022,MTCH50 W,22000.0,20000.0,2000.0,Poly Handle Tape,White,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,251207,MTCH50 W,10500.0,10000.0,500.0,Poly Handle Tape,White,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,251211,HBTP15 BLACK,22000.0,20000.0,2000.0,Polyester Tape,Black,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,251215,MTS36 BT,34500.0,30000.0,4500.0,Poly Mattress Tape,Beige T297 / Tan T307,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,251216 CS,MT402536 WD TB,20850.0,19500.0,1350.0,Poly Mattress Tape,Taupe T3748 with highlight colour Brown T5917,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,260124,MT36 WHITE,19500.0,15000.0,4500.0,Poly Mattress Tape,White,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,260129,ELW 25B,2900.0,2000.0,900.0,PP + Poly Woven Elastic,Black,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,260129,HBTPFR26 BLACK,33000.0,30000.0,3000.0,Polyester Tape -                 3 TIMES RUBBER,Black - R18433,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,260129,MTS36 DK SIL,46500.0,45000.0,1500.0,Poly Mattress Tape,Dk Silver - A17748,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,260129,SFW25B,5000.0,4000.0,1000.0,High Strength Poly Shadeflex Webbing,Dope - Dyed Black,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,260217 KEL,WEBKEL2 25B,3850.0,3000.0,850.0,Polyester Jacquard Webbing,Silver T861 and Orange Pantone # 1655 Jacquard on Black with Silver T861 lines on edges,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,260225,ELKSR 25CH,2800.0,2000.0,800.0,Polyester 37 Gauge Knitted Elastic,Charcoal - T1371,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,260225,MTCS36 SWDKS,97500.0,81000.0,16500.0,Poly Mattress Tape,Shiny White / Dk Silver A17748,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,260225,MTYC70736 CW,32000.0,30000.0,2000.0,Poly Mattress Tape,Charcoal T2055 / Shiny White,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,260226,HBTP22 BLACK,24000.0,20000.0,4000.0,Polyester Tape,Black,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,260304 CS,MT400336 CHAONDKS,22500.0,21000.0,1500.0,Poly Mattress Tape,Charcoal T2055 on Dk Silver A17748,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,260304 CS,MTS100 BLACK,3500.0,3000.0,500.0,Poly Border Tape,Black,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,260311,WEBRG 50B,3450.0,3000.0,450.0,G0001 High Strength Polyester Webbing,Black,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,260327,ELBH 12W,4200.0,4000.0,200.0,Polyester Heavy Braided Elastic,White,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,260327,WEBSP 20B,1950.0,1500.0,450.0,"Spun Pol,yester Webbing",Black,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,260327,MTYC70736 G,11000.0,10000.0,1000.0,Poly Mattress Tape,Grey T3937,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,260331,ELKHR30 15W,20860.0,20000.0,860.0,Polyester 2344 # 30 Knitted Elastic,White,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,260331,MT22 807 CHARCOAL,19200.0,18000.0,1200.0,Poly Mattress Tape,Charcoal - 807,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,260407,ELKSR 25BE,2200.0,2000.0,200.0,Polyester 37 Gauge Knitted Elastic,Beige - R 240,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,260407,ELKSR 32W,11000.0,10000.0,1000.0,Polyester 37 Gauge Knitted Elastic,White,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,260407,HBTP16 BLACK SHF,32000.0,30000.0,2000.0,Polyester Tape,Black,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,260407,MTF36 NC,16500.0,15000.0,1500.0,Poly Mattress Tape,Navy T1481 /           Charcoal T2055,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,260407,WEBPP38B,6000.0,5000.0,1000.0,UV Polyprop Webbing,Black,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,260409SM,LMT36 SH-SILVER LX,14000.0,12000.0,2000.0,Poly Mattress Tape,SH-Silver LX,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,260413,WEBEE 25B,3500.0,3000.0,500.0,High Strength Polyester Webbing,Black,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,250812,MT405083 SC,5500.0,5000.0,500.0,Poly Handle Tape,Black / FE0016 (Shiny Charcoal),Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,251003,WEBAS 50B,2350.0,2000.0,350.0,PP Webbing with UV,Black,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,251011,WEBABC 100BRS,1450.0,1000.0,450.0,Polyester Webbing,Black with Red Stripe,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+OVERSUPPLY,10530,\CDL,505.0,500.0,5.0,Complete Dog Lead,Dark Blue T1876 Ground,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.

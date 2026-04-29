@@ -1,0 +1,16 @@
+{
+  "packing_source_rows": 107,
+  "grouped_packing_lines": 86,
+  "output_po_lines": 86,
+  "matched_adjustment_lines": 86,
+  "unmatched_lines": 0,
+  "oversupply_lines": 35,
+  "duplicate_review_lines": 0,
+  "myob_pos_adjusted": 39,
+  "adjusted_lines": 86,
+  "zeroed_lines": 38,
+  "empty_po_candidates": 12,
+  "total_packed_qty": 1633439.0,
+  "total_adjusted_qty": 1571574.0,
+  "total_remaining_qty_on_touched_pos": 2086761.0
+}
