@@ -33,4 +33,6 @@ OVERSUPPLY,260413,WEBEE 25B,3500.0,3000.0,500.0,High Strength Polyester Webbing,
 OVERSUPPLY,250812,MT405083 SC,5500.0,5000.0,500.0,Poly Handle Tape,Black / FE0016 (Shiny Charcoal),Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
 OVERSUPPLY,251003,WEBAS 50B,2350.0,2000.0,350.0,PP Webbing with UV,Black,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
 OVERSUPPLY,251011,WEBABC 100BRS,1450.0,1000.0,450.0,Polyester Webbing,Black with Red Stripe,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.
+PRICE DISCREPANCY,260224,V100BH,54.0,120.0,20.2%,Hook,Black,Invoice USD unit 7.762 converts to AUD 11.41471 at 0.68; MYOB AUD unit is 9.5.
+PRICE DISCREPANCY,260224,V100BL,120.0,180.0,20.2%,Loop,Black,Invoice USD unit 7.762 converts to AUD 11.41471 at 0.68; MYOB AUD unit is 9.5.
 OVERSUPPLY,10530,\CDL,505.0,500.0,5.0,Complete Dog Lead,Dark Blue T1876 Ground,Packed quantity is higher than MYOB quantity. Do not auto-adjust below zero.

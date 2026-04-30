@@ -1,0 +1,18 @@
+{
+  "Packing source rows": 107,
+  "Grouped packing lines": 86,
+  "New PO item lines": 86,
+  "New PO visible lines incl. headers": 125,
+  "MYOB POs adjusted": 39,
+  "MYOB lines adjusted": 86,
+  "Lines reduced to zero": 38,
+  "Empty / delete candidate POs": 12,
+  "Oversupply lines": 35,
+  "Unmatched lines": 0,
+  "Duplicate review lines": 0,
+  "Invoice price rows": 86,
+  "Major price discrepancies": 2,
+  "Total packed qty": 1633439.0,
+  "Total adjusted qty": 1571574.0,
+  "Remaining qty on touched POs": 2086761.0
+}

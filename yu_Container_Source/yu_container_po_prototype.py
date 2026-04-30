@@ -36,6 +36,9 @@ NS = {
     "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
 }
 
+DEFAULT_EXCHANGE_RATE = 0.68
+DEFAULT_MAJOR_PRICE_THRESHOLD = 0.20
+
 
 def clean_text(value):
     if value is None:
@@ -218,6 +221,133 @@ def load_packing_list(path):
     return items
 
 
+def load_invoice_prices(path):
+    try:
+        rows = read_xlsx_sheet(path, "Invoice")
+    except Exception:
+        return {}
+
+    grouped = {}
+    for row_number, row in enumerate(rows, start=1):
+        if row_number < 24:
+            continue
+
+        supplier_item = clean_text(row[0] if len(row) > 0 else "")
+        order_no_raw = clean_text(row[1] if len(row) > 1 else "")
+        unit_usd = to_float(row[7] if len(row) > 7 else 0)
+        qty = to_float(row[8] if len(row) > 8 else 0)
+        total_usd = to_float(row[9] if len(row) > 9 else 0)
+        item_number = clean_text(row[10] if len(row) > 10 else "")
+
+        if not supplier_item or not order_no_raw or not item_number or qty <= 0:
+            continue
+
+        if unit_usd <= 0 and total_usd > 0:
+            unit_usd = total_usd / qty
+        if total_usd <= 0 and unit_usd > 0:
+            total_usd = unit_usd * qty
+
+        key = (norm_order(order_no_raw), norm_item(item_number))
+        if key not in grouped:
+            grouped[key] = {
+                "Order No": norm_order(order_no_raw),
+                "Order No Display": order_no_raw,
+                "Item Number": item_number,
+                "Item Key": norm_item(item_number),
+                "Supplier Item": supplier_item,
+                "Invoice Qty": 0.0,
+                "Invoice USD Total": 0.0,
+                "Invoice Source Rows": [],
+                "Invoice Unit Prices": [],
+            }
+
+        target = grouped[key]
+        target["Invoice Qty"] += qty
+        target["Invoice USD Total"] += total_usd
+        target["Invoice Source Rows"].append(row_number)
+        if unit_usd > 0:
+            target["Invoice Unit Prices"].append(unit_usd)
+
+    for target in grouped.values():
+        if target["Invoice Qty"] > 0 and target["Invoice USD Total"] > 0:
+            target["Invoice USD Unit"] = target["Invoice USD Total"] / target["Invoice Qty"]
+        elif target["Invoice Unit Prices"]:
+            target["Invoice USD Unit"] = sum(target["Invoice Unit Prices"]) / len(target["Invoice Unit Prices"])
+        else:
+            target["Invoice USD Unit"] = 0.0
+
+        rounded_prices = {round(price, 6) for price in target["Invoice Unit Prices"]}
+        target["Invoice Price Note"] = "Multiple invoice unit prices" if len(rounded_prices) > 1 else ""
+        target["Invoice Source Rows"] = ",".join(str(row) for row in target["Invoice Source Rows"])
+
+    return grouped
+
+
+def format_price(value):
+    try:
+        return f"{float(value):.5f}".rstrip("0").rstrip(".")
+    except Exception:
+        return clean_text(value)
+
+
+def format_percent(value):
+    try:
+        return f"{float(value) * 100:.1f}%"
+    except Exception:
+        return ""
+
+
+def build_price_check(invoice_row, myob_price_aud, exchange_rate=DEFAULT_EXCHANGE_RATE, major_price_threshold=DEFAULT_MAJOR_PRICE_THRESHOLD):
+    exchange_rate = float(exchange_rate or DEFAULT_EXCHANGE_RATE)
+    major_price_threshold = float(major_price_threshold or DEFAULT_MAJOR_PRICE_THRESHOLD)
+    myob_price_aud = float(myob_price_aud or 0.0)
+
+    if not invoice_row:
+        return {
+            "Price Check": "NO INVOICE PRICE",
+            "Invoice USD Unit": "",
+            "Invoice AUD Unit": "",
+            "MYOB AUD Unit": format_price(myob_price_aud),
+            "Difference AUD": "",
+            "Difference %": "",
+            "Invoice Qty": "",
+            "Invoice Source Rows": "",
+            "Price Note": "No matching invoice row by order number + item number.",
+            "_is_major_price_issue": False,
+        }
+
+    invoice_usd_unit = float(invoice_row.get("Invoice USD Unit") or 0.0)
+    invoice_aud_unit = invoice_usd_unit / exchange_rate if exchange_rate else 0.0
+    diff_aud = invoice_aud_unit - myob_price_aud
+    diff_pct = diff_aud / myob_price_aud if myob_price_aud else 0.0
+
+    if invoice_usd_unit <= 0 or myob_price_aud <= 0:
+        status = "PRICE UNKNOWN"
+        is_major = False
+        note = "Missing invoice or MYOB unit price."
+    elif abs(diff_pct) >= major_price_threshold:
+        status = "PRICE ISSUE"
+        is_major = True
+        note = f"Major price difference at {format_percent(diff_pct)} using exchange rate {exchange_rate}."
+    else:
+        status = "PRICE OK"
+        is_major = False
+        note = invoice_row.get("Invoice Price Note") or "Within threshold."
+
+    return {
+        "Price Check": status,
+        "Invoice USD Unit": format_price(invoice_usd_unit),
+        "Invoice AUD Unit": format_price(invoice_aud_unit),
+        "MYOB AUD Unit": format_price(myob_price_aud),
+        "Difference AUD": format_price(diff_aud),
+        "Difference %": format_percent(diff_pct),
+        "Invoice Qty": fmt_qty(invoice_row.get("Invoice Qty", 0)),
+        "Invoice Source Rows": clean_text(invoice_row.get("Invoice Source Rows")),
+        "Price Note": note,
+        "_is_major_price_issue": is_major,
+    }
+
+
 def load_myob_itempur(path):
     with open(path, "r", encoding="utf-8-sig", newline="") as file:
         lines = file.readlines()
@@ -310,14 +440,16 @@ def build_myob_indexes(myob_rows):
     return by_order_item, by_po
 
 
-def analyse_container(packing_path, myob_path):
+def analyse_container(packing_path, myob_path, exchange_rate=DEFAULT_EXCHANGE_RATE, major_price_threshold=DEFAULT_MAJOR_PRICE_THRESHOLD):
     packing_items = load_packing_list(packing_path)
     grouped_packing = aggregate_packing(packing_items)
+    invoice_prices = load_invoice_prices(packing_path)
     myob_rows = load_myob_itempur(myob_path)
     by_order_item, by_po = build_myob_indexes(myob_rows)
 
     adjustments = []
     issues = []
+    price_checks = []
     po_rows = []
     orders_touched = set()
     oversupply_lines = 0
@@ -386,6 +518,41 @@ def analyse_container(packing_path, myob_path):
 
         orders_touched.add(chosen["_purchase_no_norm"] or packed["Order No"])
 
+        invoice_row = invoice_prices.get((packed["Order No"], packed["Item Key"]))
+        price_check = build_price_check(invoice_row, chosen["_price"], exchange_rate, major_price_threshold)
+        if price_check["_is_major_price_issue"]:
+            issues.append({
+                "Issue Type": "PRICE DISCREPANCY",
+                "Order No": packed["Order No Display"],
+                "Item Number": packed["Item Number"],
+                "Packed Qty": packed_qty,
+                "MYOB Qty": original_qty,
+                "Difference": price_check["Difference %"],
+                "Supplier Item": packed["Supplier Item"],
+                "Colour": packed["Colour"],
+                "Notes": f"Invoice USD unit {price_check['Invoice USD Unit']} converts to AUD {price_check['Invoice AUD Unit']} at {exchange_rate}; MYOB AUD unit is {price_check['MYOB AUD Unit']}.",
+            })
+
+        price_checks.append({
+            "Price Check": price_check["Price Check"],
+            "Supplier": clean_text(chosen.get("Co./Last Name")),
+            "MYOB Purchase No": clean_text(chosen.get("Purchase No.")),
+            "Order No": packed["Order No Display"],
+            "Item Number": clean_text(chosen.get("Item Number")),
+            "Description": clean_text(chosen.get("Description")),
+            "Invoice USD Unit": price_check["Invoice USD Unit"],
+            "Invoice AUD Unit": price_check["Invoice AUD Unit"],
+            "MYOB AUD Unit": price_check["MYOB AUD Unit"],
+            "Difference AUD": price_check["Difference AUD"],
+            "Difference %": price_check["Difference %"],
+            "Invoice Qty": price_check["Invoice Qty"],
+            "Packed Qty": packed_qty,
+            "Original MYOB Qty": original_qty,
+            "Invoice Source Rows": price_check["Invoice Source Rows"],
+            "Packing Source Rows": ",".join(str(row) for row in packed["Source Rows"]),
+            "Note": price_check["Price Note"],
+        })
+
         adjustments.append({
             "Status": status,
             "Supplier": clean_text(chosen.get("Co./Last Name")),
@@ -397,6 +564,11 @@ def analyse_container(packing_path, myob_path):
             "Packed Qty": packed_qty,
             "Remaining Qty": max(0.0, remaining_qty),
             "Adjustment Qty": min(original_qty, packed_qty),
+            "MYOB AUD Unit": price_check["MYOB AUD Unit"],
+            "Invoice USD Unit": price_check["Invoice USD Unit"],
+            "Invoice AUD Unit": price_check["Invoice AUD Unit"],
+            "Price Difference %": price_check["Difference %"],
+            "Price Check": price_check["Price Check"],
             "Source Rows": ",".join(str(row) for row in packed["Source Rows"]),
             "Line No": chosen["_line_no"],
             "Note": note,
@@ -408,6 +580,9 @@ def analyse_container(packing_path, myob_path):
             "Quantity": packed_qty,
             "Description": clean_text(chosen.get("Description")),
             "Price": clean_text(chosen.get("Price")),
+            "Invoice USD Unit": price_check["Invoice USD Unit"],
+            "Invoice AUD Unit": price_check["Invoice AUD Unit"],
+            "Price Check": price_check["Price Check"],
             "Supplier Item": packed["Supplier Item"],
             "Colour": packed["Colour"],
             "Source Rows": ",".join(str(row) for row in packed["Source Rows"]),
@@ -451,6 +626,7 @@ def analyse_container(packing_path, myob_path):
 
     po_rows.sort(key=lambda row: (norm_order(row["Order No"]), norm_item(row["Item Number"])))
     adjustments.sort(key=lambda row: (norm_order(row["Order No"]), norm_item(row["Item Number"])))
+    price_checks.sort(key=lambda row: (row["Price Check"] != "PRICE ISSUE", norm_order(row["Order No"]), norm_item(row["Item Number"])))
     po_summary.sort(key=lambda row: clean_text(row["MYOB Purchase No"]))
 
     po_preview = []
@@ -467,6 +643,9 @@ def analyse_container(packing_path, myob_path):
                 "Quantity": 0,
                 "Description": f"O/NO {row['Order No']}",
                 "Price": "$0.00",
+                "Invoice USD Unit": "",
+                "Invoice AUD Unit": "",
+                "Price Check": "",
                 "Status": "GROUP HEADER",
             })
             last_order = row["Order No"]
@@ -479,6 +658,9 @@ def analyse_container(packing_path, myob_path):
             "Quantity": row["Quantity"],
             "Description": row["Description"],
             "Price": row["Price"],
+            "Invoice USD Unit": row.get("Invoice USD Unit", ""),
+            "Invoice AUD Unit": row.get("Invoice AUD Unit", ""),
+            "Price Check": row.get("Price Check", ""),
             "Status": row["Status"],
         })
 
@@ -494,6 +676,8 @@ def analyse_container(packing_path, myob_path):
         "Oversupply lines": oversupply_lines,
         "Unmatched lines": sum(1 for issue in issues if issue["Issue Type"] == "UNMATCHED"),
         "Duplicate review lines": duplicate_review_lines,
+        "Invoice price rows": len(invoice_prices),
+        "Major price discrepancies": sum(1 for row in price_checks if row["Price Check"] == "PRICE ISSUE"),
         "Total packed qty": sum(row["Quantity"] for row in po_rows),
         "Total adjusted qty": sum(row["Adjustment Qty"] for row in adjustments),
         "Remaining qty on touched POs": sum(row["After Qty"] for row in po_summary),
@@ -522,6 +706,7 @@ def analyse_container(packing_path, myob_path):
         "adjustments": adjustments,
         "po_summary": po_summary,
         "issues": issues,
+        "price_checks": price_checks,
     }
 
 
@@ -537,13 +722,20 @@ def write_csv(path, rows, fieldnames=None):
 class StatCard(QFrame):
     def __init__(self, title):
         super().__init__()
+        self.setObjectName("statCard")
         self.setFrameShape(QFrame.StyledPanel)
-        self.setStyleSheet("QFrame { border: 1px solid #CBD5E1; border-radius: 8px; background: #F8FAFC; }")
+        self.setStyleSheet(
+            "QFrame#statCard {"
+            " border: 1px solid #3B82F6;"
+            " border-radius: 8px;"
+            " background: #172033;"
+            "}"
+        )
         layout = QVBoxLayout(self)
         self.title = QLabel(title)
-        self.title.setStyleSheet("font-size: 10pt; color: #475569;")
+        self.title.setStyleSheet("font-size: 10pt; color: #BFDBFE; background: transparent; border: none;")
         self.value = QLabel("—")
-        self.value.setStyleSheet("font-size: 15pt; font-weight: bold; color: #0F172A;")
+        self.value.setStyleSheet("font-size: 15pt; font-weight: bold; color: #FFFFFF; background: transparent; border: none;")
         layout.addWidget(self.title)
         layout.addWidget(self.value)
 
@@ -557,7 +749,88 @@ class PrototypeWindow(QMainWindow):
         self.setWindowTitle("YU Container Prototype - MYOB PO Preview")
         self.resize(1500, 900)
         self.results = None
+        self.apply_readable_dark_theme()
         self.build_ui()
+
+    def apply_readable_dark_theme(self):
+        # Keep this prototype readable even when Windows / Qt is in dark mode.
+        # The old pale warning colours were being paired with white text by the OS theme.
+        self.setStyleSheet("""
+            QMainWindow, QWidget {
+                background-color: #111827;
+                color: #F9FAFB;
+                font-size: 10pt;
+            }
+            QLabel {
+                color: #F9FAFB;
+                background: transparent;
+            }
+            QLineEdit, QTextEdit {
+                background-color: #1F2937;
+                color: #F9FAFB;
+                border: 1px solid #4B5563;
+                border-radius: 4px;
+                padding: 4px;
+                selection-background-color: #2563EB;
+            }
+            QPushButton {
+                background-color: #2563EB;
+                color: #FFFFFF;
+                border: 1px solid #60A5FA;
+                border-radius: 5px;
+                padding: 6px 10px;
+            }
+            QPushButton:hover {
+                background-color: #1D4ED8;
+            }
+            QPushButton:pressed {
+                background-color: #1E40AF;
+            }
+            QTabWidget::pane {
+                border: 1px solid #4B5563;
+                background-color: #111827;
+            }
+            QTabBar::tab {
+                background-color: #1F2937;
+                color: #D1D5DB;
+                border: 1px solid #374151;
+                padding: 7px 12px;
+            }
+            QTabBar::tab:selected {
+                background-color: #2563EB;
+                color: #FFFFFF;
+                border-color: #60A5FA;
+            }
+            QTableWidget {
+                background-color: #111827;
+                alternate-background-color: #1F2937;
+                color: #F9FAFB;
+                gridline-color: #374151;
+                border: 1px solid #4B5563;
+                selection-background-color: #2563EB;
+                selection-color: #FFFFFF;
+            }
+            QHeaderView::section {
+                background-color: #374151;
+                color: #FFFFFF;
+                border: 1px solid #4B5563;
+                padding: 5px;
+                font-weight: bold;
+            }
+            QScrollBar:horizontal, QScrollBar:vertical {
+                background: #111827;
+                border: 1px solid #374151;
+            }
+            QScrollBar::handle:horizontal, QScrollBar::handle:vertical {
+                background: #6B7280;
+                border-radius: 4px;
+                min-height: 24px;
+                min-width: 24px;
+            }
+            QScrollBar::handle:horizontal:hover, QScrollBar::handle:vertical:hover {
+                background: #9CA3AF;
+            }
+        """)
 
     def build_ui(self):
         root = QWidget()
@@ -575,6 +848,8 @@ class PrototypeWindow(QMainWindow):
         self.packing_edit = QLineEdit()
         self.myob_edit = QLineEdit()
         self.new_po_edit = QLineEdit("NEW_CONTAINER_PO")
+        self.exchange_rate_edit = QLineEdit(str(DEFAULT_EXCHANGE_RATE))
+        self.price_threshold_edit = QLineEdit(str(int(DEFAULT_MAJOR_PRICE_THRESHOLD * 100)))
 
         browse_packing = QPushButton("Browse Packing List")
         browse_packing.clicked.connect(self.browse_packing)
@@ -583,7 +858,7 @@ class PrototypeWindow(QMainWindow):
 
         run_button = QPushButton("Run Prototype Analysis")
         run_button.clicked.connect(self.run_analysis)
-        run_button.setStyleSheet("font-weight: bold; padding: 6px;")
+        run_button.setStyleSheet("font-weight: bold; padding: 6px 10px; background-color: #16A34A; border-color: #86EFAC;")
 
         export_button = QPushButton("Export CSV Results")
         export_button.clicked.connect(self.export_results)
@@ -596,8 +871,12 @@ class PrototypeWindow(QMainWindow):
         picker_layout.addWidget(browse_myob, 1, 2)
         picker_layout.addWidget(QLabel("New Container PO No"), 2, 0)
         picker_layout.addWidget(self.new_po_edit, 2, 1)
-        picker_layout.addWidget(run_button, 2, 2)
-        picker_layout.addWidget(export_button, 2, 3)
+        picker_layout.addWidget(QLabel("USD→AUD factor"), 3, 0)
+        picker_layout.addWidget(self.exchange_rate_edit, 3, 1)
+        picker_layout.addWidget(QLabel("Major price threshold %"), 3, 2)
+        picker_layout.addWidget(self.price_threshold_edit, 3, 3)
+        picker_layout.addWidget(run_button, 4, 2)
+        picker_layout.addWidget(export_button, 4, 3)
         root_layout.addLayout(picker_layout)
 
         self.stat_grid = QGridLayout()
@@ -611,6 +890,8 @@ class PrototypeWindow(QMainWindow):
             "Empty / delete candidate POs",
             "Oversupply lines",
             "Unmatched lines",
+            "Major price discrepancies",
+            "Invoice price rows",
             "Total packed qty",
             "Total adjusted qty",
             "Remaining qty on touched POs",
@@ -624,7 +905,7 @@ class PrototypeWindow(QMainWindow):
 
         self.tabs = QTabWidget()
         self.tables = {}
-        for name in ["Output PO Preview", "MYOB Adjustments", "PO Summary", "Issues", "Packing Lines"]:
+        for name in ["Output PO Preview", "MYOB Adjustments", "Price Check", "PO Summary", "Issues", "Packing Lines"]:
             table = QTableWidget()
             table.setAlternatingRowColors(True)
             table.setSortingEnabled(True)
@@ -636,7 +917,7 @@ class PrototypeWindow(QMainWindow):
         notes = QTextEdit()
         notes.setReadOnly(True)
         notes.setMaximumHeight(90)
-        notes.setPlainText("Process: Import PackingList → read item number/order number/packed qty → match exact item+order against ITEMPURTEST.TXT → preview new grouped PO → preview reductions to original MYOB POs. Oversupply is shown as an issue and should not be live-written without approval.")
+        notes.setPlainText("Process: Import PackingList + Invoice → read item/order/packed qty and invoice USD unit price → convert USD to AUD using the factor above → compare against MYOB order AUD price → preview new grouped PO and old PO reductions. Oversupply and major price issues are shown as review issues and should not be live-written without approval.")
         root_layout.addWidget(notes)
 
         self.setCentralWidget(root)
@@ -671,7 +952,10 @@ class PrototypeWindow(QMainWindow):
             return
 
         try:
-            self.results = analyse_container(packing_path, myob_path)
+            exchange_rate = to_float(self.exchange_rate_edit.text()) or DEFAULT_EXCHANGE_RATE
+            threshold_value = to_float(self.price_threshold_edit.text())
+            major_price_threshold = threshold_value / 100.0 if threshold_value > 1 else (threshold_value or DEFAULT_MAJOR_PRICE_THRESHOLD)
+            self.results = analyse_container(packing_path, myob_path, exchange_rate=exchange_rate, major_price_threshold=major_price_threshold)
         except Exception as exc:
             QMessageBox.critical(self, "Analysis failed", str(exc))
             return
@@ -681,6 +965,7 @@ class PrototypeWindow(QMainWindow):
 
         self.populate_table("Output PO Preview", self.results["po_preview"])
         self.populate_table("MYOB Adjustments", self.results["adjustments"])
+        self.populate_table("Price Check", self.results["price_checks"])
         self.populate_table("PO Summary", self.results["po_summary"])
         self.populate_table("Issues", self.results["issues"])
         self.populate_table("Packing Lines", self.results["packing_lines"])
@@ -703,6 +988,7 @@ class PrototypeWindow(QMainWindow):
 
         for row_index, row in enumerate(rows):
             row_status = clean_text(row.get("Status") or row.get("Issue Type") or row.get("Empty/Delete Candidate"))
+            price_status = clean_text(row.get("Price Check"))
             for col_index, column in enumerate(columns):
                 value = row.get(column, "")
                 if isinstance(value, float):
@@ -711,14 +997,25 @@ class PrototypeWindow(QMainWindow):
                     display = clean_text(value)
                 item = QTableWidgetItem(display)
                 item.setFlags((item.flags() | Qt.ItemIsSelectable | Qt.ItemIsEnabled) & ~Qt.ItemIsEditable)
+                # Use dark warning colours with explicit foregrounds.
+                # This avoids unreadable white-on-pale-pink rows under Windows dark mode.
                 if "OVERSUPPLY" in row_status:
-                    item.setBackground(QBrush(QColor("#FCE7E7")))
+                    item.setBackground(QBrush(QColor("#7F1D1D")))
+                    item.setForeground(QBrush(QColor("#FFFFFF")))
+                elif price_status == "PRICE ISSUE" or "PRICE DISCREPANCY" in row_status:
+                    item.setBackground(QBrush(QColor("#831843")))
+                    item.setForeground(QBrush(QColor("#FFFFFF")))
                 elif "UNMATCHED" in row_status:
-                    item.setBackground(QBrush(QColor("#FFE4C7")))
+                    item.setBackground(QBrush(QColor("#7C2D12")))
+                    item.setForeground(QBrush(QColor("#FFFFFF")))
                 elif row_status == "YES":
-                    item.setBackground(QBrush(QColor("#FEF3C7")))
+                    item.setBackground(QBrush(QColor("#713F12")))
+                    item.setForeground(QBrush(QColor("#FFFFFF")))
                 elif row_status == "GROUP HEADER":
-                    item.setBackground(QBrush(QColor("#DBEAFE")))
+                    item.setBackground(QBrush(QColor("#1D4ED8")))
+                    item.setForeground(QBrush(QColor("#FFFFFF")))
+                else:
+                    item.setForeground(QBrush(QColor("#F9FAFB")))
                 table.setItem(row_index, col_index, item)
 
         table.resizeColumnsToContents()
@@ -736,8 +1033,9 @@ class PrototypeWindow(QMainWindow):
         folder_path = Path(folder)
         write_csv(folder_path / "output_po_preview.csv", self.results["po_preview"])
         write_csv(folder_path / "myob_order_adjustments.csv", self.results["adjustments"])
+        write_csv(folder_path / "price_check.csv", self.results["price_checks"])
         write_csv(folder_path / "myob_po_summary.csv", self.results["po_summary"])
-        write_csv(folder_path / "issues_oversupply_unmatched.csv", self.results["issues"], ["Issue Type", "Order No", "Item Number", "Packed Qty", "MYOB Qty", "Difference", "Supplier Item", "Colour", "Notes"])
+        write_csv(folder_path / "issues_oversupply_unmatched_price.csv", self.results["issues"], ["Issue Type", "Order No", "Item Number", "Packed Qty", "MYOB Qty", "Difference", "Supplier Item", "Colour", "Notes"])
         write_csv(folder_path / "packing_lines_loaded.csv", self.results["packing_lines"])
         with open(folder_path / "stats.json", "w", encoding="utf-8") as file:
             json.dump(self.results["stats"], file, indent=2)
