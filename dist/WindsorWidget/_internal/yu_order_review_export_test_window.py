@@ -7,12 +7,15 @@ import json
 import os
 import re
 import sys
+import shutil
+import tempfile
+import zipfile
 from collections import defaultdict
 from copy import copy, deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
 try:
@@ -547,6 +550,356 @@ def write_audit_csv(audit_path: str, results: list[OrderResolveResult]) -> None:
             )
 
 
+
+SHEET_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+OFFICE_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+MC_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+XLSX_IGNORABLE_NAMESPACES = {
+    "x14ac": "http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac",
+    "xr": "http://schemas.microsoft.com/office/spreadsheetml/2014/revision",
+    "xr2": "http://schemas.microsoft.com/office/spreadsheetml/2015/revision2",
+    "xr3": "http://schemas.microsoft.com/office/spreadsheetml/2016/revision3",
+    "xr6": "http://schemas.microsoft.com/office/spreadsheetml/2016/revision6",
+    "xr10": "http://schemas.microsoft.com/office/spreadsheetml/2016/revision10",
+}
+ET_NS = {"s": SHEET_NS, "r": OFFICE_REL_NS, "rel": PACKAGE_REL_NS}
+
+
+def _register_xlsx_namespaces() -> None:
+    try:
+        import xml.etree.ElementTree as ET
+        ET.register_namespace("", SHEET_NS)
+        ET.register_namespace("r", OFFICE_REL_NS)
+        ET.register_namespace("mc", MC_NS)
+        for prefix, namespace_uri in XLSX_IGNORABLE_NAMESPACES.items():
+            ET.register_namespace(prefix, namespace_uri)
+    except Exception:
+        pass
+
+
+def _xml_namespace_is_used(root, namespace_uri: str) -> bool:
+    namespace_marker = f"{{{namespace_uri}}}"
+    for node in root.iter():
+        if str(node.tag).startswith(namespace_marker):
+            return True
+        for attr_name in node.attrib.keys():
+            if str(attr_name).startswith(namespace_marker):
+                return True
+    return False
+
+
+def _ensure_mc_ignorable_namespace_declarations(root) -> None:
+    ignorable_attr = f"{{{MC_NS}}}Ignorable"
+    ignorable_text = str(root.attrib.get(ignorable_attr, "") or "").strip()
+    if not ignorable_text:
+        return
+
+    for prefix in ignorable_text.split():
+        namespace_uri = XLSX_IGNORABLE_NAMESPACES.get(prefix)
+        if not namespace_uri:
+            continue
+        # ElementTree drops namespace declarations that are only mentioned inside
+        # mc:Ignorable. Excel treats that as a damaged worksheet part, so add
+        # explicit xmlns declarations for ignorable prefixes that are otherwise unused.
+        if not _xml_namespace_is_used(root, namespace_uri):
+            root.set(f"xmlns:{prefix}", namespace_uri)
+
+
+def _xlsx_xml_tostring(root) -> bytes:
+    import xml.etree.ElementTree as ET
+
+    _ensure_mc_ignorable_namespace_declarations(root)
+    data = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    if data.startswith(b"<?xml version='1.0' encoding='utf-8'?>"):
+        data = data.replace(
+            b"<?xml version='1.0' encoding='utf-8'?>",
+            b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+            1,
+        )
+    return data
+
+
+def _xlsx_part_for_sheet(zip_file: zipfile.ZipFile, sheet_name: str) -> str:
+    import xml.etree.ElementTree as ET
+
+    workbook_root = ET.fromstring(zip_file.read("xl/workbook.xml"))
+    rels_root = ET.fromstring(zip_file.read("xl/_rels/workbook.xml.rels"))
+    rel_targets = {rel.attrib.get("Id"): rel.attrib.get("Target", "") for rel in rels_root}
+
+    sheets_node = workbook_root.find("s:sheets", ET_NS)
+    if sheets_node is None:
+        raise ValueError("Workbook contains no sheets list.")
+
+    for sheet in sheets_node.findall("s:sheet", ET_NS):
+        if sheet.attrib.get("name") != sheet_name:
+            continue
+        rel_id = sheet.attrib.get(f"{{{OFFICE_REL_NS}}}id")
+        target = rel_targets.get(rel_id, "")
+        if not target:
+            break
+        if target.startswith("/"):
+            return target.lstrip("/")
+        return str(PurePosixPath("xl") / target)
+
+    raise ValueError(f"Sheet '{sheet_name}' not found in workbook.")
+
+
+def _xlsx_shared_strings(zip_file: zipfile.ZipFile) -> list[str]:
+    import xml.etree.ElementTree as ET
+
+    if "xl/sharedStrings.xml" not in zip_file.namelist():
+        return []
+    root = ET.fromstring(zip_file.read("xl/sharedStrings.xml"))
+    strings: list[str] = []
+    for si in root.findall("s:si", ET_NS):
+        parts = []
+        for node in si.iter(f"{{{SHEET_NS}}}t"):
+            parts.append(node.text or "")
+        strings.append("".join(parts))
+    return strings
+
+
+def _cell_text(cell, shared_strings: list[str]) -> str:
+    if cell is None:
+        return ""
+    cell_type = cell.attrib.get("t", "")
+    if cell_type == "inlineStr":
+        parts = []
+        for node in cell.iter(f"{{{SHEET_NS}}}t"):
+            parts.append(node.text or "")
+        return "".join(parts)
+    value_node = cell.find("s:v", ET_NS)
+    if value_node is None or value_node.text is None:
+        return ""
+    value = value_node.text
+    if cell_type == "s":
+        try:
+            return shared_strings[int(value)]
+        except Exception:
+            return value
+    return value
+
+
+def _excel_int(value: Any) -> int | None:
+    try:
+        if value is None:
+            return None
+        if isinstance(value, int):
+            return int(value)
+        text = str(value).strip()
+        if not text:
+            return None
+        return int(float(text))
+    except Exception:
+        return None
+
+
+def _split_cell_ref(cell_ref: str) -> tuple[str, int]:
+    match = re.match(r"^([A-Z]+)(\d+)$", str(cell_ref or "").upper())
+    if not match:
+        raise ValueError(f"Invalid cell reference: {cell_ref}")
+    return match.group(1), int(match.group(2))
+
+
+def _cell_sort_key(cell) -> int:
+    ref = cell.attrib.get("r", "A1")
+    col_text, _row = _split_cell_ref(ref)
+    return column_index_from_string(col_text)
+
+
+def _sheet_rows_by_number(root) -> dict[int, Any]:
+    sheet_data = root.find("s:sheetData", ET_NS)
+    if sheet_data is None:
+        raise ValueError("Worksheet has no sheetData node.")
+    rows: dict[int, Any] = {}
+    for row in sheet_data.findall("s:row", ET_NS):
+        try:
+            rows[int(row.attrib.get("r", "0"))] = row
+        except Exception:
+            pass
+    return rows
+
+
+def _ensure_xml_row(root, row_number: int):
+    import xml.etree.ElementTree as ET
+
+    sheet_data = root.find("s:sheetData", ET_NS)
+    if sheet_data is None:
+        sheet_data = ET.SubElement(root, f"{{{SHEET_NS}}}sheetData")
+    rows = _sheet_rows_by_number(root)
+    row = rows.get(row_number)
+    if row is not None:
+        return row
+    row = ET.Element(f"{{{SHEET_NS}}}row", {"r": str(row_number)})
+    inserted = False
+    for index, existing in enumerate(list(sheet_data)):
+        try:
+            if int(existing.attrib.get("r", "0")) > row_number:
+                sheet_data.insert(index, row)
+                inserted = True
+                break
+        except Exception:
+            continue
+    if not inserted:
+        sheet_data.append(row)
+    return row
+
+
+def _ensure_xml_cell(root, cell_ref: str):
+    import xml.etree.ElementTree as ET
+
+    _col_text, row_number = _split_cell_ref(cell_ref)
+    row = _ensure_xml_row(root, row_number)
+    for cell in row.findall("s:c", ET_NS):
+        if cell.attrib.get("r") == cell_ref:
+            return cell
+    cell = ET.Element(f"{{{SHEET_NS}}}c", {"r": cell_ref})
+    children = list(row)
+    target_key = _cell_sort_key(cell)
+    inserted = False
+    for index, existing in enumerate(children):
+        try:
+            if _cell_sort_key(existing) > target_key:
+                row.insert(index, cell)
+                inserted = True
+                break
+        except Exception:
+            continue
+    if not inserted:
+        row.append(cell)
+    return cell
+
+
+def _set_xml_cell_text(root, cell_ref: str, value: str | None) -> None:
+    import xml.etree.ElementTree as ET
+
+    cell = _ensure_xml_cell(root, cell_ref)
+    for child in list(cell):
+        tag = child.tag
+        if tag in {f"{{{SHEET_NS}}}v", f"{{{SHEET_NS}}}is", f"{{{SHEET_NS}}}f"}:
+            cell.remove(child)
+    if value is None or str(value).strip() == "":
+        cell.attrib.pop("t", None)
+        return
+    cell.attrib["t"] = "inlineStr"
+    inline = ET.SubElement(cell, f"{{{SHEET_NS}}}is")
+    text_node = ET.SubElement(inline, f"{{{SHEET_NS}}}t")
+    text = str(value).strip()
+    text_node.text = text
+    if text.startswith(" ") or text.endswith(" "):
+        text_node.attrib["{http://www.w3.org/XML/1998/namespace}space"] = "preserve"
+
+
+def _find_header_column_in_xml(root, shared_strings: list[str], header_text: str, header_row: int = 4, default_col: str = "A") -> int:
+    wanted = str(header_text or "").strip().lower()
+    row = _sheet_rows_by_number(root).get(header_row)
+    if row is not None:
+        for cell in row.findall("s:c", ET_NS):
+            if _cell_text(cell, shared_strings).strip().lower() == wanted:
+                col_text, _row_number = _split_cell_ref(cell.attrib.get("r", "A1"))
+                return column_index_from_string(col_text)
+    return column_index_from_string(default_col)
+
+
+def _review_row_map_by_source(root, shared_strings: list[str], source_col: int, header_row: int = 4) -> dict[int, int]:
+    rows_by_number = _sheet_rows_by_number(root)
+    source_letter = get_column_letter(source_col)
+    out: dict[int, int] = {}
+    for row_number, row in rows_by_number.items():
+        if row_number <= header_row:
+            continue
+        source_cell = None
+        source_ref = f"{source_letter}{row_number}"
+        for cell in row.findall("s:c", ET_NS):
+            if cell.attrib.get("r") == source_ref:
+                source_cell = cell
+                break
+        source_row = _excel_int(_cell_text(source_cell, shared_strings))
+        if source_row is not None:
+            out[source_row] = row_number
+    return out
+
+
+def save_yuchang_workbook_matches(
+    template_path: str,
+    row_matches: dict[int, str | None],
+    *,
+    order_sheet_name: str = "Sheet1",
+    match_col: str = "A",
+    review_sheet_name: str = "Match_Review",
+    review_header_row: int = 4,
+) -> dict:
+    import xml.etree.ElementTree as ET
+
+    if not row_matches:
+        return {"updated_rows": [], "path": str(template_path or "")}
+
+    workbook_path = Path(str(template_path or "").strip())
+    if not workbook_path.exists():
+        raise FileNotFoundError(f"YU workbook was not found: {workbook_path}")
+
+    _register_xlsx_namespaces()
+    updated_parts: dict[str, bytes] = {}
+
+    with zipfile.ZipFile(str(workbook_path), "r") as zin:
+        shared_strings = _xlsx_shared_strings(zin)
+        order_part = _xlsx_part_for_sheet(zin, order_sheet_name)
+        order_root = ET.fromstring(zin.read(order_part))
+        match_letter = get_column_letter(column_index_from_string(match_col))
+        updated_rows: list[int] = []
+
+        for source_row, item_number in row_matches.items():
+            row_number = int(source_row)
+            if row_number <= 0:
+                continue
+            value = str(item_number or "").strip() or None
+            _set_xml_cell_text(order_root, f"{match_letter}{row_number}", value)
+            updated_rows.append(row_number)
+
+        updated_parts[order_part] = _xlsx_xml_tostring(order_root)
+
+        try:
+            review_part = _xlsx_part_for_sheet(zin, review_sheet_name)
+        except Exception:
+            review_part = ""
+        if review_part:
+            review_root = ET.fromstring(zin.read(review_part))
+            source_col = _find_header_column_in_xml(review_root, shared_strings, "Source Row", review_header_row, "A")
+            final_col = _find_header_column_in_xml(review_root, shared_strings, "Final Selection", review_header_row, "B")
+            final_letter = get_column_letter(final_col)
+            review_row_by_source = _review_row_map_by_source(review_root, shared_strings, source_col, review_header_row)
+
+            for source_row, item_number in row_matches.items():
+                review_row = review_row_by_source.get(int(source_row))
+                if review_row is None:
+                    continue
+                value = str(item_number or "").strip() or None
+                _set_xml_cell_text(review_root, f"{final_letter}{review_row}", value)
+
+            updated_parts[review_part] = _xlsx_xml_tostring(review_root)
+
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{workbook_path.stem}_", suffix=workbook_path.suffix, dir=str(workbook_path.parent))
+        os.close(fd)
+        tmp_path = Path(tmp_name)
+        try:
+            with zipfile.ZipFile(str(tmp_path), "w", zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    data = updated_parts.get(item.filename)
+                    if data is None:
+                        data = zin.read(item.filename)
+                    zout.writestr(item, data)
+            shutil.move(str(tmp_path), str(workbook_path))
+        finally:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
+
+    return {"updated_rows": sorted(set(updated_rows)), "path": str(workbook_path)}
+
+
 def export_yuchang_po_compact_by_rows(
     template_path: str,
     output_path: str,
@@ -558,7 +911,7 @@ def export_yuchang_po_compact_by_rows(
     qty_col: str = "L",
     date_cell: str = "C10",
     order_no_cell: str = "H10",
-    export_min_col: str = "B",
+    export_min_col: str = "A",
     export_max_col: str = "N",
     header_start_row: int = 1,
     header_end_row: int = 14,
@@ -1882,8 +2235,84 @@ class YUOrderReviewWindow(QMainWindow):
                 (str(row["new_status"]), source_row),
             )
 
+    def source_rows_for_final_selection(self, item_number: str) -> list[int]:
+        rows = self.db.all(
+            f"""
+            SELECT source_row
+            FROM dbo.{self.tables["match_review"]}
+            WHERE ISNULL(final_selection, '') = ?
+            ORDER BY source_row
+            """,
+            (str(item_number or "").strip(),),
+        )
+        out: list[int] = []
+        for row in rows:
+            try:
+                out.append(int(row["source_row"]))
+            except Exception:
+                pass
+        return out
+
+    def save_workbook_matches_or_warn(self, row_matches: dict[int, str | None], action_title: str = "Save YU Match") -> bool:
+        if not row_matches:
+            return True
+        try:
+            result = save_yuchang_workbook_matches(self.template_path, row_matches)
+        except PermissionError as exc:
+            QMessageBox.warning(
+                self,
+                action_title,
+                "The match could not be saved to the YU workbook.\n\n"
+                "Close the workbook in Excel and try again.\n\n"
+                f"{exc}",
+            )
+            return False
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                action_title,
+                "The match could not be saved to the YU workbook, so the local review table was not changed.\n\n"
+                f"{exc}",
+            )
+            return False
+        updated_rows = result.get("updated_rows") or []
+        if updated_rows:
+            self.statusBar().showMessage(
+                f"Saved YU workbook match row(s): {', '.join(str(r) for r in updated_rows)}.",
+                5000,
+            )
+        return True
+
+    def sync_confirmed_matches_to_workbook(self) -> bool:
+        rows = self.db.all(
+            f"""
+            SELECT source_row, final_selection
+            FROM dbo.{self.tables["match_review"]}
+            WHERE ISNULL(final_selection, '') <> ''
+            ORDER BY source_row
+            """
+        )
+        row_matches: dict[int, str | None] = {}
+        for row in rows:
+            try:
+                row_matches[int(row["source_row"])] = str(row.get("final_selection") or "").strip() or None
+            except Exception:
+                pass
+        return self.save_workbook_matches_or_warn(row_matches, "Sync YU Matches")
+
     def confirm_item_to_source_row(self, item_number: str, source_row: int):
+        item_number = str(item_number or "").strip()
+        source_row = int(source_row)
         self.ensure_match_review_row(source_row)
+
+        row_matches: dict[int, str | None] = {source_row: item_number}
+        for existing_source_row in self.source_rows_for_final_selection(item_number):
+            if existing_source_row != source_row:
+                row_matches[existing_source_row] = None
+
+        if not self.save_workbook_matches_or_warn(row_matches, "Confirm YU Match"):
+            return
+
         self.reset_row_status_for_item(item_number, exclude_source_row=source_row)
         self.db.execute(
             f"""
@@ -1893,7 +2322,7 @@ class YUOrderReviewWindow(QMainWindow):
             """,
             (item_number, source_row),
         )
-        self.statusBar().showMessage(f"Confirmed {item_number} to source row {source_row}.", 5000)
+        self.statusBar().showMessage(f"Confirmed {item_number} to source row {source_row} and saved it to the workbook.", 5000)
         self.refresh_all()
         self.reselect_item(item_number)
 
@@ -1962,6 +2391,15 @@ class YUOrderReviewWindow(QMainWindow):
             QMessageBox.information(self, "YU Order Review", f"There is no confirmed mapping for {item_number}.")
             return
 
+        row_matches: dict[int, str | None] = {}
+        for row in rows:
+            try:
+                row_matches[int(row["source_row"])] = None
+            except Exception:
+                pass
+        if not self.save_workbook_matches_or_warn(row_matches, "Clear YU Match"):
+            return
+
         for row in rows:
             self.db.execute(
                 f"""
@@ -1972,7 +2410,7 @@ class YUOrderReviewWindow(QMainWindow):
                 (str(row["new_status"]), int(row["source_row"])),
             )
 
-        self.statusBar().showMessage(f"Cleared confirmation for {item_number}.", 5000)
+        self.statusBar().showMessage(f"Cleared confirmation for {item_number} and saved it to the workbook.", 5000)
         self.refresh_all()
         self.reselect_item(item_number)
 
@@ -1992,6 +2430,9 @@ class YUOrderReviewWindow(QMainWindow):
 
         if not self.current_rows:
             QMessageBox.warning(self, "YU Order Review", "There are no visible order rows to export.")
+            return
+
+        if not self.sync_confirmed_matches_to_workbook():
             return
 
         output_dir = QFileDialog.getExistingDirectory(
