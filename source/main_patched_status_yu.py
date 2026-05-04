@@ -80,12 +80,14 @@ from yu_order_workflow import YUOrderEntryDialog, load_yu_review_module
 TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
 TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
 TABLE_FORMAT_SETTINGS_PREFIX = "table_format"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.1"
 APP_DESIGNER = "Bradley Mayze"
 UPDATE_REPO_OWNER = "Kuillemaul"
 UPDATE_REPO_NAME = "Windsor_Widget_Code"
 UPDATE_RELEASES_API_URL = f"https://api.github.com/repos/{UPDATE_REPO_OWNER}/{UPDATE_REPO_NAME}/releases/latest"
 UPDATE_RELEASES_PAGE_URL = f"https://github.com/{UPDATE_REPO_OWNER}/{UPDATE_REPO_NAME}/releases/latest"
+UPDATE_INSTALLER_EXTENSIONS = (".exe", ".msi", ".msix", ".msixbundle")
+UPDATE_INSTALLER_KEYWORDS = ("setup", "installer", "install", "windsor", "widget")
 
 PLANNING_STATUS_ACTIVE = "ACTIVE"
 PLANNING_STATUS_SPECIAL_ORDER = "SPECIAL_ORDER"
@@ -3744,7 +3746,7 @@ class FrozenColumnsHelper:
 
 
 class UpdateCheckSignals(QObject):
-    update_available = Signal(str, str, str, str)
+    update_available = Signal(object)
 
 
 def version_to_tuple(version_text):
@@ -3760,6 +3762,55 @@ def version_to_tuple(version_text):
 
 def is_newer_version(remote_version, current_version):
     return version_to_tuple(remote_version) > version_to_tuple(current_version)
+
+
+def safe_update_filename(name, fallback="Windsor_Widget_Update.exe"):
+    """Keep downloaded update asset names safe for a local temp folder."""
+    text = str(name or "").strip() or fallback
+    text = re.sub(r"[^A-Za-z0-9_.() -]+", "_", text)
+    text = text.strip(" .")
+    return text or fallback
+
+
+def find_installer_asset(release_payload):
+    """Return the best installer asset from a GitHub release payload.
+
+    Auto-install only works when the GitHub Release has an attached installer asset.
+    Source code zip/tarball links are deliberately ignored because they are not installers.
+    """
+    assets = release_payload.get("assets") if isinstance(release_payload, dict) else []
+    candidates = []
+    for asset in assets or []:
+        if not isinstance(asset, dict):
+            continue
+        name = str(asset.get("name") or "").strip()
+        url = str(asset.get("browser_download_url") or "").strip()
+        if not name or not url:
+            continue
+        lower_name = name.lower()
+        suffix = Path(lower_name).suffix
+        if suffix not in UPDATE_INSTALLER_EXTENSIONS:
+            continue
+        score = 0
+        for keyword in UPDATE_INSTALLER_KEYWORDS:
+            if keyword in lower_name:
+                score += 1
+        if lower_name.endswith(".exe"):
+            score += 3
+        elif lower_name.endswith(".msi"):
+            score += 2
+        try:
+            size = int(asset.get("size") or 0)
+        except Exception:
+            size = 0
+        candidates.append((score, size, name, url))
+
+    if not candidates:
+        return {"name": "", "url": "", "size": 0}
+
+    candidates.sort(reverse=True)
+    _score, size, name, url = candidates[0]
+    return {"name": name, "url": url, "size": size}
 
 
 class MainWindow(QMainWindow):
@@ -3989,14 +4040,30 @@ class MainWindow(QMainWindow):
         if not is_newer_version(latest_version, APP_VERSION):
             return
 
-        release_url = str(payload.get("html_url") or UPDATE_RELEASES_PAGE_URL).strip()
-        release_name = str(payload.get("name") or latest_tag).strip()
-        release_notes = str(payload.get("body") or "").strip()
-        self.update_check_signals.update_available.emit(latest_version, release_url, release_name, release_notes)
+        installer_asset = find_installer_asset(payload)
+        update_info = {
+            "latest_version": latest_version,
+            "release_url": str(payload.get("html_url") or UPDATE_RELEASES_PAGE_URL).strip(),
+            "release_name": str(payload.get("name") or latest_tag).strip(),
+            "release_notes": str(payload.get("body") or "").strip(),
+            "installer_name": installer_asset.get("name", ""),
+            "installer_url": installer_asset.get("url", ""),
+            "installer_size": installer_asset.get("size", 0),
+        }
+        self.update_check_signals.update_available.emit(update_info)
 
-    def show_update_available_message(self, latest_version, release_url, release_name, release_notes):
+    def show_update_available_message(self, update_info):
+        update_info = update_info or {}
+        latest_version = str(update_info.get("latest_version") or "").strip()
         if not latest_version:
             return
+
+        release_url = str(update_info.get("release_url") or UPDATE_RELEASES_PAGE_URL).strip()
+        release_name = str(update_info.get("release_name") or f"Version {latest_version}").strip()
+        release_notes = str(update_info.get("release_notes") or "").strip()
+        installer_url = str(update_info.get("installer_url") or "").strip()
+        installer_name = str(update_info.get("installer_name") or "").strip()
+
         message = QMessageBox(self)
         message.setWindowTitle("Windsor Widget Update Available")
         message.setIcon(QMessageBox.Information)
@@ -4005,18 +4072,175 @@ class MainWindow(QMainWindow):
             f"Installed version: {APP_VERSION}\n"
             f"Latest version: {latest_version}"
         )
+
         details = release_name or f"Version {latest_version}"
+        if installer_name:
+            details += f"\n\nInstaller asset: {installer_name}"
         if release_notes:
             details = f"{details}\n\n{release_notes[:1800]}"
             if len(release_notes) > 1800:
                 details += "\n\n..."
-        message.setInformativeText("Open the GitHub release page to download or review the update.")
         message.setDetailedText(details)
-        open_button = message.addButton("Open Release Page", QMessageBox.AcceptRole)
+
+        install_button = None
+        if installer_url:
+            message.setInformativeText(
+                "Download and install the update now. Windsor Widget will close before the installer starts."
+            )
+            install_button = message.addButton("Download and Install", QMessageBox.AcceptRole)
+            message.addButton("Open Release Page", QMessageBox.ActionRole)
+        else:
+            message.setInformativeText(
+                "No installer file was attached to this GitHub Release. Open the release page to download it manually."
+            )
+            message.addButton("Open Release Page", QMessageBox.AcceptRole)
         message.addButton("Not Now", QMessageBox.RejectRole)
         message.exec()
-        if message.clickedButton() == open_button and release_url:
+
+        clicked = message.clickedButton()
+        clicked_text = clicked.text() if clicked is not None else ""
+        if install_button is not None and clicked == install_button:
+            self.download_and_install_update(update_info)
+        elif "Open Release" in clicked_text and release_url:
             QDesktopServices.openUrl(QUrl(release_url))
+
+    def download_and_install_update(self, update_info):
+        installer_url = str((update_info or {}).get("installer_url") or "").strip()
+        if not installer_url:
+            QMessageBox.warning(
+                self,
+                "Update Installer Missing",
+                "This release does not have an installer attached. Open the GitHub release page and download it manually.",
+            )
+            release_url = str((update_info or {}).get("release_url") or UPDATE_RELEASES_PAGE_URL).strip()
+            if release_url:
+                QDesktopServices.openUrl(QUrl(release_url))
+            return
+
+        latest_version = str((update_info or {}).get("latest_version") or "update").strip()
+        asset_name = safe_update_filename(
+            (update_info or {}).get("installer_name"),
+            fallback=f"Windsor_Widget_{latest_version}_Setup.exe",
+        )
+        update_dir = Path(tempfile.gettempdir()) / "WindsorWidgetUpdates"
+        update_dir.mkdir(parents=True, exist_ok=True)
+        installer_path = update_dir / asset_name
+        download_path = installer_path.with_suffix(installer_path.suffix + ".download")
+
+        progress = QProgressDialog("Downloading Windsor Widget update...", "Cancel", 0, 100, self)
+        progress.setWindowTitle("Downloading Update")
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        try:
+            request = urllib.request.Request(
+                installer_url,
+                headers={"User-Agent": f"WindsorWidget/{APP_VERSION}"},
+            )
+            with urllib.request.urlopen(request, timeout=30) as response:
+                try:
+                    total_bytes = int(response.headers.get("Content-Length") or 0)
+                except Exception:
+                    total_bytes = 0
+                downloaded_bytes = 0
+                with open(download_path, "wb") as handle:
+                    while True:
+                        if progress.wasCanceled():
+                            raise RuntimeError("Update download was cancelled.")
+                        chunk = response.read(1024 * 128)
+                        if not chunk:
+                            break
+                        handle.write(chunk)
+                        downloaded_bytes += len(chunk)
+                        if total_bytes > 0:
+                            progress.setValue(min(99, int(downloaded_bytes * 100 / total_bytes)))
+                        else:
+                            progress.setValue(0)
+                        QApplication.processEvents()
+            if installer_path.exists():
+                try:
+                    installer_path.unlink()
+                except Exception:
+                    pass
+            download_path.replace(installer_path)
+            progress.setValue(100)
+        except Exception as exc:
+            try:
+                if download_path.exists():
+                    download_path.unlink()
+            except Exception:
+                pass
+            progress.close()
+            QMessageBox.warning(
+                self,
+                "Update Download Failed",
+                f"The update could not be downloaded.\n\n{exc}",
+            )
+            return
+        finally:
+            progress.close()
+
+        reply = QMessageBox.question(
+            self,
+            "Install Update",
+            "The update has been downloaded. Windsor Widget will now close and start the installer.\n\nContinue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        if not self.launch_update_installer_and_close(installer_path):
+            QMessageBox.warning(
+                self,
+                "Update Launch Failed",
+                f"The installer was downloaded, but could not be started.\n\nInstaller location:\n{installer_path}",
+            )
+
+    def launch_update_installer_and_close(self, installer_path):
+        installer_path = Path(installer_path)
+        if not installer_path.exists():
+            return False
+
+        try:
+            if os.name == "nt":
+                batch_path = installer_path.with_name(f"run_windsor_update_{os.getpid()}.cmd")
+                batch_text = (
+                    "@echo off\r\n"
+                    "setlocal\r\n"
+                    f"set \"APP_PID={os.getpid()}\"\r\n"
+                    f"set \"INSTALLER={installer_path}\"\r\n"
+                    "echo Waiting for Windsor Widget to close...\r\n"
+                    ":wait_for_app\r\n"
+                    "tasklist /FI \"PID eq %APP_PID%\" 2>NUL | findstr /R /C:\"%APP_PID%\" >NUL\r\n"
+                    "if not errorlevel 1 (\r\n"
+                    "    timeout /t 1 /nobreak >NUL\r\n"
+                    "    goto wait_for_app\r\n"
+                    ")\r\n"
+                    "echo Starting installer...\r\n"
+                    "start \"\" \"%INSTALLER%\"\r\n"
+                    "endlocal\r\n"
+                )
+                batch_path.write_text(batch_text, encoding="utf-8")
+                creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+                subprocess.Popen(
+                    f'start "" "{batch_path}"',
+                    shell=True,
+                    cwd=str(installer_path.parent),
+                    creationflags=creationflags,
+                )
+            else:
+                subprocess.Popen([str(installer_path)], cwd=str(installer_path.parent))
+        except Exception:
+            return False
+
+        app = QApplication.instance()
+        if app is not None:
+            QTimer.singleShot(250, app.quit)
+        else:
+            self.close()
+        return True
 
     def setup_live_page_refresh(self):
         self.live_page_refresh_interval_ms = int(getattr(self, "live_page_refresh_interval_ms", 4000) or 4000)
