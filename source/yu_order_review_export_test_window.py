@@ -900,6 +900,186 @@ def save_yuchang_workbook_matches(
     return {"updated_rows": sorted(set(updated_rows)), "path": str(workbook_path)}
 
 
+def _make_compact_export_row_plan(
+    kept_rows: list[int],
+    row_has_item_fn,
+    *,
+    header_end_row: int,
+    footer_start_row: int,
+    separator_source_gap: int = 50,
+) -> list[int | None]:
+    """
+    Build the output row plan for compact exports.
+
+    None entries are deliberately inserted blank rows. This keeps separated order
+    sections readable after the export removes hundreds of unmatched supplier rows.
+    """
+    row_plan: list[int | None] = []
+    previous_detail_row: int | None = None
+
+    for old_row in kept_rows:
+        is_detail_row = header_end_row < old_row < footer_start_row and row_has_item_fn(old_row)
+        if (
+            is_detail_row
+            and previous_detail_row is not None
+            and old_row - previous_detail_row > separator_source_gap
+        ):
+            # Do not insert an extra blank if a header/note row was just kept immediately
+            # before this item. Header/note rows already act as the visual separator.
+            previous_kept = row_plan[-1] if row_plan else None
+            previous_kept_is_header_or_note = (
+                isinstance(previous_kept, int)
+                and header_end_row < previous_kept < footer_start_row
+                and not row_has_item_fn(previous_kept)
+            )
+            if not previous_kept_is_header_or_note:
+                row_plan.append(None)
+
+        row_plan.append(old_row)
+
+        if is_detail_row:
+            previous_detail_row = old_row
+
+    return row_plan
+
+
+def _collect_related_header_note_rows_above(
+    source_row: int,
+    *,
+    header_end_row: int,
+    matched_rows: set[int],
+    row_has_item_fn,
+    row_has_export_content_fn,
+    max_blank_scan: int = 3,
+    max_unmatched_item_scan: int = 25,
+) -> set[int]:
+    """
+    Find instruction/header rows that belong to a selected source row.
+
+    The old compact-export scan stopped as soon as it hit an item row above the
+    selected line. That misses headers for cases like the CAN mattress-tape block
+    where the first item under the note is not ordered, but a later item is.
+
+    This scan walks past nearby unmatched item rows so it can still pick up the
+    note/header immediately above the block, while refusing to cross a blank gap
+    after it has already skipped item rows.
+    """
+    related_rows: set[int] = set()
+    scan = int(source_row) - 1
+    blank_count = 0
+    skipped_unmatched_items = 0
+    found_header_or_note = False
+
+    while scan > header_end_row:
+        if row_has_item_fn(scan):
+            if scan in matched_rows:
+                break
+            skipped_unmatched_items += 1
+            if skipped_unmatched_items > max_unmatched_item_scan:
+                break
+            blank_count = 0
+            scan -= 1
+            continue
+
+        if row_has_export_content_fn(scan):
+            related_rows.add(scan)
+            found_header_or_note = True
+            blank_count = 0
+            scan -= 1
+            continue
+
+        blank_count += 1
+        if found_header_or_note or skipped_unmatched_items > 0 or blank_count > max_blank_scan:
+            break
+        scan -= 1
+
+    return related_rows
+
+
+def _cell_text_for_autofit(cell) -> str:
+    value = cell.value
+    if value in (None, ""):
+        return ""
+    number_format = str(getattr(cell, "number_format", "") or "")
+    if isinstance(value, str):
+        # Formula text is not the displayed value and can make columns wildly wide.
+        # Estimate simple amount formulas where possible, otherwise ignore formula text.
+        if value.startswith("="):
+            formula_match = re.fullmatch(r"=\s*([A-Z]+)(\d+)\s*\*\s*([A-Z]+)(\d+)\s*", value.strip(), flags=re.IGNORECASE)
+            if formula_match:
+                try:
+                    ws = cell.parent
+                    left = ws[f"{formula_match.group(1).upper()}{formula_match.group(2)}"].value
+                    right = ws[f"{formula_match.group(3).upper()}{formula_match.group(4)}"].value
+                    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+                        value = float(left) * float(right)
+                    else:
+                        return ""
+                except Exception:
+                    return ""
+            else:
+                return ""
+        else:
+            text = value
+            return max(str(part) for part in text.splitlines() or [""])
+
+    if isinstance(value, (int, float)):
+        if "$" in number_format:
+            decimals = 4 if "0000" in number_format else 2
+            text = f"${value:,.{decimals}f}"
+        elif "," in number_format or "#,##" in number_format:
+            text = f"{value:,.0f}" if float(value).is_integer() else f"{value:,.2f}"
+        else:
+            text = str(value)
+    else:
+        text = str(value)
+    return max(str(part) for part in text.splitlines() or [""])
+
+
+def _merged_cell_coordinates_to_skip_for_autofit(ws) -> set[str]:
+    skip: set[str] = set()
+    try:
+        for merged_range in ws.merged_cells.ranges:
+            min_col, min_row, max_col, max_row = merged_range.bounds
+            if min_col == max_col and min_row == max_row:
+                continue
+            for row in range(min_row, max_row + 1):
+                for col in range(min_col, max_col + 1):
+                    skip.add(f"{get_column_letter(col)}{row}")
+    except Exception:
+        return set()
+    return skip
+
+
+def auto_size_columns_from_row(
+    ws,
+    *,
+    start_row: int = 12,
+    min_width: float = 8.0,
+    max_width: float = 45.0,
+    padding: float = 2.0,
+) -> None:
+    """Auto-size columns using worksheet content from start_row down only."""
+    if ws.max_row < start_row:
+        return
+
+    skip_merged = _merged_cell_coordinates_to_skip_for_autofit(ws)
+    for col_idx in range(1, ws.max_column + 1):
+        letter = get_column_letter(col_idx)
+        max_len = 0
+        for row_idx in range(start_row, ws.max_row + 1):
+            cell = ws.cell(row_idx, col_idx)
+            if cell.coordinate in skip_merged:
+                continue
+            text = _cell_text_for_autofit(cell)
+            if text:
+                max_len = max(max_len, len(text))
+        if max_len <= 0:
+            continue
+        ws.column_dimensions[letter].width = min(max_width, max(min_width, max_len + padding))
+        ws.column_dimensions[letter].bestFit = True
+
+
 def export_yuchang_po_compact_by_rows(
     template_path: str,
     output_path: str,
@@ -918,6 +1098,8 @@ def export_yuchang_po_compact_by_rows(
     footer_start_row: int = 3045,
     footer_end_row: int = 3050,
     max_blank_scan: int = 3,
+    separator_source_gap: int = 50,
+    auto_size_start_row: int = 12,
 ) -> dict:
     template_path = str(template_path)
     output_path = str(output_path)
@@ -963,22 +1145,33 @@ def export_yuchang_po_compact_by_rows(
     rows_to_keep.update(matched_rows)
 
     for row in sorted(matched_rows):
-        scan = row - 1
-        blank_count = 0
-        while scan > header_end_row:
-            if row_has_item(scan):
-                break
-            if row_has_export_content(scan):
-                rows_to_keep.add(scan)
-                blank_count = 0
-            else:
-                blank_count += 1
-                if blank_count > max_blank_scan:
-                    break
-            scan -= 1
+        rows_to_keep.update(
+            _collect_related_header_note_rows_above(
+                row,
+                header_end_row=header_end_row,
+                matched_rows=matched_rows,
+                row_has_item_fn=row_has_item,
+                row_has_export_content_fn=row_has_export_content,
+                max_blank_scan=max_blank_scan,
+            )
+        )
 
     kept_rows = sorted(rows_to_keep)
-    row_map = {old_row: new_row for new_row, old_row in enumerate(kept_rows, start=1)}
+    row_plan = _make_compact_export_row_plan(
+        kept_rows,
+        row_has_item,
+        header_end_row=header_end_row,
+        footer_start_row=footer_start_row,
+        separator_source_gap=separator_source_gap,
+    )
+    row_map: dict[int, int] = {}
+    output_row = 1
+    for old_row in row_plan:
+        if old_row is None:
+            output_row += 1
+            continue
+        row_map[old_row] = output_row
+        output_row += 1
 
     out_wb = Workbook()
     out_ws = out_wb.active
@@ -1013,7 +1206,9 @@ def export_yuchang_po_compact_by_rows(
         out_dim.collapsed = src_dim.collapsed
         out_dim.outlineLevel = src_dim.outlineLevel
 
-    for old_row in kept_rows:
+    for old_row in row_plan:
+        if old_row is None:
+            continue
         new_row = row_map[old_row]
         src_row_dim = src.row_dimensions[old_row]
         out_row_dim = out_ws.row_dimensions[new_row]
@@ -1026,7 +1221,14 @@ def export_yuchang_po_compact_by_rows(
             out_col = src_col - export_min_idx + 1
             s = src.cell(old_row, src_col)
             d = out_ws.cell(new_row, out_col)
-            if isinstance(s.value, str) and s.value.startswith("="):
+
+            is_instruction_row = header_end_row < old_row < footer_start_row and not row_has_item(old_row)
+            if out_col == 1 and is_instruction_row:
+                # Supplier instruction/header rows can contain helper formulas in column A.
+                # Those formulas are not part of the purchase order and become #REF! after
+                # compact export, so leave column A blank for those rows.
+                d.value = None
+            elif isinstance(s.value, str) and s.value.startswith("="):
                 old_coord = f"{get_column_letter(src_col)}{old_row}"
                 new_coord = f"{get_column_letter(out_col)}{new_row}"
                 try:
@@ -1127,12 +1329,15 @@ def export_yuchang_po_compact_by_rows(
             last_detail = max(detail_rows)
             out_ws[f"{amount_out_col}{total_row}"] = f"=SUM({amount_out_col}{first_detail}:{amount_out_col}{last_detail})"
 
+    auto_size_columns_from_row(out_ws, start_row=auto_size_start_row)
+
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     out_wb.save(output_path)
     return {
         "output_path": output_path,
         "matched_rows": sorted(matched_rows),
         "kept_source_rows": kept_rows,
+        "inserted_blank_rows": sum(1 for row in row_plan if row is None),
     }
 
 
@@ -1318,14 +1523,23 @@ class YUOrderReviewWindow(QMainWindow):
 
         self.candidate_table = QTableWidget(self.candidate_frame)
         self.candidate_table.setObjectName("candidate_table")
-        self.candidate_table.setColumnCount(5)
-        self.candidate_table.setHorizontalHeaderLabels(["Row", "Hit Type", "Conf %", "Description", "Labelled As"])
+        self.candidate_table.setColumnCount(7)
+        self.candidate_table.setHorizontalHeaderLabels([
+            "Row", "Hit Type", "Conf %", "Item", "Description", "Size", "Labelled As"
+        ])
         self.candidate_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.candidate_table.setSelectionMode(QTableWidget.SingleSelection)
         self.candidate_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.candidate_table.verticalHeader().setVisible(False)
         self.candidate_table.itemSelectionChanged.connect(self.on_candidate_selection_changed)
         self.candidate_table.itemDoubleClicked.connect(lambda *_args: self.confirm_selected_candidate())
+        candidate_header = self.candidate_table.horizontalHeader()
+        candidate_header.setStretchLastSection(False)
+        candidate_header.setSectionsClickable(True)
+        # Keep the candidate columns manually resizable.
+        # resizeColumnToContents() is still called after data loads for a good starting width.
+        for column_index in range(self.candidate_table.columnCount()):
+            candidate_header.setSectionResizeMode(column_index, QHeaderView.Interactive)
         candidate_layout.addWidget(self.candidate_table)
 
         action_bar = QHBoxLayout()
@@ -1925,16 +2139,34 @@ class YUOrderReviewWindow(QMainWindow):
             return None
         return self.current_rows[row_index]
 
+    def supplier_candidate_values(self, row: dict) -> dict:
+        return {
+            "sheet_col_b": str(row.get("sheet_col_b") or ""),
+            "sheet_col_c": str(row.get("sheet_col_c") or ""),
+            "sheet_col_d": str(row.get("sheet_col_d") or ""),
+            "sheet_col_g": str(row.get("sheet_col_g") or ""),
+        }
+
+    def candidate_supplier_select_sql(self, prefix: str = "") -> str:
+        p = prefix
+        return (
+            f"COALESCE(NULLIF({p}current_item_number, ''), {p}literal_item_number, '') AS sheet_col_b, "
+            f"{p}description AS sheet_col_c, "
+            f"{p}size_text AS sheet_col_d, "
+            f"{p}labelled_as AS sheet_col_g"
+        )
+
     def load_candidates_for_item(self, item_number: str, current_result: OrderResolveResult) -> list[dict]:
         rows: list[dict] = []
+        supplier_cols = self.candidate_supplier_select_sql("s.")
 
         direct_rows = self.db.all(
             f"""
-            SELECT source_row, description, labelled_as
-            FROM dbo.{self.tables["supplier_lines"]}
-            WHERE row_kind = 'detail'
-              AND (ISNULL(current_item_number, '') = ? OR ISNULL(literal_item_number, '') = ?)
-            ORDER BY source_row
+            SELECT s.source_row, {supplier_cols}
+            FROM dbo.{self.tables["supplier_lines"]} s
+            WHERE s.row_kind = 'detail'
+              AND (ISNULL(s.current_item_number, '') = ? OR ISNULL(s.literal_item_number, '') = ?)
+            ORDER BY s.source_row
             """,
             (item_number, item_number),
         )
@@ -1943,13 +2175,12 @@ class YUOrderReviewWindow(QMainWindow):
                 "source_row": int(row["source_row"]),
                 "hit_type": "direct",
                 "confidence": None,
-                "description": str(row.get("description") or ""),
-                "labelled_as": str(row.get("labelled_as") or ""),
+                **self.supplier_candidate_values(row),
             })
 
         final_rows = self.db.all(
             f"""
-            SELECT r.source_row, s.description, s.labelled_as
+            SELECT r.source_row, {supplier_cols}
             FROM dbo.{self.tables["match_review"]} r
             LEFT JOIN dbo.{self.tables["supplier_lines"]} s ON s.source_row = r.source_row
             WHERE ISNULL(r.final_selection, '') = ?
@@ -1962,13 +2193,12 @@ class YUOrderReviewWindow(QMainWindow):
                 "source_row": int(row["source_row"]),
                 "hit_type": "final_selection",
                 "confidence": None,
-                "description": str(row.get("description") or ""),
-                "labelled_as": str(row.get("labelled_as") or ""),
+                **self.supplier_candidate_values(row),
             })
 
         suggested_rows = self.db.all(
             f"""
-            SELECT r.source_row, r.confidence_pct, s.description, s.labelled_as
+            SELECT r.source_row, r.confidence_pct, {supplier_cols}
             FROM dbo.{self.tables["match_review"]} r
             LEFT JOIN dbo.{self.tables["supplier_lines"]} s ON s.source_row = r.source_row
             WHERE ISNULL(r.suggested_match, '') = ?
@@ -1981,13 +2211,12 @@ class YUOrderReviewWindow(QMainWindow):
                 "source_row": int(row["source_row"]),
                 "hit_type": "suggested_match",
                 "confidence": float(row["confidence_pct"]) if row.get("confidence_pct") is not None else None,
-                "description": str(row.get("description") or ""),
-                "labelled_as": str(row.get("labelled_as") or ""),
+                **self.supplier_candidate_values(row),
             })
 
         candidate_rows = self.db.all(
             f"""
-            SELECT c.source_row, c.confidence_pct, c.candidate_rank, s.description, s.labelled_as
+            SELECT c.source_row, c.confidence_pct, c.candidate_rank, {supplier_cols}
             FROM dbo.{self.tables["match_candidates"]} c
             LEFT JOIN dbo.{self.tables["supplier_lines"]} s ON s.source_row = c.source_row
             WHERE c.candidate_item_number = ?
@@ -2000,8 +2229,7 @@ class YUOrderReviewWindow(QMainWindow):
                 "source_row": int(row["source_row"]),
                 "hit_type": f"candidate_{row.get('candidate_rank')}",
                 "confidence": float(row["confidence_pct"]) if row.get("confidence_pct") is not None else None,
-                "description": str(row.get("description") or ""),
-                "labelled_as": str(row.get("labelled_as") or ""),
+                **self.supplier_candidate_values(row),
             })
 
         if current_result.source_row is not None:
@@ -2009,9 +2237,9 @@ class YUOrderReviewWindow(QMainWindow):
             if not any(r["source_row"] == source_row and r["hit_type"] == "current" for r in rows):
                 src = self.db.one(
                     f"""
-                    SELECT source_row, description, labelled_as
-                    FROM dbo.{self.tables["supplier_lines"]}
-                    WHERE source_row = ?
+                    SELECT s.source_row, {supplier_cols}
+                    FROM dbo.{self.tables["supplier_lines"]} s
+                    WHERE s.source_row = ?
                     """,
                     (source_row,),
                 )
@@ -2020,8 +2248,7 @@ class YUOrderReviewWindow(QMainWindow):
                         "source_row": source_row,
                         "hit_type": "current",
                         "confidence": None,
-                        "description": str(src.get("description") or ""),
-                        "labelled_as": str(src.get("labelled_as") or ""),
+                        **self.supplier_candidate_values(src),
                     })
 
         deduped = []
@@ -2065,8 +2292,10 @@ class YUOrderReviewWindow(QMainWindow):
                 str(cand["source_row"]),
                 cand["hit_type"],
                 self.format_confidence(cand["confidence"]),
-                cand["description"],
-                cand["labelled_as"],
+                cand.get("sheet_col_b", ""),
+                cand.get("sheet_col_c", ""),
+                cand.get("sheet_col_d", ""),
+                cand.get("sheet_col_g", ""),
             ]
             for col, value in enumerate(values):
                 item = QTableWidgetItem(value)

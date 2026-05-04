@@ -128,6 +128,15 @@ class YUOrderEntryDialog(QDialog):
 
         button_row = QHBoxLayout()
         button_row.addStretch(1)
+
+        self.load_csv_button = QPushButton("Load CSV", self)
+        self.load_csv_button.clicked.connect(self.load_csv_from_file)
+        button_row.addWidget(self.load_csv_button)
+
+        self.save_csv_button = QPushButton("Save CSV", self)
+        self.save_csv_button.clicked.connect(self.save_csv_as)
+        button_row.addWidget(self.save_csv_button)
+
         self.save_later_button = QPushButton("Save for Later", self)
         self.save_later_button.clicked.connect(self.save_for_later)
         button_row.addWidget(self.save_later_button)
@@ -373,29 +382,131 @@ class YUOrderEntryDialog(QDialog):
             writer.writeheader()
             writer.writerows(rows)
 
+    def _row_value(self, row_data: dict, *names: str) -> str:
+        lowered = {str(key or '').strip().casefold(): value for key, value in (row_data or {}).items()}
+        for name in names:
+            value = lowered.get(str(name or '').strip().casefold())
+            if value not in (None, ''):
+                return str(value).strip()
+        return ''
+
+    def _default_yu_csv_path(self) -> Path:
+        order_no = self.normalised_order_number() or 'YU_order_test'
+        try:
+            base_dir = Path(self.main_window.get_yu_order_drafts_dir())
+        except Exception:
+            base_dir = Path.home()
+        return base_dir / f"{order_no}.csv"
+
+    def add_loaded_line(self, item_number: str, qty_value: float) -> bool:
+        item_number = self.find_item_number(str(item_number or '').strip())
+        try:
+            qty_value = float(qty_value)
+        except Exception:
+            qty_value = 0.0
+        if not item_number or qty_value <= 0:
+            return False
+
+        row = self.lines_table.rowCount()
+        self.lines_table.insertRow(row)
+        self.lines_table.setItem(row, 0, QTableWidgetItem(item_number))
+        self.lines_table.setItem(row, 1, QTableWidgetItem(self.description_for_item(item_number)))
+        qty_item = QTableWidgetItem(self.format_qty(qty_value))
+        qty_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.lines_table.setItem(row, 2, qty_item)
+        add_on_order_item = QTableWidgetItem('Add To On Order')
+        add_on_order_item.setTextAlignment(Qt.AlignCenter)
+        self.lines_table.setItem(row, 3, add_on_order_item)
+        remove_item = QTableWidgetItem('Remove')
+        remove_item.setTextAlignment(Qt.AlignCenter)
+        self.lines_table.setItem(row, 4, remove_item)
+        return True
+
     def load_draft(self, draft_path: Path):
         self.lines_table.setRowCount(0)
-        with draft_path.open(newline='', encoding='utf-8-sig') as f:
+        with Path(draft_path).open(newline='', encoding='utf-8-sig') as f:
             reader = csv.DictReader(f)
             rows = list(reader)
         if rows:
-            self.order_number_edit.setText(str(rows[0].get('Order Number', '')).strip())
+            order_no = self._row_value(rows[0], 'Order Number', 'Order No', 'Order')
+            if order_no:
+                self.order_number_edit.setText(order_no)
+
+        loaded_count = 0
         for row_data in rows:
-            row = self.lines_table.rowCount()
-            self.lines_table.insertRow(row)
-            self.lines_table.setItem(row, 0, QTableWidgetItem(str(row_data.get('Item Number', '')).strip()))
-            self.lines_table.setItem(row, 1, QTableWidgetItem(self.description_for_item(str(row_data.get('Item Number', '')).strip())))
-            qty_item = QTableWidgetItem(self.format_qty(float(row_data.get('QTY', 0) or 0)))
-            qty_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            self.lines_table.setItem(row, 2, qty_item)
-            add_on_order_item = QTableWidgetItem('Add To On Order')
-            add_on_order_item.setTextAlignment(Qt.AlignCenter)
-            self.lines_table.setItem(row, 3, add_on_order_item)
-            remove_item = QTableWidgetItem('Remove')
-            remove_item.setTextAlignment(Qt.AlignCenter)
-            self.lines_table.setItem(row, 4, remove_item)
+            item_number = self._row_value(row_data, 'Item Number', 'Item', 'Item No')
+            qty_text = self._row_value(row_data, 'QTY', 'Qty', 'Quantity')
+            try:
+                qty_value = float(str(qty_text or '0').replace(',', ''))
+            except Exception:
+                qty_value = 0.0
+            if self.add_loaded_line(item_number, qty_value):
+                loaded_count += 1
+
         self.lines_table.resizeRowsToContents()
         self.lines_table.resizeColumnsToContents()
+        return loaded_count
+
+    def save_csv_as(self):
+        order_no = self.normalised_order_number()
+        rows = self.rows_as_dicts()
+        if not order_no:
+            QMessageBox.warning(self, 'Missing order number', 'Enter the order number first.')
+            return
+        if not rows:
+            QMessageBox.warning(self, 'No lines', 'Add at least one line before saving.')
+            return
+
+        default_path = self._default_yu_csv_path()
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            'Save YU Order CSV',
+            str(default_path),
+            'CSV Files (*.csv);;All Files (*)',
+        )
+        if not file_path:
+            return
+
+        path = Path(file_path)
+        if path.suffix.lower() != '.csv':
+            path = path.with_suffix('.csv')
+        try:
+            self.write_csv(path)
+        except Exception as exc:
+            QMessageBox.critical(self, 'Save CSV failed', str(exc))
+            return
+        QMessageBox.information(self, 'CSV saved', f'Saved YU order CSV to:\n{path}')
+
+    def load_csv_from_file(self):
+        default_path = self._default_yu_csv_path()
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            'Load YU Order CSV',
+            str(default_path.parent),
+            'CSV Files (*.csv);;All Files (*)',
+        )
+        if not file_path:
+            return
+
+        if self.lines_table.rowCount() > 0:
+            answer = QMessageBox.question(
+                self,
+                'Replace current lines?',
+                'Loading a CSV will replace the current YU order lines. Continue?',
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+
+        try:
+            loaded_count = self.load_draft(Path(file_path))
+        except Exception as exc:
+            QMessageBox.critical(self, 'Load CSV failed', str(exc))
+            return
+
+        self._loaded_draft_order_no = self.normalised_order_number()
+        QMessageBox.information(self, 'CSV loaded', f'Loaded {loaded_count} line(s) from:\n{file_path}')
 
     def save_for_later(self):
         order_no = self.normalised_order_number()
