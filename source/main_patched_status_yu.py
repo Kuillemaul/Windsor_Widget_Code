@@ -10,11 +10,14 @@ import tempfile
 import json
 import subprocess
 import warnings
+import threading
+import urllib.error
+import urllib.request
 from pathlib import Path
 from datetime import datetime, date, timedelta
 from collections import Counter
 
-from PySide6.QtCore import Qt, QDate, QSettings, QMargins, QUrl, QEvent, QSignalBlocker, QTimer
+from PySide6.QtCore import Qt, QDate, QSettings, QMargins, QUrl, QEvent, QSignalBlocker, QTimer, QObject, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -77,8 +80,12 @@ from yu_order_workflow import YUOrderEntryDialog, load_yu_review_module
 TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
 TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
 TABLE_FORMAT_SETTINGS_PREFIX = "table_format"
-APP_VERSION = "1.1.8"
+APP_VERSION = "1.0.1"
 APP_DESIGNER = "Bradley Mayze"
+UPDATE_REPO_OWNER = "Kuillemaul"
+UPDATE_REPO_NAME = "Windsor_Widget_Code"
+UPDATE_RELEASES_API_URL = f"https://api.github.com/repos/{UPDATE_REPO_OWNER}/{UPDATE_REPO_NAME}/releases/latest"
+UPDATE_RELEASES_PAGE_URL = f"https://github.com/{UPDATE_REPO_OWNER}/{UPDATE_REPO_NAME}/releases/latest"
 
 PLANNING_STATUS_ACTIVE = "ACTIVE"
 PLANNING_STATUS_SPECIAL_ORDER = "SPECIAL_ORDER"
@@ -3736,6 +3743,25 @@ class FrozenColumnsHelper:
             self._syncing_row_height = False
 
 
+class UpdateCheckSignals(QObject):
+    update_available = Signal(str, str, str, str)
+
+
+def version_to_tuple(version_text):
+    """Return a safe comparable version tuple from tags like v1.0.1 or 1.0.1-beta."""
+    text = str(version_text or "").strip()
+    text = text.lstrip("vV")
+    text = re.split(r"[-+]", text, maxsplit=1)[0]
+    parts = [int(part) for part in re.findall(r"\d+", text)]
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts[:4])
+
+
+def is_newer_version(remote_version, current_version):
+    return version_to_tuple(remote_version) > version_to_tuple(current_version)
+
+
 class MainWindow(QMainWindow):
     STATE_SUFFIX_RE = re.compile(
         r"\s*(?:-\s*)?(N\.S\.W|N\.S\.W\.|NSW|VIC|QLD|WA|SA|TAS|NT|ACT|NEW SOUTH WALES|VICTORIA|QUEENSLAND|WESTERN AUSTRALIA|SOUTH AUSTRALIA|TASMANIA|NORTHERN TERRITORY|AUSTRALIAN CAPITAL TERRITORY)\s*$",
@@ -3758,6 +3784,8 @@ class MainWindow(QMainWindow):
         self.app_dir = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
         self.base_dir = Path(getattr(sys, "_MEIPASS", str(self.app_dir))).resolve() if getattr(sys, "frozen", False) else self.app_dir
         self.settings = QSettings("Windsor", "WidgetApp")
+        self.update_check_signals = UpdateCheckSignals(self)
+        self.update_check_signals.update_available.connect(self.show_update_available_message)
         self.db_conn = None
         self.db_engine = "sqlserver"
         self.db_config = {}
@@ -3927,6 +3955,68 @@ class MainWindow(QMainWindow):
         self.install_all_table_font_menus()
         self.install_all_table_header_double_click_sort()
         self.restore_theme()
+        QTimer.singleShot(1500, self.check_for_updates_on_startup)
+
+    def check_for_updates_on_startup(self):
+        """Check GitHub Releases for a newer published Windsor Widget version.
+
+        This is deliberately quiet on network failure so app startup is not interrupted.
+        """
+        if bool(getattr(self, "_update_check_started", False)):
+            return
+        self._update_check_started = True
+        worker = threading.Thread(target=self._update_check_worker, name="WindsorUpdateCheck", daemon=True)
+        worker.start()
+
+    def _update_check_worker(self):
+        try:
+            request = urllib.request.Request(
+                UPDATE_RELEASES_API_URL,
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "User-Agent": f"WindsorWidget/{APP_VERSION}",
+                },
+            )
+            with urllib.request.urlopen(request, timeout=6) as response:
+                payload = json.loads(response.read().decode("utf-8", errors="replace"))
+        except Exception:
+            return
+
+        latest_tag = str(payload.get("tag_name") or payload.get("name") or "").strip()
+        if not latest_tag:
+            return
+        latest_version = latest_tag.lstrip("vV")
+        if not is_newer_version(latest_version, APP_VERSION):
+            return
+
+        release_url = str(payload.get("html_url") or UPDATE_RELEASES_PAGE_URL).strip()
+        release_name = str(payload.get("name") or latest_tag).strip()
+        release_notes = str(payload.get("body") or "").strip()
+        self.update_check_signals.update_available.emit(latest_version, release_url, release_name, release_notes)
+
+    def show_update_available_message(self, latest_version, release_url, release_name, release_notes):
+        if not latest_version:
+            return
+        message = QMessageBox(self)
+        message.setWindowTitle("Windsor Widget Update Available")
+        message.setIcon(QMessageBox.Information)
+        message.setText(
+            f"A newer Windsor Widget version is available.\n\n"
+            f"Installed version: {APP_VERSION}\n"
+            f"Latest version: {latest_version}"
+        )
+        details = release_name or f"Version {latest_version}"
+        if release_notes:
+            details = f"{details}\n\n{release_notes[:1800]}"
+            if len(release_notes) > 1800:
+                details += "\n\n..."
+        message.setInformativeText("Open the GitHub release page to download or review the update.")
+        message.setDetailedText(details)
+        open_button = message.addButton("Open Release Page", QMessageBox.AcceptRole)
+        message.addButton("Not Now", QMessageBox.RejectRole)
+        message.exec()
+        if message.clickedButton() == open_button and release_url:
+            QDesktopServices.openUrl(QUrl(release_url))
 
     def setup_live_page_refresh(self):
         self.live_page_refresh_interval_ms = int(getattr(self, "live_page_refresh_interval_ms", 4000) or 4000)
@@ -8376,6 +8466,106 @@ class MainWindow(QMainWindow):
             table.resizeColumnToContents(col)
         table.verticalHeader().setVisible(False)
 
+    def sales_import_instruction_text(self):
+        return (
+            "SALES IMPORT\n\n"
+            "Use this import for sales history exported from MYOB AccountRight using the Import/Export Assistant.\n"
+            "Do not use a MYOB report export for this import. Reports can have different headings and layouts.\n\n"
+            "Accepted file types:\n"
+            "TXT, CSV, XLSX, XLSM\n\n"
+            "Required columns:\n"
+            "Date\n"
+            "Co./Last Name\n"
+            "Item Number\n"
+            "Quantity\n"
+            "Price\n"
+            "Invoice No.\n\n"
+            "Optional columns:\n"
+            "Description\n"
+            "Freight Amount\n\n"
+            "How to export from MYOB AccountRight:\n"
+            "1. Open MYOB AccountRight and open the company file.\n"
+            "2. Go to File > Import/Export Assistant.\n"
+            "3. Choose Export data, then click Next.\n"
+            "4. Choose Sales.\n"
+            "5. Choose Item Sales / Item Sales Data / All Sales, depending on the wording in your MYOB version.\n"
+            "6. Choose comma-separated or tab-separated text. Comma-separated is preferred.\n"
+            "7. Choose to include a header record / first record contains field names.\n"
+            "8. Select these fields: Date, Co./Last Name, Item Number, Description, Quantity, Price, Freight Amount, Invoice No.\n"
+            "9. Export the file and save it somewhere easy to find.\n"
+            "10. In Windsor Widget, click Update Sales and select that exported file.\n\n"
+            "Important:\n"
+            "- Invoice No. is required.\n"
+            "- Multiple rows can share the same Invoice No. This is normal for multi-line invoices.\n"
+            "- Duplicate checking uses Invoice No. + Date + Customer + Item Number + Quantity + Price.\n"
+            "- Blank rows are ignored.\n"
+            "- Rows with a blank Item Number are skipped.\n"
+            "- A backslash item number is kept, because MYOB uses it on some non-stock or repair lines.\n"
+            "- Quantity and Price should be numeric.\n"
+            "- Freight Amount is optional.\n\n"
+            "Example header:\n"
+            "Date,Co./Last Name,Item Number,Description,Quantity,Price,Freight Amount,Invoice No.\n"
+        )
+
+    def placeholder_import_instruction_text(self, import_name):
+        return (
+            f"{import_name.upper()} IMPORT\n\n"
+            "Instructions for this import will be added here.\n\n"
+            "Use the matching MYOB export or Windsor source file for this import.\n"
+            "Check that the first row contains headings before uploading.\n"
+        )
+
+    def setup_update_data_instruction_tabs(self):
+        page = getattr(self.ui, "update_page", None)
+        import_panel = getattr(self.ui, "frame_47", None)
+        if page is None or import_panel is None:
+            return
+
+        existing_tabs = getattr(self.ui, "updateDataInstructions_tabs", None)
+        if existing_tabs is not None:
+            try:
+                sales_widget = getattr(self.ui, "salesImportInstructions_textEdit", None)
+                if sales_widget is not None:
+                    sales_widget.setPlainText(self.sales_import_instruction_text())
+            except Exception:
+                pass
+            return
+
+        layout = page.layout()
+        if layout is None:
+            layout = QHBoxLayout(page)
+            layout.setObjectName("updateData_pageLayout")
+            layout.setContentsMargins(10, 10, 10, 10)
+            layout.setSpacing(12)
+
+        try:
+            import_panel.setMinimumWidth(420)
+            import_panel.setMaximumWidth(460)
+            import_panel.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+            layout.addWidget(import_panel)
+        except Exception:
+            pass
+
+        tabs = QTabWidget(page)
+        tabs.setObjectName("updateDataInstructions_tabs")
+        tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        setattr(self.ui, "updateDataInstructions_tabs", tabs)
+
+        sales_text = QTextEdit(tabs)
+        sales_text.setObjectName("salesImportInstructions_textEdit")
+        sales_text.setReadOnly(True)
+        sales_text.setPlainText(self.sales_import_instruction_text())
+        setattr(self.ui, "salesImportInstructions_textEdit", sales_text)
+        tabs.addTab(sales_text, "Sales")
+
+        for tab_name in ("Stock", "Orders", "Customers", "Items"):
+            text_box = QTextEdit(tabs)
+            text_box.setReadOnly(True)
+            text_box.setPlainText(self.placeholder_import_instruction_text(tab_name))
+            tabs.addTab(text_box, tab_name)
+
+        layout.addWidget(tabs, 1)
+
     def setup_update_page(self):
         orders_status = getattr(self.ui, "lastUpdateOrders_textBrowser_3", None)
         if orders_status is not None:
@@ -8407,6 +8597,8 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             freight_box.setToolTip("Double-click a row to toggle Charge Freight, Card on File, or Send Proforma for the current customer.")
+
+        self.setup_update_data_instruction_tabs()
 
     def setup_order_table(self):
         table = getattr(self.ui, "order_table", None)
@@ -11426,7 +11618,7 @@ class MainWindow(QMainWindow):
 
         existing_rows = self.db_all(
             """
-            SELECT sale_date, customer_name, item_number, quantity, price
+            SELECT sale_date, customer_name, item_number, quantity, price, invoice_no
             FROM sales
             WHERE DATE(sale_date) BETWEEN ? AND ?
             """,
@@ -11440,12 +11632,13 @@ class MainWindow(QMainWindow):
                 row["item_number"],
                 row["quantity"],
                 row["price"],
+                row["invoice_no"],
             )] += 1
 
         incoming_counts = Counter()
         rows_to_insert = []
         for row in rows:
-            signature = self.sales_row_signature(row[0], row[1], row[2], row[5], row[6])
+            signature = self.sales_row_signature(row[0], row[1], row[2], row[5], row[6], row[8])
             if incoming_counts[signature] < existing_counts[signature]:
                 incoming_counts[signature] += 1
                 continue
@@ -11483,9 +11676,9 @@ class MainWindow(QMainWindow):
             "item_number": ["itemnumber", "item", "itemno"],
             "quantity": ["quantity", "qty"],
             "price": ["price", "unitprice", "sellprice"],
+            "invoice_no": ["invoiceno", "invoice", "invno", "invoicenumber", "taxinvoice"],
         }
         optional_aliases = {
-            "invoice_no": ["invoiceno", "invoice", "invno", "invoicenumber", "taxinvoice"],
             "freight_amount": ["freightamount", "freight", "freightamt", "freightvalue", "shippingamount"],
         }
         resolved = {}
@@ -11499,7 +11692,7 @@ class MainWindow(QMainWindow):
         if missing:
             missing_text = ", ".join(missing)
             raise ValueError(
-                f"Missing required column(s): {missing_text}. Expected columns like Date, Co./Last Name, Item Number, Quantity, Price."
+                f"Missing required column(s): {missing_text}. Expected columns like Date, Co./Last Name, Item Number, Quantity, Price, Invoice No."
             )
 
         for field_name, options in optional_aliases.items():
@@ -11561,13 +11754,14 @@ class MainWindow(QMainWindow):
         except ValueError:
             return ""
 
-    def sales_row_signature(self, sale_date, customer_name, item_number, quantity, price):
+    def sales_row_signature(self, sale_date, customer_name, item_number, quantity, price, invoice_no):
         return (
             self.normalize_sales_import_date(sale_date),
             str(customer_name or "").strip().upper(),
             str(item_number or "").strip().upper(),
             round(self.parse_float(quantity), 6),
             round(self.parse_float(price), 6),
+            str(invoice_no or "").strip().upper(),
         )
 
     def fetch_item_name_map(self, item_numbers):
@@ -11670,7 +11864,7 @@ class MainWindow(QMainWindow):
         item_number = str(row.get(column_map["item_number"], "") or "").strip()
         quantity_value = self.parse_float(row.get(column_map["quantity"], 0))
         price_value = self.parse_float(row.get(column_map["price"], 0))
-        invoice_no = str(row.get(column_map.get("invoice_no", ""), "") or "").strip() if column_map.get("invoice_no") else ""
+        invoice_no = str(row.get(column_map["invoice_no"], "") or "").strip()
         freight_amount = self.parse_float(row.get(column_map.get("freight_amount", ""), 0)) if column_map.get("freight_amount") else 0.0
 
         if not sale_date and not customer_name and not item_number and quantity_value == 0 and price_value == 0:
@@ -11681,6 +11875,8 @@ class MainWindow(QMainWindow):
             raise ValueError(f"Line {line_number}: customer name is blank.")
         if not sale_date:
             raise ValueError(f"Line {line_number}: sale date is blank.")
+        if not invoice_no:
+            raise ValueError(f"Line {line_number}: invoice number is blank.")
 
         description = item_map.get(item_number.upper(), "")
         if not description:
