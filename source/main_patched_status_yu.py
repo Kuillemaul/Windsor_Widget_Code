@@ -5,6 +5,10 @@ try:
     import pyodbc
 except Exception:
     pyodbc = None
+try:
+    from shiboken6 import isValid as shiboken_is_valid
+except Exception:
+    shiboken_is_valid = None
 import os
 import tempfile
 import json
@@ -17,7 +21,7 @@ from pathlib import Path
 from datetime import datetime, date, timedelta
 from collections import Counter
 
-from PySide6.QtCore import Qt, QDate, QSettings, QMargins, QUrl, QEvent, QSignalBlocker, QTimer, QObject, Signal
+from PySide6.QtCore import Qt, QDate, QSettings, QMargins, QUrl, QEvent, QSignalBlocker, QTimer, QObject, Signal, QCoreApplication, QMetaObject, QSize
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -31,23 +35,25 @@ from PySide6.QtGui import (
     QDoubleValidator,
     QBrush,
 )
-from PySide6.QtWidgets import (QFrame, QTextEdit, 
+from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
     QMessageBox,
     QCompleter,
     QTableWidgetItem,
     QVBoxLayout,
+    QHBoxLayout,
+    QGridLayout,
     QLabel,
     QAbstractItemView,
     QAbstractSpinBox,
     QHeaderView,
     QDialog,
     QPushButton,
-    QHBoxLayout,
     QTableWidget,
     QTabWidget,
     QTextEdit,
+    QTextBrowser,
     QWidget,
     QSizePolicy,
     QLineEdit,
@@ -63,6 +69,13 @@ from PySide6.QtWidgets import (QFrame, QTextEdit,
     QStyledItemDelegate,
     QMenu,
     QFontDialog,
+    QFrame,
+    QRadioButton,
+    QSpinBox,
+    QStatusBar,
+    QStackedWidget,
+    QSplitter,
+    QScrollBar,
 )
 from PySide6.QtCharts import (
     QChart,
@@ -72,7 +85,8 @@ from PySide6.QtCharts import (
     QValueAxis,
 )
 
-from ui_mainwindow import Ui_MainWindow
+# Ui_MainWindow is now built directly in this file.
+# The generated ui_mainwindow.py file is intentionally no longer imported.
 from month_year_picker import MonthYearPicker
 from shipments_window_ui import Ui_MainWindow as Ui_ShipmentsWindow
 from yu_order_workflow import YUOrderEntryDialog, load_yu_review_module
@@ -80,7 +94,7 @@ from yu_order_workflow import YUOrderEntryDialog, load_yu_review_module
 TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
 TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
 TABLE_FORMAT_SETTINGS_PREFIX = "table_format"
-APP_VERSION = "1.1.0-ui.1"
+APP_VERSION = "1.0.2"
 APP_DESIGNER = "Bradley Mayze"
 UPDATE_REPO_OWNER = "Kuillemaul"
 UPDATE_REPO_NAME = "Windsor_Widget_Code"
@@ -112,6 +126,25 @@ PLANNING_STATUS_COLORS = {
     PLANNING_STATUS_OBSOLETE: {"bg": "#5A1F1F", "fg": "#FFEAEA", "border": "#E47C7C"},
 }
 
+
+def qt_object_is_alive(obj):
+    """Return False when a PySide wrapper points to a deleted C++ object."""
+    if obj is None:
+        return False
+    if shiboken_is_valid is not None:
+        try:
+            return bool(shiboken_is_valid(obj))
+        except RuntimeError:
+            return False
+        except Exception:
+            pass
+    try:
+        obj.objectName()
+        return True
+    except RuntimeError:
+        return False
+    except Exception:
+        return True
 
 class SortableTableWidgetItem(QTableWidgetItem):
     def __lt__(self, other):
@@ -314,8 +347,6 @@ def _table_format_theme_name(owner=None):
     try:
         if owner is not None and hasattr(owner, "ui"):
             ui = owner.ui
-            if getattr(ui, "radioHighContrast", None) is not None and ui.radioHighContrast.isChecked():
-                return "high"
             if getattr(ui, "radioLight", None) is not None and ui.radioLight.isChecked():
                 return "light"
             if getattr(ui, "radioDark", None) is not None and ui.radioDark.isChecked():
@@ -325,7 +356,8 @@ def _table_format_theme_name(owner=None):
             return _table_format_theme_name(main_window)
         settings = getattr(owner, "settings", None)
         if settings is not None:
-            return str(settings.value("theme", "dark") or "dark")
+            theme = str(settings.value("theme", "dark") or "dark").strip().lower()
+            return theme if theme in {"light", "dark"} else "dark"
     except Exception:
         pass
     return "dark"
@@ -337,11 +369,6 @@ def _table_format_colors(owner=None):
         return {
             "alternate": "#eef4fb",
             "grid": "#aeb8c3",
-        }
-    if theme == "high":
-        return {
-            "alternate": "#111900",
-            "grid": "#ffff00",
         }
     return {
         "alternate": "#303338",
@@ -1258,6 +1285,8 @@ except Exception:
     Font = None
     PatternFill = None
     Alignment = None
+    Border = None
+    Side = None
     is_date_format = None
     COLOR_INDEX = None
     from_excel = None
@@ -3539,15 +3568,25 @@ class CustomerFileViewerDialog(QDialog):
 
 
 class FrozenColumnsHelper:
-    def __init__(self, main_view, frozen_columns, click_handler=None, double_click_handler=None):
+    def __init__(
+        self,
+        main_view,
+        frozen_columns,
+        click_handler=None,
+        double_click_handler=None,
+        frozen_min_widths=None,
+    ):
         self.main_view = main_view
         self.frozen_columns = max(0, int(frozen_columns or 0))
         self.click_handler = click_handler
         self.double_click_handler = double_click_handler
+        self.frozen_min_widths = frozen_min_widths or {}
         self.wrapper = None
         self.frozen_view = None
+        self.external_hscroll = None
         self._syncing_section_width = False
         self._syncing_row_height = False
+        self._refreshing = False
         self._install()
 
     def _install(self):
@@ -3573,9 +3612,14 @@ class FrozenColumnsHelper:
         layout.removeWidget(self.main_view)
 
         self.wrapper = QWidget(parent)
-        wrapper_layout = QHBoxLayout(self.wrapper)
+        wrapper_layout = QGridLayout(self.wrapper)
         wrapper_layout.setContentsMargins(0, 0, 0, 0)
-        wrapper_layout.setSpacing(0)
+        wrapper_layout.setHorizontalSpacing(0)
+        wrapper_layout.setVerticalSpacing(0)
+        wrapper_layout.setColumnStretch(0, 0)
+        wrapper_layout.setColumnStretch(1, 1)
+        wrapper_layout.setRowStretch(0, 1)
+        wrapper_layout.setRowStretch(1, 0)
 
         self.frozen_view = QTableView(self.wrapper)
         self.frozen_view.setObjectName(f"{self.main_view.objectName()}_frozen")
@@ -3594,11 +3638,36 @@ class FrozenColumnsHelper:
         self.frozen_view.setFont(self.main_view.font())
         self.frozen_view.setSortingEnabled(self.main_view.isSortingEnabled())
         self.copy_header_settings()
+        try:
+            header = self.frozen_view.horizontalHeader()
+            header.setContextMenuPolicy(Qt.CustomContextMenu)
+            header.customContextMenuRequested.connect(self.show_frozen_header_menu)
+        except Exception:
+            pass
 
         self.main_view.setParent(self.wrapper)
-        wrapper_layout.addWidget(self.frozen_view, 0)
-        wrapper_layout.addWidget(self.main_view, 1)
+        self.main_view.setProperty("_uses_frozen_external_hscroll", True)
+        self.main_view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        try:
+            self.main_view.horizontalScrollBar().hide()
+        except Exception:
+            pass
+
+        self.external_hscroll = QScrollBar(Qt.Horizontal, self.wrapper)
+        self.external_hscroll.setObjectName(f"{self.main_view.objectName()}_external_hscroll")
+        self.external_hscroll.setMinimumHeight(18)
+
+        frozen_scroll_spacer = QWidget(self.wrapper)
+        frozen_scroll_spacer.setObjectName(f"{self.main_view.objectName()}_frozen_scroll_spacer")
+        frozen_scroll_spacer.setFixedHeight(self.external_hscroll.sizeHint().height())
+
+        wrapper_layout.addWidget(self.frozen_view, 0, 0)
+        wrapper_layout.addWidget(self.main_view, 0, 1)
+        wrapper_layout.addWidget(frozen_scroll_spacer, 1, 0)
+        wrapper_layout.addWidget(self.external_hscroll, 1, 1)
         layout.insertWidget(insert_index, self.wrapper, 1)
+
+        self._connect_external_horizontal_scrollbar()
 
         self.main_view.verticalScrollBar().valueChanged.connect(self.frozen_view.verticalScrollBar().setValue)
         self.frozen_view.verticalScrollBar().valueChanged.connect(self.main_view.verticalScrollBar().setValue)
@@ -3616,32 +3685,171 @@ class FrozenColumnsHelper:
 
         self.rebind()
 
+    def frozen_min_width_for_column(self, column):
+        try:
+            if isinstance(self.frozen_min_widths, dict):
+                return int(self.frozen_min_widths.get(column, 80))
+            return int(self.frozen_min_widths[column])
+        except Exception:
+            return 80
+
+    def frozen_width_for_column(self, column):
+        if self.main_view is None or self.frozen_view is None:
+            return self.frozen_min_width_for_column(column)
+        try:
+            current_width = max(self.main_view.columnWidth(column), self.frozen_view.columnWidth(column))
+        except Exception:
+            current_width = self.frozen_min_width_for_column(column)
+        return max(self.frozen_min_width_for_column(column), int(current_width or 0))
+
+    def resize_frozen_view_to_columns(self):
+        if self.frozen_view is None or self.main_view is None:
+            return
+        model = self.main_view.model()
+        column_count = model.columnCount() if model is not None else 0
+        frozen_width = 0
+        for column in range(min(self.frozen_columns, column_count)):
+            if not self.frozen_view.isColumnHidden(column):
+                frozen_width += self.frozen_view.columnWidth(column)
+        frozen_width += self.frozen_view.frameWidth() * 2
+        if self.frozen_view.verticalHeader().isVisible():
+            frozen_width += self.frozen_view.verticalHeader().width()
+        self.frozen_view.setFixedWidth(max(0, frozen_width))
+
+    def set_frozen_column_width(self, column, width):
+        if self.frozen_view is None or self.main_view is None:
+            return
+        if column < 0 or column >= self.frozen_columns:
+            return
+        width = max(self.frozen_min_width_for_column(column), int(width or 0))
+        self._syncing_section_width = True
+        try:
+            self.main_view.setColumnWidth(column, width)
+            self.frozen_view.setColumnWidth(column, width)
+        finally:
+            self._syncing_section_width = False
+        self.resize_frozen_view_to_columns()
+        self._sync_external_horizontal_scrollbar()
+        try:
+            self.frozen_view.viewport().update()
+            self.main_view.viewport().update()
+        except Exception:
+            pass
+
+    def show_frozen_header_menu(self, pos):
+        if self.frozen_view is None:
+            return
+        header = self.frozen_view.horizontalHeader()
+        column = header.logicalIndexAt(pos)
+        if column < 0 or column >= self.frozen_columns:
+            return
+
+        menu = QMenu(self.frozen_view)
+        set_width_action = menu.addAction("Set Frozen Column Width...")
+        auto_width_action = menu.addAction("Auto-size Frozen Column")
+        wider_action = menu.addAction("Widen 40 px")
+        narrower_action = menu.addAction("Narrow 40 px")
+        chosen = menu.exec(header.mapToGlobal(pos))
+        if chosen is None:
+            return
+
+        current_width = self.frozen_view.columnWidth(column)
+        if chosen == set_width_action:
+            value, ok = QInputDialog.getInt(
+                self.frozen_view,
+                "Frozen Column Width",
+                "Width in pixels:",
+                current_width,
+                self.frozen_min_width_for_column(column),
+                900,
+                10,
+            )
+            if ok:
+                self.set_frozen_column_width(column, value)
+        elif chosen == auto_width_action:
+            try:
+                self.frozen_view.resizeColumnToContents(column)
+                width = self.frozen_view.columnWidth(column)
+            except Exception:
+                width = current_width
+            self.set_frozen_column_width(column, width)
+        elif chosen == wider_action:
+            self.set_frozen_column_width(column, current_width + 40)
+        elif chosen == narrower_action:
+            self.set_frozen_column_width(column, current_width - 40)
+
     def copy_header_settings(self):
         if self.frozen_view is None or self.main_view is None:
             return
 
         main_h = self.main_view.horizontalHeader()
         frozen_h = self.frozen_view.horizontalHeader()
-        frozen_h.setVisible(main_h.isVisible())
-        frozen_h.setDefaultAlignment(main_h.defaultAlignment())
-        frozen_h.setHighlightSections(main_h.highlightSections())
-        frozen_h.setSectionsClickable(main_h.sectionsClickable())
-        frozen_h.setSortIndicatorShown(main_h.isSortIndicatorShown())
-        frozen_h.setCascadingSectionResizes(main_h.cascadingSectionResizes())
-        frozen_h.setMinimumSectionSize(main_h.minimumSectionSize())
-        frozen_h.setDefaultSectionSize(main_h.defaultSectionSize())
-        frozen_h.setStretchLastSection(False)
-        frozen_h.setSectionsMovable(False)
-
         main_v = self.main_view.verticalHeader()
         frozen_v = self.frozen_view.verticalHeader()
-        frozen_v.setVisible(main_v.isVisible())
-        frozen_v.setDefaultAlignment(main_v.defaultAlignment())
-        frozen_v.setHighlightSections(main_v.highlightSections())
-        frozen_v.setSectionsClickable(main_v.sectionsClickable())
-        frozen_v.setMinimumSectionSize(main_v.minimumSectionSize())
-        frozen_v.setDefaultSectionSize(main_v.defaultSectionSize())
-        frozen_v.setStretchLastSection(False)
+
+        # Block header signals while mirroring settings. Without this, Qt can emit
+        # geometriesChanged/sectionResized while refresh() is already running, which
+        # causes a refresh loop and eventually a RecursionError.
+        frozen_h_blocker = QSignalBlocker(frozen_h)
+        frozen_v_blocker = QSignalBlocker(frozen_v)
+        try:
+            frozen_h.setVisible(main_h.isVisible())
+            frozen_h.setDefaultAlignment(main_h.defaultAlignment())
+            frozen_h.setHighlightSections(main_h.highlightSections())
+            # Frozen columns need clickable/interactive headers so the user can
+            # drag their width independently of the horizontally scrolling table.
+            frozen_h.setSectionsClickable(True)
+            frozen_h.setSortIndicatorShown(main_h.isSortIndicatorShown())
+            frozen_h.setCascadingSectionResizes(False)
+            frozen_h.setMinimumSectionSize(max(40, main_h.minimumSectionSize()))
+            frozen_h.setDefaultSectionSize(main_h.defaultSectionSize())
+            frozen_h.setStretchLastSection(False)
+            frozen_h.setSectionsMovable(False)
+
+            frozen_v.setVisible(main_v.isVisible())
+            frozen_v.setDefaultAlignment(main_v.defaultAlignment())
+            frozen_v.setHighlightSections(main_v.highlightSections())
+            frozen_v.setSectionsClickable(main_v.sectionsClickable())
+            frozen_v.setMinimumSectionSize(main_v.minimumSectionSize())
+            frozen_v.setDefaultSectionSize(main_v.defaultSectionSize())
+            frozen_v.setStretchLastSection(False)
+        finally:
+            del frozen_h_blocker
+            del frozen_v_blocker
+
+    def _connect_external_horizontal_scrollbar(self):
+        if self.main_view is None or self.external_hscroll is None:
+            return
+        main_scroll = self.main_view.horizontalScrollBar()
+        main_scroll.rangeChanged.connect(lambda _min, _max: self._sync_external_horizontal_scrollbar())
+        main_scroll.valueChanged.connect(self._sync_external_horizontal_scrollbar_value)
+        self.external_hscroll.valueChanged.connect(main_scroll.setValue)
+        self._sync_external_horizontal_scrollbar()
+
+    def _sync_external_horizontal_scrollbar(self):
+        if self.main_view is None or self.external_hscroll is None:
+            return
+        main_scroll = self.main_view.horizontalScrollBar()
+        blocker = QSignalBlocker(self.external_hscroll)
+        try:
+            self.external_hscroll.setRange(main_scroll.minimum(), main_scroll.maximum())
+            self.external_hscroll.setPageStep(main_scroll.pageStep())
+            self.external_hscroll.setSingleStep(main_scroll.singleStep())
+            self.external_hscroll.setValue(main_scroll.value())
+            self.external_hscroll.setVisible(main_scroll.maximum() > main_scroll.minimum())
+        finally:
+            del blocker
+
+    def _sync_external_horizontal_scrollbar_value(self, value):
+        if self.external_hscroll is None:
+            return
+        if self.external_hscroll.value() == value:
+            return
+        blocker = QSignalBlocker(self.external_hscroll)
+        try:
+            self.external_hscroll.setValue(value)
+        finally:
+            del blocker
 
     def _forward_click(self, index):
         if self.click_handler is not None and index.isValid():
@@ -3664,70 +3872,84 @@ class FrozenColumnsHelper:
     def refresh(self):
         if self.frozen_view is None or self.main_view is None:
             return
+        if self._refreshing:
+            return
         model = self.main_view.model()
         if model is None:
             return
 
-        self.copy_header_settings()
+        # The main view keeps the real horizontal scroll range, but its own
+        # built-in scrollbar must stay hidden. The external scrollbar below the
+        # scrollable section is the only visible horizontal scrollbar. Some
+        # table setup routines reset the policy to AlwaysOn, so enforce this on
+        # every refresh.
+        try:
+            self.main_view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            self.main_view.horizontalScrollBar().hide()
+            self.frozen_view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        except Exception:
+            pass
 
-        column_count = model.columnCount()
-        row_count = model.rowCount()
-        main_header = self.main_view.horizontalHeader()
-        frozen_header = self.frozen_view.horizontalHeader()
+        self._refreshing = True
+        try:
+            self.copy_header_settings()
 
-        for column in range(column_count):
-            freeze_this = column < self.frozen_columns
-            self.frozen_view.setColumnHidden(column, not freeze_this)
-            self.main_view.setColumnHidden(column, freeze_this)
+            column_count = model.columnCount()
+            row_count = model.rowCount()
+            frozen_header = self.frozen_view.horizontalHeader()
+
+            main_h_blocker = QSignalBlocker(self.main_view.horizontalHeader())
+            frozen_h_blocker = QSignalBlocker(frozen_header)
             try:
-                frozen_header.setSectionResizeMode(column, main_header.sectionResizeMode(column))
-            except Exception:
-                pass
-            if freeze_this:
-                width = self.main_view.columnWidth(column)
-                self.frozen_view.setColumnWidth(column, width)
+                for column in range(column_count):
+                    freeze_this = column < self.frozen_columns
+                    self.frozen_view.setColumnHidden(column, not freeze_this)
+                    self.main_view.setColumnHidden(column, freeze_this)
+                    try:
+                        if freeze_this:
+                            frozen_header.setSectionResizeMode(column, QHeaderView.Interactive)
+                    except Exception:
+                        pass
+                    if freeze_this:
+                        width = self.frozen_width_for_column(column)
+                        self.frozen_view.setColumnWidth(column, width)
+                        self.main_view.setColumnWidth(column, width)
+            finally:
+                del main_h_blocker
+                del frozen_h_blocker
 
-        for row in range(row_count):
-            self.frozen_view.setRowHidden(row, self.main_view.isRowHidden(row))
-            self.frozen_view.setRowHeight(row, self.main_view.rowHeight(row))
+            frozen_v_blocker = QSignalBlocker(self.frozen_view.verticalHeader())
+            try:
+                for row in range(row_count):
+                    self.frozen_view.setRowHidden(row, self.main_view.isRowHidden(row))
+                    self.frozen_view.setRowHeight(row, self.main_view.rowHeight(row))
 
-        self.frozen_view.verticalHeader().setDefaultSectionSize(self.main_view.verticalHeader().defaultSectionSize())
-        self.frozen_view.horizontalHeader().setDefaultSectionSize(self.main_view.horizontalHeader().defaultSectionSize())
-        self.frozen_view.horizontalHeader().setStretchLastSection(False)
-        self.frozen_view.horizontalHeader().viewport().update()
-        self.frozen_view.viewport().update()
+                self.frozen_view.verticalHeader().setDefaultSectionSize(self.main_view.verticalHeader().defaultSectionSize())
+            finally:
+                del frozen_v_blocker
 
-        frozen_width = 0
-        for column in range(min(self.frozen_columns, column_count)):
-            if not self.frozen_view.isColumnHidden(column):
-                frozen_width += self.frozen_view.columnWidth(column)
-        frozen_width += self.frozen_view.frameWidth() * 2
-        if self.frozen_view.verticalHeader().isVisible():
-            frozen_width += self.frozen_view.verticalHeader().width()
-        self.frozen_view.setFixedWidth(max(0, frozen_width))
+            self.frozen_view.horizontalHeader().setDefaultSectionSize(self.main_view.horizontalHeader().defaultSectionSize())
+            self.frozen_view.horizontalHeader().setStretchLastSection(False)
+            self.frozen_view.horizontalHeader().viewport().update()
+            self.frozen_view.viewport().update()
+
+            self.resize_frozen_view_to_columns()
+            self._sync_external_horizontal_scrollbar()
+        finally:
+            self._refreshing = False
 
     def update_section_width_from_main(self, logical_index, _old_size, new_size):
-        if self.frozen_view is None or logical_index >= self.frozen_columns or self._syncing_section_width:
+        if self.frozen_view is None or logical_index >= self.frozen_columns or self._syncing_section_width or self._refreshing:
             return
-        self._syncing_section_width = True
-        try:
-            self.frozen_view.setColumnWidth(logical_index, new_size)
-        finally:
-            self._syncing_section_width = False
-        self.refresh()
+        self.set_frozen_column_width(logical_index, new_size)
 
     def update_section_width_from_frozen(self, logical_index, _old_size, new_size):
-        if self.main_view is None or logical_index >= self.frozen_columns or self._syncing_section_width:
+        if self.main_view is None or logical_index >= self.frozen_columns or self._syncing_section_width or self._refreshing:
             return
-        self._syncing_section_width = True
-        try:
-            self.main_view.setColumnWidth(logical_index, new_size)
-        finally:
-            self._syncing_section_width = False
-        self.refresh()
+        self.set_frozen_column_width(logical_index, new_size)
 
     def update_row_height_from_main(self, logical_index, _old_size, new_size):
-        if self.frozen_view is None or self._syncing_row_height:
+        if self.frozen_view is None or self._syncing_row_height or self._refreshing:
             return
         self._syncing_row_height = True
         try:
@@ -3736,7 +3958,7 @@ class FrozenColumnsHelper:
             self._syncing_row_height = False
 
     def update_row_height_from_frozen(self, logical_index, _old_size, new_size):
-        if self.main_view is None or self._syncing_row_height:
+        if self.main_view is None or self._syncing_row_height or self._refreshing:
             return
         self._syncing_row_height = True
         try:
@@ -3811,6 +4033,1513 @@ def find_installer_asset(release_payload):
     candidates.sort(reverse=True)
     _score, size, name, url = candidates[0]
     return {"name": name, "url": url, "size": size}
+
+
+# -----------------------------------------------------------------------------
+# Code-built main window UI
+# -----------------------------------------------------------------------------
+class Ui_MainWindow(object):
+    """Manual UI shell.
+
+    The current app code references many ``self.ui.<objectName>`` widgets.  This
+    class keeps those object names intact while moving the main window away from
+    the generated Qt Designer file.
+    """
+
+    def setupUi(self, MainWindow):
+        if not MainWindow.objectName():
+            MainWindow.setObjectName("MainWindow")
+        MainWindow.resize(1600, 900)
+        MainWindow.setMinimumSize(QSize(1280, 760))
+        MainWindow.setMaximumSize(QSize(16777215, 16777215))
+
+        self.centralwidget = QWidget(MainWindow)
+        self.centralwidget.setObjectName("centralwidget")
+        MainWindow.setCentralWidget(self.centralwidget)
+
+        self.horizontalLayout_17 = QHBoxLayout(self.centralwidget)
+        self.horizontalLayout_17.setObjectName("horizontalLayout_17")
+        self.horizontalLayout_17.setContentsMargins(0, 0, 0, 0)
+        self.horizontalLayout_17.setSpacing(0)
+
+        self._build_left_navigation()
+        self._build_main_stack()
+
+        self.statusbar = QStatusBar(MainWindow)
+        self.statusbar.setObjectName("statusbar")
+        MainWindow.setStatusBar(self.statusbar)
+
+        self.retranslateUi(MainWindow)
+        self.stackedWidget.setCurrentWidget(self.homeGuide_page)
+        self.homeGuide_button.clicked.connect(lambda: self.stackedWidget.setCurrentWidget(self.homeGuide_page))
+        QMetaObject.connectSlotsByName(MainWindow)
+
+    # ------------------------------------------------------------------
+    # Shell
+    # ------------------------------------------------------------------
+    def _build_left_navigation(self):
+        self.frame_6 = QFrame(self.centralwidget)
+        self.frame_6.setObjectName("frame_6")
+        self.frame_6.setMinimumWidth(196)
+        self.frame_6.setMaximumWidth(220)
+        self.frame_6.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        self.frame_6.setFrameShape(QFrame.NoFrame)
+        self.horizontalLayout_17.addWidget(self.frame_6)
+
+        self.verticalLayout_28 = QVBoxLayout(self.frame_6)
+        self.verticalLayout_28.setObjectName("verticalLayout_28")
+        self.verticalLayout_28.setContentsMargins(14, 14, 14, 14)
+        self.verticalLayout_28.setSpacing(12)
+
+        self.logo = QFrame(self.frame_6)
+        self.logo.setObjectName("logo")
+        self.logo.setMinimumSize(QSize(158, 158))
+        self.logo.setMaximumSize(QSize(176, 176))
+        self.logo.setFrameShape(QFrame.NoFrame)
+        self.verticalLayout_28.addWidget(self.logo, 0, Qt.AlignHCenter)
+
+        self.frame_7 = QFrame(self.frame_6)
+        self.frame_7.setObjectName("frame_7")
+        self.frame_7.setFrameShape(QFrame.NoFrame)
+        self.verticalLayout_4 = QVBoxLayout(self.frame_7)
+        self.verticalLayout_4.setObjectName("verticalLayout_4")
+        self.verticalLayout_4.setContentsMargins(0, 0, 0, 0)
+        self.verticalLayout_4.setSpacing(8)
+        self.verticalLayout_28.addWidget(self.frame_7)
+
+        self.homeGuide_button = self._nav_button("Home / Guide", "homeGuide_button")
+        self.customerSummary_button = self._nav_button("Customer Summary", "customerSummary_button")
+        self.itemSummary_button = self._nav_button("Item Summary", "itemSummary_button")
+        self.toOrderSheet_button = self._nav_button("To Order", "toOrderSheet_button")
+        self.onOrder_button = self._nav_button("On Order", "onOrder_button")
+        self.buildContainerSheet_button = self._nav_button("Build Container", "buildContainerSheet_button")
+        self.orderAnalasys_button = self._nav_button("Order Analysis", "orderAnalasys_button")
+        self.leftShipments_button = self._nav_button("Shipments", "leftShipments_button")
+        self.sabaReview_button = self._nav_button("SABA Review", "sabaReview_button")
+        self.updateData_button = self._nav_button("Update Data", "updateData_button")
+
+        self.verticalLayout_28.addStretch(1)
+
+        self.frame_8 = QFrame(self.frame_6)
+        self.frame_8.setObjectName("frame_8")
+        self.frame_8.setFrameShape(QFrame.NoFrame)
+        self.verticalLayout_5 = QVBoxLayout(self.frame_8)
+        self.verticalLayout_5.setObjectName("verticalLayout_5")
+        self.verticalLayout_5.setContentsMargins(0, 0, 0, 0)
+        self.verticalLayout_5.setSpacing(4)
+        self.radioLight = QRadioButton("Light", self.frame_8)
+        self.radioLight.setObjectName("radioLight")
+        self.radioDark = QRadioButton("Dark", self.frame_8)
+        self.radioDark.setObjectName("radioDark")
+        self.radioDark.setChecked(True)
+        self.verticalLayout_5.addWidget(self.radioLight)
+        self.verticalLayout_5.addWidget(self.radioDark)
+        self.verticalLayout_28.addWidget(self.frame_8)
+
+        self.textEdit = QTextEdit(self.frame_6)
+        self.textEdit.setObjectName("textEdit")
+        self.textEdit.setReadOnly(True)
+        self.textEdit.setMinimumHeight(86)
+        self.textEdit.setMaximumHeight(170)
+        self.verticalLayout_28.addWidget(self.textEdit)
+
+    def _nav_button(self, text, object_name):
+        button = QPushButton(text, self.frame_7)
+        button.setObjectName(object_name)
+        button.setMinimumHeight(46)
+        button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.verticalLayout_4.addWidget(button)
+        return button
+
+    def _build_main_stack(self):
+        self.stackedWidget = QStackedWidget(self.centralwidget)
+        self.stackedWidget.setObjectName("stackedWidget")
+        self.stackedWidget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.horizontalLayout_17.addWidget(self.stackedWidget, 1)
+
+        self._build_home_guide_page()
+        self._build_customer_summary_page()
+        self._build_item_summary_page()
+        self._build_to_order_page()
+        self._build_on_order_page()
+        self._build_build_container_page()
+        self._build_order_analysis_page()
+        self._build_shipments_page()
+        self._build_saba_review_page()
+        self._build_update_data_page()
+
+    # ------------------------------------------------------------------
+    # Common helpers
+    # ------------------------------------------------------------------
+    def _page(self, object_name, title):
+        page = QWidget()
+        page.setObjectName(object_name)
+        layout = QVBoxLayout(page)
+        layout.setObjectName(f"{object_name}_layout")
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
+        title_label = QLabel(title, page)
+        title_label.setObjectName(f"{object_name}_title")
+        title_label.setProperty("role", "pageTitle")
+        title_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        title_label.setMinimumHeight(28)
+        title_label.setMaximumHeight(40)
+        layout.addWidget(title_label)
+        self.stackedWidget.addWidget(page)
+        return page, layout
+
+    def _panel(self, parent, object_name, layout_type=QVBoxLayout):
+        frame = QFrame(parent)
+        frame.setObjectName(object_name)
+        frame.setFrameShape(QFrame.StyledPanel)
+        frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        layout = layout_type(frame)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+        return frame, layout
+
+    def _value_label(self, parent, object_name, text=""):
+        label = QLabel(text, parent)
+        label.setObjectName(object_name)
+        label.setMinimumHeight(28)
+        label.setFrameShape(QFrame.StyledPanel)
+        label.setAlignment(Qt.AlignCenter)
+        return label
+
+    def _text_box(self, parent, object_name, text=""):
+        box = QTextBrowser(parent)
+        box.setObjectName(object_name)
+        box.setPlainText(text)
+        box.setMinimumHeight(34)
+        box.setMaximumHeight(84)
+        return box
+
+    def _line_edit(self, parent, object_name, placeholder=""):
+        edit = QLineEdit(parent)
+        edit.setObjectName(object_name)
+        edit.setPlaceholderText(placeholder)
+        edit.setMinimumHeight(32)
+        return edit
+
+    def _table_widget(self, parent, object_name):
+        table = QTableWidget(parent)
+        table.setObjectName(object_name)
+        table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        table.setAlternatingRowColors(True)
+        table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        return table
+
+    def _table_view(self, parent, object_name):
+        table = QTableView(parent)
+        table.setObjectName(object_name)
+        table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        table.setAlternatingRowColors(True)
+        table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        return table
+
+    def _summary_card(self, parent, title, value, value_object_name, minimum_width=116):
+        card = QFrame(parent)
+        card.setObjectName(f"{value_object_name}_card")
+        card.setProperty("role", "metricCard")
+        card.setFrameShape(QFrame.StyledPanel)
+        card.setMinimumWidth(minimum_width)
+        card.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(10, 5, 10, 5)
+        card_layout.setSpacing(1)
+
+        title_label = QLabel(title, card)
+        title_label.setObjectName(f"{value_object_name}_title")
+        title_label.setProperty("role", "metricTitle")
+        title_label.setAlignment(Qt.AlignCenter)
+        title_label.setWordWrap(False)
+        title_label.setMinimumWidth(max(64, minimum_width - 20))
+
+        value_label = QLabel(value, card)
+        value_label.setObjectName(value_object_name)
+        value_label.setProperty("role", "metricValue")
+        value_label.setAlignment(Qt.AlignCenter)
+        value_label.setWordWrap(False)
+        value_label.setMinimumWidth(max(76, minimum_width - 20))
+
+        card_layout.addWidget(title_label)
+        card_layout.addWidget(value_label)
+        return value_label
+
+    # ------------------------------------------------------------------
+    # Home guide
+    # ------------------------------------------------------------------
+    def _build_home_guide_page(self):
+        self.homeGuide_page, layout = self._page("homeGuide_page", "Windsor Widget - How To Guide")
+        self.howToGuide_textBrowser = QTextBrowser(self.homeGuide_page)
+        self.howToGuide_textBrowser.setObjectName("howToGuide_textBrowser")
+        self.howToGuide_textBrowser.setOpenExternalLinks(True)
+        self.howToGuide_textBrowser.setHtml(self._home_guide_html())
+        layout.addWidget(self.howToGuide_textBrowser, 1)
+
+    def _home_guide_html(self):
+        return """
+        <h1>Windsor Widget</h1>
+        <p>This page is the starting point for the rebuilt code-based interface.</p>
+        <h2>Basic workflow</h2>
+        <ol>
+          <li><b>Customer Summary</b> - search customer sales history and open linked customer files.</li>
+          <li><b>Item Summary</b> - review item stock, sales, on-order quantities and purchasing context.</li>
+          <li><b>To Order</b> - review suggested ordering and manage purchasing lines.</li>
+          <li><b>On Order</b> - review incoming orders and order comments.</li>
+          <li><b>Build Container</b> - prepare and review container lines.</li>
+          <li><b>Order Analysis</b> - compare sales, stock and forecast demand.</li>
+          <li><b>SABA Review</b> - review SABA purchasing patterns.</li>
+          <li><b>Update Data</b> - import sales, stock and order updates.</li>
+        </ol>
+        <h2>UI rebuild note</h2>
+        <p>The overall shell has now been moved out of the generated Qt file.  Each section can be rebuilt one at a time while keeping the existing object names stable.</p>
+        <p><b>Current priority:</b> keep the app functional while the layout becomes more consistent.</p>
+        """
+
+    # ------------------------------------------------------------------
+    # Pages
+    # ------------------------------------------------------------------
+    def _build_customer_summary_page(self):
+        self.customerSummary_page, self.verticalLayout_3 = self._page("customerSummary_page", "Customer Summary")
+        customer_title = self.customerSummary_page.findChild(QLabel, "customerSummary_page_title")
+        if customer_title is not None:
+            customer_title.setMinimumHeight(24)
+            customer_title.setMaximumHeight(30)
+
+        self.customerSummary_intro = QLabel(
+            "Search a customer, review monthly demand by item, open the linked customer file, and check freight/account flags.",
+            self.customerSummary_page,
+        )
+        self.customerSummary_intro.setObjectName("customerSummary_intro")
+        self.customerSummary_intro.setWordWrap(False)
+        self.customerSummary_intro.setProperty("role", "pageSubtitle")
+        self.customerSummary_intro.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.customerSummary_intro.setMinimumHeight(16)
+        self.customerSummary_intro.setMaximumHeight(18)
+        self.verticalLayout_3.setContentsMargins(10, 6, 10, 10)
+        self.verticalLayout_3.setSpacing(6)
+        self.verticalLayout_3.addWidget(self.customerSummary_intro)
+
+        self.frame_5, self.verticalLayout_2 = self._panel(self.customerSummary_page, "frame_5")
+        self.frame_5.setProperty("role", "pageBody")
+        self.verticalLayout_2.setContentsMargins(10, 8, 10, 10)
+        self.verticalLayout_2.setSpacing(6)
+        self.verticalLayout_3.addWidget(self.frame_5, 1)
+
+        # Top search/filter card.
+        self.frame_4, self.horizontalLayout_3 = self._panel(self.frame_5, "frame_4", QHBoxLayout)
+        self.frame_4.setProperty("role", "toolbarCard")
+        self.frame_4.setMinimumHeight(50)
+        self.frame_4.setMaximumHeight(56)
+        self.frame_4.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.horizontalLayout_3.setContentsMargins(8, 6, 8, 6)
+        self.horizontalLayout_3.setSpacing(8)
+        self.verticalLayout_2.addWidget(self.frame_4)
+
+        search_label = QLabel("Customer", self.frame_4)
+        search_label.setObjectName("customerSearch_label")
+        search_label.setProperty("role", "fieldLabel")
+        self.customerEdit = self._line_edit(self.frame_4, "customerEdit", "Start typing a customer name...")
+        self.searchButton = QPushButton("Search", self.frame_4)
+        self.searchButton.setObjectName("searchButton")
+        self.searchButton.setProperty("role", "primaryButton")
+        self.loadFile = QPushButton("Open Customer File", self.frame_4)
+        self.loadFile.setObjectName("loadFile")
+        self.combineStateAccountsCheck = QCheckBox("Combine state accounts", self.frame_4)
+        self.combineStateAccountsCheck.setObjectName("combineStateAccountsCheck")
+        self.horizontalLayout_3.addWidget(search_label)
+        self.horizontalLayout_3.addWidget(self.customerEdit, 1)
+        self.horizontalLayout_3.addWidget(self.searchButton)
+        self.horizontalLayout_3.addWidget(self.loadFile)
+        self.horizontalLayout_3.addWidget(self.combineStateAccountsCheck)
+
+        # Date range and live status/summary cards.
+        self.customerSummaryControls_frame, controls_layout = self._panel(self.frame_5, "customerSummaryControls_frame", QHBoxLayout)
+        self.customerSummaryControls_frame.setProperty("role", "subtleCard")
+        self.customerSummaryControls_frame.setMinimumHeight(58)
+        self.customerSummaryControls_frame.setMaximumHeight(66)
+        self.customerSummaryControls_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        controls_layout.setContentsMargins(8, 6, 8, 6)
+        controls_layout.setSpacing(8)
+        self.verticalLayout_2.addWidget(self.customerSummaryControls_frame)
+
+        self.frame_customer_dates = QFrame(self.customerSummaryControls_frame)
+        self.frame_customer_dates.setObjectName("frame_customer_dates")
+        self.frame_customer_dates.setFrameShape(QFrame.NoFrame)
+        self.frame_customer_dates.setMaximumHeight(46)
+        self.frame_customer_dates.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.horizontalLayout_2 = QHBoxLayout(self.frame_customer_dates)
+        self.horizontalLayout_2.setContentsMargins(0, 0, 0, 0)
+        self.horizontalLayout_2.setSpacing(8)
+        self.startMonthPickerCustomer_2 = MonthYearPicker(self.frame_customer_dates)
+        self.startMonthPickerCustomer_2.setObjectName("startMonthPickerCustomer_2")
+        self.endMonthPickerCustomer = MonthYearPicker(self.frame_customer_dates)
+        self.endMonthPickerCustomer.setObjectName("endMonthPickerCustomer")
+        self.horizontalLayout_2.addWidget(QLabel("From", self.frame_customer_dates))
+        self.horizontalLayout_2.addWidget(self.startMonthPickerCustomer_2)
+        self.horizontalLayout_2.addWidget(QLabel("To", self.frame_customer_dates))
+        self.horizontalLayout_2.addWidget(self.endMonthPickerCustomer)
+        controls_layout.addWidget(self.frame_customer_dates, 0)
+        controls_layout.addStretch(1)
+
+        self.customerSummaryStats_frame = QFrame(self.customerSummaryControls_frame)
+        self.customerSummaryStats_frame.setObjectName("customerSummaryStats_frame")
+        self.customerSummaryStats_frame.setFrameShape(QFrame.NoFrame)
+        self.customerSummaryStats_frame.setMaximumHeight(52)
+        self.customerSummaryStats_frame.setMinimumWidth(610)
+        self.customerSummaryStats_frame.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.customerSummaryStats_layout = QHBoxLayout(self.customerSummaryStats_frame)
+        self.customerSummaryStats_layout.setContentsMargins(0, 0, 0, 0)
+        self.customerSummaryStats_layout.setSpacing(8)
+        controls_layout.addWidget(self.customerSummaryStats_frame, 0)
+
+        self.customerSummaryPeriod_box = self._summary_card(self.customerSummaryStats_frame, "Period", "No range", "customerSummaryPeriod_box", minimum_width=180)
+        self.customerSummaryItems_box = self._summary_card(self.customerSummaryStats_frame, "Items", "0", "customerSummaryItems_box", minimum_width=108)
+        self.customerSummaryUnits_box = self._summary_card(self.customerSummaryStats_frame, "Units Sold", "0", "customerSummaryUnits_box", minimum_width=132)
+        self.customerSummaryAccounts_box = self._summary_card(self.customerSummaryStats_frame, "Accounts", "0", "customerSummaryAccounts_box", minimum_width=150)
+        for card in (
+            self.customerSummaryPeriod_box,
+            self.customerSummaryItems_box,
+            self.customerSummaryUnits_box,
+            self.customerSummaryAccounts_box,
+        ):
+            card_widget = card.parentWidget()
+            card_widget.setMinimumHeight(46)
+            card_widget.setMaximumHeight(52)
+            card_widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            self.customerSummaryStats_layout.addWidget(card_widget)
+
+        # Main content area: chart/table on the left, customer details on the right.
+        self.customerSummaryMain_frame = QFrame(self.frame_5)
+        self.customerSummaryMain_frame.setObjectName("customerSummaryMain_frame")
+        self.customerSummaryMain_frame.setFrameShape(QFrame.NoFrame)
+        self.customerSummaryMain_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.customerSummaryMain_layout = QHBoxLayout(self.customerSummaryMain_frame)
+        self.customerSummaryMain_layout.setContentsMargins(0, 0, 0, 0)
+        self.customerSummaryMain_layout.setSpacing(14)
+        self.verticalLayout_2.addWidget(self.customerSummaryMain_frame, 1)
+
+        self.frame_21, frame_21_layout = self._panel(self.customerSummaryMain_frame, "frame_21")
+        self.frame_21.setProperty("role", "contentCard")
+        self.customerSummaryMain_layout.addWidget(self.frame_21, 3)
+
+        chart_header = QLabel("Monthly units by item", self.frame_21)
+        chart_header.setObjectName("customerSalesChart_title")
+        chart_header.setProperty("role", "sectionTitle")
+        frame_21_layout.addWidget(chart_header)
+        self.sales_graph = QWidget(self.frame_21)
+        self.sales_graph.setObjectName("sales_graph")
+        self.sales_graph.setMinimumHeight(210)
+        self.sales_graph.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        frame_21_layout.addWidget(self.sales_graph, 2)
+
+        table_header = QLabel("Item sales detail", self.frame_21)
+        table_header.setObjectName("customerSalesTable_title")
+        table_header.setProperty("role", "sectionTitle")
+        frame_21_layout.addWidget(table_header)
+        self.salesTable = self._table_widget(self.frame_21, "salesTable")
+        self.salesTable.setMinimumHeight(220)
+        frame_21_layout.addWidget(self.salesTable, 3)
+
+        self.customerDetails_frame, details_layout = self._panel(self.customerSummaryMain_frame, "customerDetails_frame")
+        self.customerDetails_frame.setProperty("role", "sideCard")
+        self.customerDetails_frame.setMinimumWidth(330)
+        self.customerDetails_frame.setMaximumWidth(420)
+        self.customerSummaryMain_layout.addWidget(self.customerDetails_frame, 1)
+
+        customer_details_title = QLabel("Customer details", self.customerDetails_frame)
+        customer_details_title.setObjectName("customerDetails_title")
+        customer_details_title.setProperty("role", "sectionTitle")
+        details_layout.addWidget(customer_details_title)
+        self.customer_Info = self._table_view(self.customerDetails_frame, "customer_Info")
+        self.customer_Info.setMinimumHeight(150)
+        self.customer_Info.setMaximumHeight(220)
+        details_layout.addWidget(self.customer_Info)
+
+        flags_title = QLabel("Account flags", self.customerDetails_frame)
+        flags_title.setObjectName("customerFlags_title")
+        flags_title.setProperty("role", "sectionTitle")
+        details_layout.addWidget(flags_title)
+        self.chargeFreight_textBrowser = QTextBrowser(self.customerDetails_frame)
+        self.chargeFreight_textBrowser.setObjectName("chargeFreight_textBrowser")
+        self.chargeFreight_textBrowser.setMinimumHeight(118)
+        self.chargeFreight_textBrowser.setMaximumHeight(150)
+        self.chargeFreight_textBrowser.setOpenExternalLinks(False)
+        details_layout.addWidget(self.chargeFreight_textBrowser)
+
+        self.customerSummaryHelp_textBrowser = QTextBrowser(self.customerDetails_frame)
+        self.customerSummaryHelp_textBrowser.setObjectName("customerSummaryHelp_textBrowser")
+        self.customerSummaryHelp_textBrowser.setMaximumHeight(170)
+        self.customerSummaryHelp_textBrowser.setPlainText(
+            "Tips:\n"
+            "- Click a row to redraw the chart for that item.\n"
+            "- Double-click an item number to open Item Summary.\n"
+            "- Double-click a month column to see invoice lines.\n"
+            "- Use Combine state accounts for customers split by state suffix."
+        )
+        details_layout.addWidget(self.customerSummaryHelp_textBrowser)
+        details_layout.addStretch(1)
+
+    def _build_item_summary_page(self):
+        self.itemSummary_page, layout = self._page("itemSummary_page", "Item Summary")
+        layout.setContentsMargins(8, 6, 8, 8)
+        layout.setSpacing(6)
+
+        self.itemSummary_statusLabel = QLabel("Search an item to review demand, stock position, inbound supply and suggested ordering.", self.itemSummary_page)
+        self.itemSummary_statusLabel.setObjectName("itemSummary_statusLabel")
+        self.itemSummary_statusLabel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.itemSummary_statusLabel.setMinimumHeight(20)
+        self.itemSummary_statusLabel.setMaximumHeight(24)
+        layout.addWidget(self.itemSummary_statusLabel)
+
+        # Compact top control area.  Use two flowing rows instead of one long row;
+        # this keeps the date range, item search, lead time and testing controls readable
+        # at the minimum window width.
+        self.frame_18, toolbar = self._panel(self.itemSummary_page, "frame_18", QGridLayout)
+        self.frame_18.setProperty("role", "toolbarCard")
+        self.frame_18.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.frame_18.setMinimumHeight(92)
+        self.frame_18.setMaximumHeight(112)
+        toolbar.setContentsMargins(10, 8, 10, 8)
+        toolbar.setHorizontalSpacing(10)
+        toolbar.setVerticalSpacing(8)
+        layout.addWidget(self.frame_18)
+
+        item_label = QLabel("Item", self.frame_18)
+        item_label.setObjectName("itemSearch_label")
+        item_label.setProperty("role", "fieldLabel")
+        item_label.setMinimumWidth(72)
+        toolbar.addWidget(item_label, 0, 0)
+
+        self.enterItem = self._line_edit(self.frame_18, "enterItem", "Search item number")
+        self.enterItem.setMinimumWidth(360)
+        self.enterItem.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        toolbar.addWidget(self.enterItem, 0, 1, 1, 6)
+
+        self.loadItem = QPushButton("Load Item", self.frame_18)
+        self.loadItem.setObjectName("loadItem")
+        self.loadItem.setMinimumHeight(32)
+        self.loadItem.setMinimumWidth(104)
+        self.loadItem.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        toolbar.addWidget(self.loadItem, 0, 7)
+
+        from_label = QLabel("From", self.frame_18)
+        from_label.setObjectName("itemFrom_label")
+        from_label.setProperty("role", "fieldLabel")
+        from_label.setMinimumWidth(42)
+        toolbar.addWidget(from_label, 1, 0)
+
+        self.startMonthPickerItem = MonthYearPicker(self.frame_18)
+        self.startMonthPickerItem.setObjectName("startMonthPickerItem")
+        self.startMonthPickerItem.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        toolbar.addWidget(self.startMonthPickerItem, 1, 1)
+
+        to_label = QLabel("To", self.frame_18)
+        to_label.setObjectName("itemTo_label")
+        to_label.setProperty("role", "fieldLabel")
+        to_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        toolbar.addWidget(to_label, 1, 2)
+
+        self.endMonthPickerItem = MonthYearPicker(self.frame_18)
+        self.endMonthPickerItem.setObjectName("endMonthPickerItem")
+        self.endMonthPickerItem.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        toolbar.addWidget(self.endMonthPickerItem, 1, 3)
+
+        self.frame_17 = QFrame(self.frame_18)
+        self.frame_17.setObjectName("frame_17")
+        self.frame_17.setFrameShape(QFrame.NoFrame)
+        self.frame_17.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.horizontalLayout_itemTopTools = QHBoxLayout(self.frame_17)
+        self.horizontalLayout_itemTopTools.setContentsMargins(0, 0, 0, 0)
+        self.horizontalLayout_itemTopTools.setSpacing(10)
+
+        self.leadTimeLabel = QLabel("Lead Weeks", self.frame_17)
+        self.leadTimeLabel.setObjectName("leadTimeLabel")
+        self.leadTimeLabel.setProperty("role", "fieldLabel")
+        self.leadTimeLabel.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.leadTimeLabel.setMinimumWidth(78)
+        self.horizontalLayout_itemTopTools.addWidget(self.leadTimeLabel)
+
+        self.leadTimePicker = QSpinBox(self.frame_17)
+        self.leadTimePicker.setObjectName("leadTimePicker")
+        self.leadTimePicker.setRange(0, 999)
+        self.leadTimePicker.setValue(14)
+        self.leadTimePicker.setAlignment(Qt.AlignCenter)
+        self.leadTimePicker.setMinimumWidth(74)
+        self.leadTimePicker.setMaximumWidth(86)
+        self.horizontalLayout_itemTopTools.addWidget(self.leadTimePicker)
+
+        self.combineThreads_checkBox = QCheckBox("Combine Threads", self.frame_17)
+        self.combineThreads_checkBox.setObjectName("combineThreads_checkBox")
+        self.combineThreads_checkBox.setMinimumWidth(168)
+        self.combineThreads_checkBox.setMaximumWidth(190)
+        self.horizontalLayout_itemTopTools.addWidget(self.combineThreads_checkBox)
+
+        self.topItems_button = QPushButton("Top 100", self.frame_17)
+        self.topItems_button.setObjectName("topItems_button")
+        self.topItems_button.setToolTip("Open Top 100 item views for the selected date range.")
+        self.topItems_button.setMinimumWidth(116)
+        self.topItems_button.setMaximumWidth(136)
+        self.topItems_button.setMinimumHeight(32)
+        self.topItems_button.setMaximumHeight(34)
+        self.horizontalLayout_itemTopTools.addWidget(self.topItems_button)
+        self.horizontalLayout_itemTopTools.addStretch(1)
+
+        toolbar.addWidget(self.frame_17, 1, 4, 1, 4)
+        toolbar.setColumnStretch(1, 0)
+        toolbar.setColumnStretch(3, 0)
+        toolbar.setColumnStretch(4, 1)
+        toolbar.setColumnStretch(6, 1)
+
+        # Top item identity band.  Keep this as compact neutral information,
+        # not loud highlight blocks, so long descriptions and group names remain readable.
+        self.itemOverview_frame, overview_layout = self._panel(self.itemSummary_page, "itemOverview_frame", QGridLayout)
+        self.itemOverview_frame.setProperty("role", "subtleCard")
+        self.itemOverview_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.itemOverview_frame.setMinimumHeight(126)
+        self.itemOverview_frame.setMaximumHeight(154)
+        overview_layout.setContentsMargins(8, 6, 8, 6)
+        overview_layout.setHorizontalSpacing(8)
+        overview_layout.setVerticalSpacing(6)
+        layout.addWidget(self.itemOverview_frame)
+
+        def add_info_card(row, col, label_name, label_text, box_name, minimum_width=118, column_span=1):
+            card = QFrame(self.itemOverview_frame)
+            card.setObjectName(f"{box_name}_card")
+            card.setProperty("role", "metricCard")
+            card.setFrameShape(QFrame.StyledPanel)
+            card.setMinimumWidth(minimum_width)
+            card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(8, 4, 8, 5)
+            card_layout.setSpacing(1)
+
+            label = QLabel(label_text, card)
+            label.setObjectName(label_name)
+            label.setProperty("role", "metricTitle")
+            label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            label.setWordWrap(False)
+            label.setMinimumHeight(16)
+
+            box = QLabel("", card)
+            box.setObjectName(box_name)
+            box.setProperty("role", "metricValue")
+            box.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            box.setWordWrap(True)
+            box.setMinimumHeight(36)
+            box.setMaximumHeight(48)
+            box.setFrameShape(QFrame.NoFrame)
+            box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+            card_layout.addWidget(label)
+            card_layout.addWidget(box)
+            setattr(self, label_name, label)
+            setattr(self, box_name, box)
+            overview_layout.addWidget(card, row, col, 1, column_span)
+            return box
+
+        add_info_card(0, 0, "itemNumber_label_2", "Item", "itemNumber_box", 150)
+        add_info_card(0, 1, "itemName_label_2", "Description", "itemName_box", 420, 3)
+        add_info_card(0, 4, "itemGroup_label_2", "Group", "itemGroup_box", 220, 2)
+        add_info_card(1, 0, "rollSpool_label", "Roll / Spool", "rollSpool_box", 140)
+        add_info_card(1, 1, "mtUnit_label", "Mt / Unit", "mtUnit_box", 140)
+        add_info_card(1, 2, "box_label", "Carton", "box_box", 140)
+        add_info_card(1, 3, "palletCarton_label", "Pallet", "palletCarton_box", 140)
+
+        self.itemStatusHost_frame = QFrame(self.itemOverview_frame)
+        self.itemStatusHost_frame.setObjectName("itemStatusHost_frame")
+        self.itemStatusHost_frame.setProperty("role", "metricCard")
+        self.itemStatusHost_frame.setFrameShape(QFrame.StyledPanel)
+        self.itemStatusHost_frame.setMinimumWidth(320)
+        self.itemStatusHost_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.itemStatusHost_layout = QVBoxLayout(self.itemStatusHost_frame)
+        self.itemStatusHost_layout.setContentsMargins(8, 4, 8, 5)
+        self.itemStatusHost_layout.setSpacing(3)
+        overview_layout.addWidget(self.itemStatusHost_frame, 1, 4, 1, 2)
+
+        for col, stretch in enumerate((1, 2, 2, 2, 1, 1)):
+            overview_layout.setColumnStretch(col, stretch)
+
+        # Main data area.  The graph and customer table get the width; the right
+        # rail keeps purchasing numbers visible without stealing too much room.
+        self.itemMain_splitter = QSplitter(Qt.Horizontal, self.itemSummary_page)
+        self.itemMain_splitter.setObjectName("itemMain_splitter")
+        self.itemMain_splitter.setChildrenCollapsible(False)
+        self.itemMain_splitter.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        layout.addWidget(self.itemMain_splitter, 1)
+
+        self.frame_19 = QFrame(self.itemMain_splitter)
+        self.frame_19.setObjectName("frame_19")
+        self.frame_19.setFrameShape(QFrame.StyledPanel)
+        self.frame_19.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        content_layout = QVBoxLayout(self.frame_19)
+        content_layout.setContentsMargins(8, 8, 8, 8)
+        content_layout.setSpacing(6)
+
+        chart_title = QLabel("Monthly unit sales", self.frame_19)
+        chart_title.setObjectName("itemSales_graph_title")
+        chart_title.setProperty("role", "sectionTitle")
+        chart_title.setMinimumHeight(24)
+        chart_title.setMaximumHeight(28)
+        content_layout.addWidget(chart_title)
+
+        self.itemSales_graph = QWidget(self.frame_19)
+        self.itemSales_graph.setObjectName("itemSales_graph")
+        self.itemSales_graph.setMinimumHeight(210)
+        self.itemSales_graph.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        content_layout.addWidget(self.itemSales_graph, 2)
+
+        table_title = QLabel("Customer purchasing detail", self.frame_19)
+        table_title.setObjectName("customerPurchase_table_title")
+        table_title.setProperty("role", "sectionTitle")
+        table_title.setMinimumHeight(24)
+        table_title.setMaximumHeight(28)
+        content_layout.addWidget(table_title)
+
+        self.customerPurchase_table = self._table_view(self.frame_19, "customerPurchase_table")
+        self.customerPurchase_table.setMinimumHeight(210)
+        content_layout.addWidget(self.customerPurchase_table, 3)
+
+        self.itemSummary_sidePanel = QFrame(self.itemMain_splitter)
+        self.itemSummary_sidePanel.setObjectName("itemSummary_sidePanel")
+        self.itemSummary_sidePanel.setFrameShape(QFrame.StyledPanel)
+        self.itemSummary_sidePanel.setMinimumWidth(540)
+        self.itemSummary_sidePanel.setMaximumWidth(680)
+        self.itemSummary_sidePanel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        side_layout = QVBoxLayout(self.itemSummary_sidePanel)
+        side_layout.setContentsMargins(8, 8, 8, 8)
+        side_layout.setSpacing(8)
+
+        def add_section(title, fields, columns=2):
+            section = QFrame(self.itemSummary_sidePanel)
+            section.setObjectName(re.sub(r"[^A-Za-z0-9_]+", "_", title).strip("_") + "_section")
+            section.setProperty("role", "sideMetricSection")
+            section.setFrameShape(QFrame.StyledPanel)
+            section.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            section_layout = QVBoxLayout(section)
+            section_layout.setContentsMargins(8, 6, 8, 8)
+            section_layout.setSpacing(6)
+
+            heading = QLabel(title, section)
+            heading.setProperty("role", "sectionTitle")
+            heading.setMinimumHeight(22)
+            heading.setMaximumHeight(26)
+            section_layout.addWidget(heading)
+
+            grid = QGridLayout()
+            grid.setContentsMargins(0, 0, 0, 0)
+            grid.setHorizontalSpacing(6)
+            grid.setVerticalSpacing(5)
+            section_layout.addLayout(grid)
+
+            row = 0
+            col_slot = 0
+            for field in fields:
+                label_name, label_text, box_name, min_width = field[:4]
+                layout_mode = field[4] if len(field) > 4 else "normal"
+
+                if layout_mode == "full" and col_slot:
+                    row += 1
+                    col_slot = 0
+
+                col = col_slot * 2
+                label = QLabel(label_text, section)
+                label.setObjectName(label_name)
+                label.setProperty("role", "sideMetricLabel")
+                label.setAlignment(Qt.AlignCenter)
+                label.setFrameShape(QFrame.StyledPanel)
+                label.setMinimumHeight(30)
+                label.setMinimumWidth(128)
+                label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+                label.setWordWrap(False)
+
+                box = QLabel("", section)
+                box.setObjectName(box_name)
+                box.setProperty("role", "sideMetricValue")
+                box.setAlignment(Qt.AlignCenter)
+                box.setFrameShape(QFrame.StyledPanel)
+                box.setMinimumHeight(30)
+                box.setMinimumWidth(max(min_width, 122))
+                box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+                setattr(self, label_name, label)
+                setattr(self, box_name, box)
+
+                if layout_mode == "full":
+                    grid.addWidget(label, row, 0)
+                    grid.addWidget(box, row, 1, 1, max(1, columns * 2 - 1))
+                    row += 1
+                    col_slot = 0
+                else:
+                    grid.addWidget(label, row, col)
+                    grid.addWidget(box, row, col + 1)
+                    col_slot += 1
+                    if col_slot >= columns:
+                        row += 1
+                        col_slot = 0
+
+            # Keep label/value pairs wide enough to stay readable even when the
+            # main window is at its minimum supported size.
+            for grid_col in range(columns * 2):
+                if grid_col % 2 == 0:
+                    grid.setColumnMinimumWidth(grid_col, 128)
+                else:
+                    grid.setColumnMinimumWidth(grid_col, 122)
+                    grid.setColumnStretch(grid_col, 1)
+
+            side_layout.addWidget(section)
+            return section
+
+        add_section(
+            "Demand",
+            [
+                ("totalQtySold_label", "Total Sold", "totalQtySold_box", 112),
+                ("avrMonthlySales_label", "Avg / Month", "avrMonthlySales_box", 112),
+                ("suggested_min", "Suggested Min", "suggestedMin_box", 180, "full"),
+            ],
+        )
+
+        add_section(
+            "Stock Position",
+            [
+                ("stockOnHand_label", "SOH", "stockOnHand_box", 112),
+                ("stockCommited_label", "Committed", "stockCommited_box", 112),
+                ("stockOnOrder_label", "On Order", "stockOnOrder_box", 112),
+                ("stockAvailable_label", "Available", "stockAvailable_box", 112),
+            ],
+        )
+
+        add_section(
+            "Inbound Supply",
+            [
+                ("onOrderForm_label", "Order Form", "onOrderForm_box", 180, "full"),
+                ("onNextContainer_label", "Next Container", "onNextContainer_box", 112),
+                ("nextContainerETA_label", "Next ETA", "nextContainerETA_box", 112),
+                ("shippedContainer_label", "Shipped", "shippedContainer_box", 112),
+                ("shippedContainerETA_label", "Ship ETA", "shippedContainerETA_box", 112),
+            ],
+        )
+
+        add_section(
+            "Suggested Ordering",
+            [
+                ("suggestedOrder_label", "Suggested", "suggestedOrder_box", 112),
+                ("atRisk_label", "At Risk", "atRisk_box", 112),
+                ("trendingOrder_label", "Trend", "trendingOrder_box", 112),
+                ("seasonalOrder_label", "Seasonal", "seasonalOrder_box", 112),
+                ("adjustedOrder_label", "Adjusted", "adjustedOrder_box", 112),
+            ],
+        )
+
+        tip_box = QTextBrowser(self.itemSummary_sidePanel)
+        tip_box.setObjectName("itemSummaryTips_textBrowser")
+        tip_box.setPlainText(
+            "Tips:\n"
+            "- Search an item and press Enter or Load.\n"
+            "- Use date range to control demand history.\n"
+            "- Double-click a customer row to open Customer Summary.\n"
+            "- Double-click month columns to see invoice lines.\n"
+            "- Suggested Order is display-only until added to a real order/container."
+        )
+        tip_box.setMinimumHeight(110)
+        tip_box.setMaximumHeight(150)
+        side_layout.addWidget(tip_box)
+        side_layout.addStretch(1)
+
+        self.itemMain_splitter.addWidget(self.frame_19)
+        self.itemMain_splitter.addWidget(self.itemSummary_sidePanel)
+        self.itemMain_splitter.setStretchFactor(0, 5)
+        self.itemMain_splitter.setStretchFactor(1, 0)
+        try:
+            self.itemMain_splitter.setSizes([980, 580])
+        except Exception:
+            pass
+
+
+    def _build_to_order_page(self):
+        self.toOrderSheet_page, layout = self._page("toOrderSheet_page", "To Order")
+        self.toOrderSubtitle_label = QLabel(
+            "Add suggested order lines, review on-order quantities, mark urgent items, and prepare supplier orders.",
+            self.toOrderSheet_page,
+        )
+        self.toOrderSubtitle_label.setObjectName("toOrderSubtitle_label")
+        self.toOrderSubtitle_label.setProperty("role", "pageSubtitle")
+        self.toOrderSubtitle_label.setMaximumHeight(24)
+        layout.addWidget(self.toOrderSubtitle_label)
+
+        self.frame_23 = QFrame(self.toOrderSheet_page)
+        self.frame_23.setObjectName("frame_23")
+        self.frame_23.setProperty("role", "toolbarCard")
+        self.frame_23.setFrameShape(QFrame.StyledPanel)
+        self.frame_23.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.frame_23.setMinimumHeight(92)
+        self.frame_23.setMaximumHeight(118)
+        self.horizontalLayout_9 = QHBoxLayout(self.frame_23)
+        self.horizontalLayout_9.setObjectName("horizontalLayout_9")
+        self.horizontalLayout_9.setContentsMargins(12, 10, 12, 10)
+        self.horizontalLayout_9.setSpacing(12)
+        layout.addWidget(self.frame_23)
+
+        entry_grid = QGridLayout()
+        entry_grid.setContentsMargins(0, 0, 0, 0)
+        entry_grid.setHorizontalSpacing(8)
+        entry_grid.setVerticalSpacing(6)
+
+        self.toOrderItem_label = QLabel("Item", self.frame_23)
+        self.toOrderItem_label.setObjectName("toOrderItem_label")
+        self.toOrderItem_label.setProperty("role", "fieldLabel")
+        self.enterItemOrder_lineEdit = self._line_edit(self.frame_23, "enterItemOrder_lineEdit", "Search item number")
+        self.enterItemOrder_lineEdit.setMinimumWidth(360)
+        self.enterItemOrder_lineEdit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        self.toOrderQty_label = QLabel("Qty", self.frame_23)
+        self.toOrderQty_label.setObjectName("toOrderQty_label")
+        self.toOrderQty_label.setProperty("role", "fieldLabel")
+        self.enterItemOrder_lineEdit_2 = self._line_edit(self.frame_23, "enterItemOrder_lineEdit_2", "0")
+        self.enterItemOrder_lineEdit_2.setMinimumWidth(110)
+        self.enterItemOrder_lineEdit_2.setMaximumWidth(150)
+
+        self.urgent_check = QCheckBox("Urgent", self.frame_23)
+        self.urgent_check.setObjectName("urgent_check")
+        self.urgent_check.setMinimumWidth(92)
+
+        self.toOrderAdd_button = QPushButton("Add Line", self.frame_23)
+        self.toOrderAdd_button.setObjectName("toOrderAdd_button")
+        self.toOrderAdd_button.setMinimumWidth(120)
+        self.toOrderAdd_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+        entry_grid.addWidget(self.toOrderItem_label, 0, 0)
+        entry_grid.addWidget(self.enterItemOrder_lineEdit, 0, 1, 1, 5)
+        entry_grid.addWidget(self.toOrderQty_label, 1, 0)
+        entry_grid.addWidget(self.enterItemOrder_lineEdit_2, 1, 1)
+        entry_grid.addWidget(self.urgent_check, 1, 2)
+        entry_grid.addWidget(self.toOrderAdd_button, 1, 3)
+        entry_grid.setColumnStretch(1, 1)
+        self.horizontalLayout_9.addLayout(entry_grid, 1)
+
+        actions = QFrame(self.frame_23)
+        actions.setObjectName("toOrderActions_frame")
+        actions.setFrameShape(QFrame.NoFrame)
+        actions_layout = QHBoxLayout(actions)
+        actions_layout.setContentsMargins(0, 0, 0, 0)
+        actions_layout.setSpacing(8)
+
+        self.updateOrders_button = QPushButton("Import Orders", actions)
+        self.updateOrders_button.setObjectName("updateOrders_button")
+        self.updateOrders_button.setMinimumWidth(128)
+
+        self.createYUOrder_pushButton = QPushButton("Create YU Order", actions)
+        self.createYUOrder_pushButton.setObjectName("createYUOrder_pushButton")
+        self.createYUOrder_pushButton.setMinimumWidth(142)
+
+        actions_layout.addWidget(self.updateOrders_button)
+        actions_layout.addWidget(self.createYUOrder_pushButton)
+        self.horizontalLayout_9.addWidget(actions, 0)
+
+        table_card = QFrame(self.toOrderSheet_page)
+        table_card.setObjectName("toOrderTable_frame")
+        table_card.setProperty("role", "contentCard")
+        table_card.setFrameShape(QFrame.StyledPanel)
+        table_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        table_layout = QVBoxLayout(table_card)
+        table_layout.setContentsMargins(10, 10, 10, 10)
+        table_layout.setSpacing(8)
+
+        self.toOrderTableTitle_label = QLabel("Suggested order lines", table_card)
+        self.toOrderTableTitle_label.setObjectName("toOrderTableTitle_label")
+        self.toOrderTableTitle_label.setProperty("role", "sectionTitle")
+        table_layout.addWidget(self.toOrderTableTitle_label)
+
+        self.order_table = self._table_widget(table_card, "order_table")
+        self.order_table.setMinimumHeight(360)
+        table_layout.addWidget(self.order_table, 1)
+        layout.addWidget(table_card, 1)
+
+
+    def _build_on_order_page(self):
+        self.onOrder_page, layout = self._page("onOrder_page", "On Order")
+        self.onOrderSubtitle_label = QLabel(
+            "Track incoming supplier orders, ready dates, comments, and container allocation status.",
+            self.onOrder_page,
+        )
+        self.onOrderSubtitle_label.setObjectName("onOrderSubtitle_label")
+        self.onOrderSubtitle_label.setProperty("role", "pageSubtitle")
+        self.onOrderSubtitle_label.setMaximumHeight(24)
+        layout.addWidget(self.onOrderSubtitle_label)
+
+        self.frame_onOrder = QFrame(self.onOrder_page)
+        self.frame_onOrder.setObjectName("frame_onOrder")
+        self.frame_onOrder.setProperty("role", "contentCard")
+        self.frame_onOrder.setFrameShape(QFrame.StyledPanel)
+        self.frame_onOrder.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.verticalLayout_onOrder_inner = QVBoxLayout(self.frame_onOrder)
+        self.verticalLayout_onOrder_inner.setObjectName("verticalLayout_onOrder_inner")
+        self.verticalLayout_onOrder_inner.setContentsMargins(10, 10, 10, 10)
+        self.verticalLayout_onOrder_inner.setSpacing(10)
+        layout.addWidget(self.frame_onOrder, 1)
+
+    def _build_container_capacity_tile(self, parent, size_text, avg_cartons):
+        tile = QFrame(parent)
+        tile.setObjectName(f"containerCapacity{size_text.replace("'", '')}_frame")
+        tile.setProperty("role", "metricCard")
+        tile.setFrameShape(QFrame.StyledPanel)
+        tile.setMinimumHeight(62)
+        tile.setMaximumHeight(72)
+        tile.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        layout = QVBoxLayout(tile)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(3)
+
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(6)
+
+        size_label = QLabel(size_text, tile)
+        size_label.setObjectName(f"containerCapacity{size_text.replace("'", '')}_sizeLabel")
+        size_label.setProperty("role", "metricValue")
+        size_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+
+        count_label = QLabel("x 0", tile)
+        count_label.setObjectName(f"containerCapacity{size_text.replace("'", '')}_countLabel")
+        count_label.setProperty("role", "metricValue")
+        count_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+        top.addWidget(size_label, 1)
+        top.addWidget(count_label, 0)
+
+        avg_label = QLabel(f"Avg: {avg_cartons:,}", tile)
+        avg_label.setObjectName(f"containerCapacity{size_text.replace("'", '')}_avgLabel")
+        avg_label.setProperty("role", "metricTitle")
+        avg_label.setAlignment(Qt.AlignCenter)
+
+        progress_label = QLabel("0%", tile)
+        progress_label.setObjectName(f"containerCapacity{size_text.replace("'", '')}_progressLabel")
+        progress_label.setProperty("role", "metricTitle")
+        progress_label.setAlignment(Qt.AlignCenter)
+
+        layout.addLayout(top)
+        layout.addWidget(avg_label)
+        layout.addWidget(progress_label)
+        return {
+            "frame": tile,
+            "size_label": size_label,
+            "count_label": count_label,
+            "avg_label": avg_label,
+            "progress_label": progress_label,
+            "capacity": avg_cartons,
+        }
+
+    def _build_build_container_page(self):
+        self.buildContainer_page, layout = self._page("buildContainer_page", "Build Container")
+        self.buildContainerSubtitle_label = QLabel(
+            "Build and review container lines, urgent/additional flags, saved containers, notes, and export/email actions.",
+            self.buildContainer_page,
+        )
+        self.buildContainerSubtitle_label.setObjectName("buildContainerSubtitle_label")
+        self.buildContainerSubtitle_label.setProperty("role", "pageSubtitle")
+        self.buildContainerSubtitle_label.setMaximumHeight(24)
+        layout.addWidget(self.buildContainerSubtitle_label)
+
+        self.buildContainer_splitter = QSplitter(Qt.Horizontal, self.buildContainer_page)
+        self.buildContainer_splitter.setObjectName("buildContainer_splitter")
+        self.buildContainer_splitter.setChildrenCollapsible(False)
+        self.buildContainer_splitter.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        layout.addWidget(self.buildContainer_splitter, 1)
+
+        main_area = QWidget(self.buildContainer_splitter)
+        main_area.setObjectName("buildContainerMainArea_widget")
+        main_layout = QVBoxLayout(main_area)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(10)
+
+        side_area = QWidget(self.buildContainer_splitter)
+        side_area.setObjectName("buildContainerSideArea_widget")
+        side_area.setMinimumWidth(330)
+        side_area.setMaximumWidth(390)
+        side_layout = QVBoxLayout(side_area)
+        side_layout.setContentsMargins(0, 0, 0, 0)
+        side_layout.setSpacing(10)
+
+        self.buildContainer_splitter.addWidget(main_area)
+        self.buildContainer_splitter.addWidget(side_area)
+        self.buildContainer_splitter.setStretchFactor(0, 1)
+        self.buildContainer_splitter.setStretchFactor(1, 0)
+
+        # Header / current container card.
+        self.frame_29 = QFrame(main_area)
+        self.frame_29.setObjectName("frame_29")
+        self.frame_29.setProperty("role", "toolbarCard")
+        self.frame_29.setFrameShape(QFrame.StyledPanel)
+        self.frame_29.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.horizontalLayout_11 = QGridLayout(self.frame_29)
+        self.horizontalLayout_11.setObjectName("horizontalLayout_11")
+        self.horizontalLayout_11.setContentsMargins(10, 10, 10, 10)
+        self.horizontalLayout_11.setHorizontalSpacing(10)
+        self.horizontalLayout_11.setVerticalSpacing(8)
+        main_layout.addWidget(self.frame_29, 0)
+
+        container_label = QLabel("Container", self.frame_29)
+        container_label.setProperty("role", "fieldLabel")
+        self.nextContainer_box = QTextEdit(self.frame_29)
+        self.nextContainer_box.setObjectName("nextContainer_box")
+        self.nextContainer_box.setPlaceholderText("Enter container reference, then press Enter")
+        self.nextContainer_box.setMaximumHeight(40)
+        self.nextContainer_box.setMinimumHeight(40)
+        self.nextContainer_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        updated_label = QLabel("Updated", self.frame_29)
+        updated_label.setProperty("role", "fieldLabel")
+        self.updated_box = QTextBrowser(self.frame_29)
+        self.updated_box.setObjectName("updated_box")
+        self.updated_box.setMaximumHeight(40)
+        self.updated_box.setMinimumHeight(40)
+        self.updated_box.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.updated_box.setMinimumWidth(108)
+
+        eta_label = QLabel("ETA", self.frame_29)
+        eta_label.setProperty("role", "fieldLabel")
+        self.eta_dateEdit = QDateEdit(self.frame_29)
+        self.eta_dateEdit.setObjectName("eta_dateEdit")
+        self.eta_dateEdit.setCalendarPopup(True)
+        self.eta_dateEdit.setDate(QDate.currentDate())
+        self.eta_dateEdit.setMinimumWidth(118)
+        self.eta_dateEdit.setMinimumHeight(34)
+
+        additional_label = QLabel("Additional cartons", self.frame_29)
+        additional_label.setProperty("role", "fieldLabel")
+        self.additional_spinner = QSpinBox(self.frame_29)
+        self.additional_spinner.setObjectName("additional_spinner")
+        self.additional_spinner.setRange(0, 999999)
+        self.additional_spinner.setMinimumWidth(94)
+        self.additional_spinner.setMinimumHeight(34)
+
+        self.checkBox = QCheckBox("Add dog leads note", self.frame_29)
+        self.checkBox.setObjectName("checkBox")
+        self.checkBox.setMinimumHeight(34)
+
+        self.horizontalLayout_11.addWidget(container_label, 0, 0)
+        self.horizontalLayout_11.addWidget(self.nextContainer_box, 0, 1, 1, 5)
+        self.horizontalLayout_11.addWidget(updated_label, 0, 6)
+        self.horizontalLayout_11.addWidget(self.updated_box, 0, 7)
+        self.horizontalLayout_11.addWidget(eta_label, 1, 0)
+        self.horizontalLayout_11.addWidget(self.eta_dateEdit, 1, 1)
+        self.horizontalLayout_11.addWidget(additional_label, 1, 2)
+        self.horizontalLayout_11.addWidget(self.additional_spinner, 1, 3)
+        self.horizontalLayout_11.addWidget(self.checkBox, 1, 4, 1, 2)
+        self.horizontalLayout_11.setColumnStretch(1, 1)
+        self.horizontalLayout_11.setColumnStretch(5, 1)
+
+        # Line entry card.
+        self.frame_46 = QFrame(main_area)
+        self.frame_46.setObjectName("frame_46")
+        self.frame_46.setProperty("role", "toolbarCard")
+        self.frame_46.setFrameShape(QFrame.StyledPanel)
+        self.frame_46.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        frame_46_layout = QVBoxLayout(self.frame_46)
+        frame_46_layout.setContentsMargins(10, 10, 10, 10)
+        frame_46_layout.setSpacing(8)
+        main_layout.addWidget(self.frame_46, 0)
+
+        entry_title = QLabel("Add container line", self.frame_46)
+        entry_title.setProperty("role", "sectionTitle")
+        frame_46_layout.addWidget(entry_title)
+
+        self.horizontalLayout_18 = QHBoxLayout()
+        self.horizontalLayout_18.setObjectName("horizontalLayout_18")
+        self.horizontalLayout_18.setContentsMargins(0, 0, 0, 0)
+        self.horizontalLayout_18.setSpacing(8)
+        frame_46_layout.addLayout(self.horizontalLayout_18)
+
+        self.orderNumberContainer_line = self._line_edit(self.frame_46, "orderNumberContainer_line", "Order number")
+        self.orderNumberContainer_line.setMinimumWidth(140)
+        self.itemNumberContainer_line = self._line_edit(self.frame_46, "itemNumberContainer_line", "Item number")
+        self.itemNumberContainer_line.setMinimumWidth(220)
+        self.qtyContainder_line = self._line_edit(self.frame_46, "qtyContainder_line", "Qty")
+        self.qtyContainder_line.setMinimumWidth(100)
+        self.addContainerLine_pushButton = QPushButton("Add Line", self.frame_46)
+        self.addContainerLine_pushButton.setObjectName("addContainerLine_pushButton")
+        self.addContainerLine_pushButton.setProperty("role", "primaryButton")
+        self.addContainerLine_pushButton.setMinimumWidth(110)
+
+        for label_text, widget, stretch in (
+            ("Order", self.orderNumberContainer_line, 0),
+            ("Item", self.itemNumberContainer_line, 1),
+            ("Qty", self.qtyContainder_line, 0),
+        ):
+            label = QLabel(label_text, self.frame_46)
+            label.setProperty("role", "fieldLabel")
+            self.horizontalLayout_18.addWidget(label, 0)
+            self.horizontalLayout_18.addWidget(widget, stretch)
+        self.horizontalLayout_18.addWidget(self.addContainerLine_pushButton, 0)
+
+        # Main table card.
+        table_card = QFrame(main_area)
+        table_card.setObjectName("containerTableCard_frame")
+        table_card.setProperty("role", "contentCard")
+        table_card.setFrameShape(QFrame.StyledPanel)
+        table_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        table_layout = QVBoxLayout(table_card)
+        table_layout.setContentsMargins(10, 10, 10, 10)
+        table_layout.setSpacing(8)
+        main_layout.addWidget(table_card, 1)
+
+        self.containerTableTitle_label = QLabel("Current container lines", table_card)
+        self.containerTableTitle_label.setObjectName("containerTableTitle_label")
+        self.containerTableTitle_label.setProperty("role", "sectionTitle")
+        table_layout.addWidget(self.containerTableTitle_label)
+
+        self.container_table = self._table_widget(table_card, "container_table")
+        self.container_table.setMinimumHeight(360)
+        table_layout.addWidget(self.container_table, 1)
+
+        # Side panel: totals, actions, capacity, saved containers, tips.
+        totals_card = QFrame(side_area)
+        totals_card.setObjectName("containerTotals_frame")
+        totals_card.setProperty("role", "sideMetricSection")
+        totals_card.setFrameShape(QFrame.StyledPanel)
+        totals_layout = QGridLayout(totals_card)
+        totals_layout.setContentsMargins(10, 10, 10, 10)
+        totals_layout.setHorizontalSpacing(8)
+        totals_layout.setVerticalSpacing(8)
+        side_layout.addWidget(totals_card, 0)
+
+        totals_title = QLabel("Container totals", totals_card)
+        totals_title.setProperty("role", "sectionTitle")
+        totals_layout.addWidget(totals_title, 0, 0, 1, 2)
+
+        self.totalCarton_label = QLabel("Total Cartons", totals_card)
+        self.totalCarton_label.setObjectName("totalCarton_label")
+        self.totalCarton_label.setProperty("role", "sideMetricLabel")
+        self.totalCarton_box = self._value_label(totals_card, "totalCarton_box")
+        self.totalCarton_box.setProperty("role", "sideMetricValue")
+
+        self.targetCarton_label = QLabel("Target Cartons", totals_card)
+        self.targetCarton_label.setObjectName("targetCarton_label")
+        self.targetCarton_label.setProperty("role", "sideMetricLabel")
+        self.targetCarton_box = self._value_label(totals_card, "targetCarton_box")
+        self.targetCarton_box.setProperty("role", "sideMetricValue")
+
+        totals_layout.addWidget(self.totalCarton_label, 1, 0)
+        totals_layout.addWidget(self.totalCarton_box, 1, 1)
+        totals_layout.addWidget(self.targetCarton_label, 2, 0)
+        totals_layout.addWidget(self.targetCarton_box, 2, 1)
+
+        self.container_management_panel = QFrame(side_area)
+        self.container_management_panel.setObjectName("container_management_panel")
+        self.container_management_panel.setProperty("role", "sideMetricSection")
+        self.container_management_panel.setFrameShape(QFrame.StyledPanel)
+        actions_layout = QGridLayout(self.container_management_panel)
+        actions_layout.setContentsMargins(10, 10, 10, 10)
+        actions_layout.setHorizontalSpacing(8)
+        actions_layout.setVerticalSpacing(8)
+        side_layout.addWidget(self.container_management_panel, 0)
+
+        actions_title = QLabel("Actions", self.container_management_panel)
+        actions_title.setProperty("role", "sectionTitle")
+        actions_layout.addWidget(actions_title, 0, 0, 1, 2)
+
+        self.loadContainer_pushButton = QPushButton("Load / New", self.container_management_panel)
+        self.loadContainer_pushButton.setObjectName("loadContainer_pushButton")
+        self.closeContainer_pushButton = QPushButton("Close Current", self.container_management_panel)
+        self.closeContainer_pushButton.setObjectName("closeContainer_pushButton")
+        self.exportEmail_pushButton = QPushButton("Export", self.container_management_panel)
+        self.exportEmail_pushButton.setObjectName("exportEmail_pushButton")
+        self.emailContainer_pushButton = QPushButton("Email", self.container_management_panel)
+        self.emailContainer_pushButton.setObjectName("emailContainer_pushButton")
+        self.pushButton_8 = QPushButton("Edit Notes", self.container_management_panel)
+        self.pushButton_8.setObjectName("pushButton_8")
+
+        action_buttons = (
+            self.loadContainer_pushButton,
+            self.closeContainer_pushButton,
+            self.exportEmail_pushButton,
+            self.emailContainer_pushButton,
+            self.pushButton_8,
+        )
+        for button in action_buttons:
+            button.setMinimumHeight(30)
+            button.setMaximumHeight(32)
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        actions_layout.addWidget(self.loadContainer_pushButton, 1, 0)
+        actions_layout.addWidget(self.closeContainer_pushButton, 1, 1)
+        actions_layout.addWidget(self.exportEmail_pushButton, 2, 0)
+        actions_layout.addWidget(self.emailContainer_pushButton, 2, 1)
+        # Refresh is added during live-refresh setup.  Keep Edit Notes beside it
+        # instead of using a full-width row so the action block stays compact.
+        actions_layout.addWidget(self.pushButton_8, 3, 1)
+        actions_layout.setColumnStretch(0, 1)
+        actions_layout.setColumnStretch(1, 1)
+
+        self.container_capacity_panel = QFrame(side_area)
+        self.container_capacity_panel.setObjectName("container_capacity_panel")
+        self.container_capacity_panel.setProperty("role", "sideMetricSection")
+        self.container_capacity_panel.setFrameShape(QFrame.StyledPanel)
+        self.container_capacity_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        capacity_layout = QGridLayout(self.container_capacity_panel)
+        capacity_layout.setContentsMargins(10, 10, 10, 10)
+        capacity_layout.setHorizontalSpacing(8)
+        capacity_layout.setVerticalSpacing(6)
+        side_layout.addWidget(self.container_capacity_panel, 0)
+
+        capacity_title = QLabel("Container capacity guide", self.container_capacity_panel)
+        capacity_title.setProperty("role", "sectionTitle")
+        capacity_layout.addWidget(capacity_title, 0, 0, 1, 2)
+
+        self.container_capacity_widgets = {}
+        cap40 = self._build_container_capacity_tile(self.container_capacity_panel, "40'", 1350)
+        cap20 = self._build_container_capacity_tile(self.container_capacity_panel, "20'", 600)
+        self.container_capacity_widgets["40'"] = cap40
+        self.container_capacity_widgets["20'"] = cap20
+        capacity_layout.addWidget(cap40["frame"], 1, 0)
+        capacity_layout.addWidget(cap20["frame"], 1, 1)
+        capacity_layout.setColumnStretch(0, 1)
+        capacity_layout.setColumnStretch(1, 1)
+
+        self.savedContainers_frame = QFrame(side_area)
+        self.savedContainers_frame.setObjectName("savedContainers_frame")
+        self.savedContainers_frame.setProperty("role", "contentCard")
+        self.savedContainers_frame.setFrameShape(QFrame.StyledPanel)
+        self.savedContainers_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        saved_layout = QVBoxLayout(self.savedContainers_frame)
+        saved_layout.setContentsMargins(10, 10, 10, 10)
+        saved_layout.setSpacing(8)
+        side_layout.addWidget(self.savedContainers_frame, 1)
+
+        saved_title = QLabel("Saved containers", self.savedContainers_frame)
+        saved_title.setProperty("role", "sectionTitle")
+        saved_layout.addWidget(saved_title)
+
+        self.containers_tableWidget = self._table_widget(self.savedContainers_frame, "containers_tableWidget")
+        self.containers_tableWidget.setMinimumHeight(170)
+        saved_layout.addWidget(self.containers_tableWidget, 1)
+
+        self.buildContainerTips_textBrowser = QTextBrowser(side_area)
+        self.buildContainerTips_textBrowser.setObjectName("buildContainerTips_textBrowser")
+        self.buildContainerTips_textBrowser.setMaximumHeight(112)
+        self.buildContainerTips_textBrowser.setPlainText(
+            "Tips:\n"
+            "- Enter or load a container before adding lines.\n"
+            "- Press Enter in Qty to add the current line.\n"
+            "- Double-click Urgent or Additional to flag a row.\n"
+            "- Double-click Remove to remove a line.\n"
+            "- Notes and dog leads are pinned to the bottom."
+        )
+        side_layout.addWidget(self.buildContainerTips_textBrowser, 0)
+
+    def _build_order_analysis_page(self):
+        self.orderAnalysy_page, layout = self._page("orderAnalysy_page", "Order Analysis")
+        intro = QLabel("Review supplier or group demand, stock cover, inbound supply, and suggested orders.", self.orderAnalysy_page)
+        intro.setObjectName("orderAnalysis_intro")
+        intro.setProperty("role", "pageSubtitle")
+        layout.addWidget(intro)
+
+        self.frame_39, self.horizontalLayout_14 = self._panel(self.orderAnalysy_page, "frame_39", QHBoxLayout)
+        self.frame_39.setProperty("role", "contentCard")
+        self.frame_39.setMinimumHeight(92)
+        self.frame_39.setMaximumHeight(122)
+        layout.addWidget(self.frame_39)
+
+        self.enterSupplier_label = QLabel("Supplier / Group", self.frame_39)
+        self.enterSupplier_label.setObjectName("enterSupplier_label")
+        self.enterSupplier_label.setMinimumWidth(110)
+        self.customer_lineEdit = self._line_edit(self.frame_39, "customer_lineEdit", "Enter supplier")
+        self.customer_lineEdit.setMinimumWidth(320)
+        self.weeksPurchase_label = QLabel("", self.frame_39)
+        self.weeksPurchase_label.setObjectName("weeksPurchase_label")
+        self.weeksPurchase_label.setProperty("role", "metricPill")
+        self.weeksPurchase_label.hide()
+        self.weeksSinceLast_label = QLabel("", self.frame_39)
+        self.weeksSinceLast_label.setObjectName("weeksSinceLast_label")
+        self.weeksSinceLast_label.setProperty("role", "metricPill")
+        self.weeksSinceLast_label.hide()
+        self.orderAnalysisClear_button = QPushButton("Clear", self.frame_39)
+        self.orderAnalysisClear_button.setObjectName("orderAnalysisClear_button")
+        self.orderAnalysisExport_button = QPushButton("Export", self.frame_39)
+        self.orderAnalysisExport_button.setObjectName("orderAnalysisExport_button")
+        for widget in (
+            self.enterSupplier_label,
+            self.customer_lineEdit,
+            self.orderAnalysisClear_button,
+            self.orderAnalysisExport_button,
+        ):
+            self.horizontalLayout_14.addWidget(widget)
+        self.horizontalLayout_14.addStretch(1)
+
+        self.orderAnalysisTable_frame = QFrame(self.orderAnalysy_page)
+        self.orderAnalysisTable_frame.setObjectName("orderAnalysisTable_frame")
+        self.orderAnalysisTable_frame.setProperty("role", "contentCard")
+        self.orderAnalysisTable_frame.setFrameShape(QFrame.StyledPanel)
+        table_layout = QVBoxLayout(self.orderAnalysisTable_frame)
+        table_layout.setContentsMargins(10, 10, 10, 10)
+        table_layout.setSpacing(8)
+        table_title = QLabel("Suggested order detail", self.orderAnalysisTable_frame)
+        table_title.setProperty("role", "sectionTitle")
+        table_layout.addWidget(table_title)
+        self.tableWidget = self._table_widget(self.orderAnalysisTable_frame, "tableWidget")
+        table_layout.addWidget(self.tableWidget, 1)
+        layout.addWidget(self.orderAnalysisTable_frame, 1)
+
+        # Legacy summary widgets are kept for compatibility with older update code,
+        # but hidden so this page uses the new table-first layout.
+        self.frame_44 = QFrame(self.orderAnalysy_page)
+        self.frame_44.setObjectName("frame_44")
+        self.frame_44.hide()
+        self.verticalLayout_26 = QVBoxLayout(self.frame_44)
+        for name in (
+            "bagInBox_textBrowser", "keg_textBrowser", "ibc_textBrowser",
+            "bagInBoxWeeksLast_textBrowser", "kegWeeksLast_textBrowser", "ibcWeeksLast_textBrowser",
+        ):
+            widget = self._text_box(self.frame_44, name, "No matching rows")
+            setattr(self, name, widget)
+
+    def _build_shipments_page(self):
+        self.shipments_page, layout = self._page("shipments_page", "Shipments")
+        intro = QLabel("Review shipment status, due dates, vessel details, and container movement without leaving the main app.", self.shipments_page)
+        intro.setObjectName("shipments_intro")
+        intro.setProperty("role", "pageSubtitle")
+        layout.addWidget(intro)
+
+        self.shipmentsEmbed_frame = QFrame(self.shipments_page)
+        self.shipmentsEmbed_frame.setObjectName("shipmentsEmbed_frame")
+        self.shipmentsEmbed_frame.setProperty("role", "contentCard")
+        self.shipmentsEmbed_frame.setFrameShape(QFrame.StyledPanel)
+        self.shipmentsEmbed_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.shipmentsEmbed_layout = QVBoxLayout(self.shipmentsEmbed_frame)
+        self.shipmentsEmbed_layout.setObjectName("shipmentsEmbed_layout")
+        self.shipmentsEmbed_layout.setContentsMargins(8, 8, 8, 8)
+        self.shipmentsEmbed_layout.setSpacing(8)
+
+        self.shipmentsPlaceholder_label = QLabel(
+            "Open this page to load the embedded shipments register.",
+            self.shipmentsEmbed_frame,
+        )
+        self.shipmentsPlaceholder_label.setObjectName("shipmentsPlaceholder_label")
+        self.shipmentsPlaceholder_label.setAlignment(Qt.AlignCenter)
+        self.shipmentsPlaceholder_label.setMinimumHeight(160)
+        self.shipmentsEmbed_layout.addWidget(self.shipmentsPlaceholder_label, 1)
+        layout.addWidget(self.shipmentsEmbed_frame, 1)
+
+    def _build_saba_review_page(self):
+        self.sabaReview_page, layout = self._page("sabaReview_page", "SABA Review")
+        intro = QLabel("Check SABA customer ordering intervals, overdue packs, and export review results.", self.sabaReview_page)
+        intro.setObjectName("sabaReview_intro")
+        intro.setProperty("role", "pageSubtitle")
+        layout.addWidget(intro)
+
+        self.frame_saba_controls, saba_controls = self._panel(self.sabaReview_page, "frame_saba_controls", QHBoxLayout)
+        self.frame_saba_controls.setProperty("role", "contentCard")
+        self.frame_saba_controls.setMinimumHeight(86)
+        self.frame_saba_controls.setMaximumHeight(128)
+        layout.addWidget(self.frame_saba_controls)
+        self.sabaCustomer_label = QLabel("Customer", self.frame_saba_controls)
+        self.sabaCustomer_label.setObjectName("sabaCustomer_label")
+        self.sabaCustomer_label.setMinimumWidth(96)
+        self.customerSaba_lineEdit = self._line_edit(self.frame_saba_controls, "customerSaba_lineEdit", "Enter customer or All")
+        saba_controls.addWidget(self.sabaCustomer_label)
+        saba_controls.addWidget(self.customerSaba_lineEdit, 1)
+
+        self.sabaTable_frame = QFrame(self.sabaReview_page)
+        self.sabaTable_frame.setObjectName("sabaTable_frame")
+        self.sabaTable_frame.setProperty("role", "contentCard")
+        self.sabaTable_frame.setFrameShape(QFrame.StyledPanel)
+        saba_table_layout = QVBoxLayout(self.sabaTable_frame)
+        saba_table_layout.setContentsMargins(10, 10, 10, 10)
+        saba_table_layout.setSpacing(8)
+        saba_title = QLabel("SABA purchase review", self.sabaTable_frame)
+        saba_title.setProperty("role", "sectionTitle")
+        saba_table_layout.addWidget(saba_title)
+        self.sabaSales_table = self._table_view(self.sabaTable_frame, "sabaSales_table")
+        saba_table_layout.addWidget(self.sabaSales_table, 1)
+        layout.addWidget(self.sabaTable_frame, 1)
+
+    def _build_update_data_page(self):
+        self.update_page, layout = self._page("update_page", "Update Data")
+        update_row = QHBoxLayout()
+        layout.addLayout(update_row, 1)
+        self.frame_47 = QFrame(self.update_page)
+        self.frame_47.setObjectName("frame_47")
+        self.frame_47.setFrameShape(QFrame.StyledPanel)
+        self.frame_47.setProperty("role", "contentCard")
+        self.frame_47.setMinimumWidth(420)
+        self.frame_47.setMaximumWidth(520)
+        import_layout = QVBoxLayout(self.frame_47)
+        import_layout.setContentsMargins(12, 12, 12, 12)
+        import_layout.setSpacing(10)
+        update_row.addWidget(self.frame_47)
+
+        self.updateSales_pushButton = QPushButton("Update Sales", self.frame_47)
+        self.updateSales_pushButton.setObjectName("updateSales_pushButton")
+        self.lastUpdateSales_textBrowser = self._text_box(self.frame_47, "lastUpdateSales_textBrowser", "Sales not updated this session")
+        self.updateStock_pushButton = QPushButton("Update Stock", self.frame_47)
+        self.updateStock_pushButton.setObjectName("updateStock_pushButton")
+        self.lastUPdateStock_textBrowser_2 = self._text_box(self.frame_47, "lastUPdateStock_textBrowser_2", "Stock not updated this session")
+        self.updatOrders_pushButton_3 = getattr(self, "updatOrders_pushButton_3", QPushButton("Import Orders", self.frame_47))
+        self.updatOrders_pushButton_3.setObjectName("updatOrders_pushButton_3")
+        self.lastUpdateOrders_textBrowser_3 = self._text_box(self.frame_47, "lastUpdateOrders_textBrowser_3", "Orders not updated this session")
+        self.updateDataCreateYUOrder_pushButton = QPushButton("Create YU Order", self.frame_47)
+        self.updateDataCreateYUOrder_pushButton.setObjectName("updateDataCreateYUOrder_pushButton")
+        for widget in (
+            self.updateSales_pushButton,
+            self.lastUpdateSales_textBrowser,
+            self.updateStock_pushButton,
+            self.lastUPdateStock_textBrowser_2,
+            self.updatOrders_pushButton_3,
+            self.lastUpdateOrders_textBrowser_3,
+            self.updateDataCreateYUOrder_pushButton,
+        ):
+            import_layout.addWidget(widget)
+        import_layout.addStretch(1)
+
+        self.updateDataInstructions_tabs = QTabWidget(self.update_page)
+        self.updateDataInstructions_tabs.setObjectName("updateDataInstructions_tabs")
+        self.salesImportInstructions_textEdit = QTextEdit(self.updateDataInstructions_tabs)
+        self.salesImportInstructions_textEdit.setObjectName("salesImportInstructions_textEdit")
+        self.salesImportInstructions_textEdit.setReadOnly(True)
+        self.updateDataInstructions_tabs.addTab(self.salesImportInstructions_textEdit, "Sales")
+        for title in ("Stock", "Orders", "Customers", "Items"):
+            placeholder = QTextEdit(self.updateDataInstructions_tabs)
+            placeholder.setReadOnly(True)
+            placeholder.setPlainText(f"{title} import instructions will be added here.")
+            self.updateDataInstructions_tabs.addTab(placeholder, title)
+        update_row.addWidget(self.updateDataInstructions_tabs, 1)
+
+    # ------------------------------------------------------------------
+    # Text and styling
+    # ------------------------------------------------------------------
+    def retranslateUi(self, MainWindow):
+        MainWindow.setWindowTitle(QCoreApplication.translate("MainWindow", "Windsor Widget", None))
+        self._apply_base_styles()
+
+    def _apply_base_styles(self):
+        # Keep base styling structural only.  Actual colours are applied in
+        # apply_theme(), otherwise the old dark-only page stylesheet fights
+        # the light theme and creates the mixed look shown during testing.
+        self.centralwidget.setStyleSheet("""
+            QWidget { font-family: Segoe UI, Arial, sans-serif; font-size: 10pt; }
+            QPushButton { min-height: 32px; padding: 6px 10px; border-radius: 6px; }
+            QFrame#frame_7 QPushButton { text-align: left; padding-left: 14px; font-weight: 650; }
+            QLabel[role="pageTitle"] { font-size: 22px; font-weight: 800; padding: 0; }
+            QLabel[role="pageSubtitle"] { font-size: 10pt; padding: 0; }
+            QLabel[role="sectionTitle"] { font-size: 11pt; font-weight: 800; padding: 2px 0 4px 0; }
+            QLabel[role="fieldLabel"] { font-weight: 800; }
+            QLabel[role="metricTitle"] { font-size: 8.5pt; }
+            QLabel[role="metricValue"] { font-size: 10.5pt; font-weight: 800; }
+            QFrame[role="toolbarCard"], QFrame[role="subtleCard"], QFrame[role="contentCard"],
+            QFrame[role="sideCard"], QFrame[role="metricCard"], QFrame[role="sideMetricSection"] {
+                border-radius: 10px;
+            }
+            QLabel[role="sideMetricLabel"], QLabel[role="sideMetricValue"] {
+                border-radius: 6px;
+                padding: 3px 6px;
+            }
+            QFrame[frameShape="5"], QFrame[frameShape="6"] { border-radius: 8px; }
+            QTextBrowser, QTextEdit, QLineEdit, QTableWidget, QTableView { border-radius: 5px; }
+        """)
+
 
 
 class MainWindow(QMainWindow):
@@ -3980,6 +5709,7 @@ class MainWindow(QMainWindow):
         self.setup_sales_table()
         self.setup_customer_info_table()
         self.setup_customer_purchase_table()
+        self.setup_frozen_column_tables()
         self.setup_customer_summary_layout()
         self.setup_update_page()
         self.setup_order_table()
@@ -4339,15 +6069,43 @@ class MainWindow(QMainWindow):
                 button.setMaximumWidth(template_button.maximumWidth() or 150)
                 button.setMinimumHeight(32)
                 button.setMaximumHeight(32)
-                button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+                button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             except Exception:
                 pass
 
-        insert_index = layout.indexOf(export_button) if export_button is not None else -1
-        if insert_index >= 0:
-            layout.insertWidget(insert_index, button)
+        # The old generated-UI actions panel used a box layout, but the rebuilt
+        # Build Container screen uses a grid.  QGridLayout has no insertWidget(),
+        # so place Refresh explicitly in the rebuilt actions grid instead of
+        # trying to use the old insertion path.
+        if isinstance(layout, QGridLayout):
+            try:
+                # Keep the final action row compact: Refresh beside Edit Notes.
+                edit_notes_button = getattr(self.ui, "pushButton_8", None)
+                button.setMinimumWidth(0)
+                button.setMaximumWidth(16777215)
+                button.setMinimumHeight(30)
+                button.setMaximumHeight(32)
+                button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+                if edit_notes_button is not None and layout.indexOf(edit_notes_button) >= 0:
+                    layout.removeWidget(edit_notes_button)
+                    edit_notes_button.setMinimumHeight(30)
+                    edit_notes_button.setMaximumHeight(32)
+                    edit_notes_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+                    layout.addWidget(button, 3, 0)
+                    layout.addWidget(edit_notes_button, 3, 1)
+                else:
+                    layout.addWidget(button, 3, 0)
+                layout.setColumnStretch(0, 1)
+                layout.setColumnStretch(1, 1)
+            except Exception:
+                layout.addWidget(button)
         else:
-            layout.addWidget(button)
+            insert_index = layout.indexOf(export_button) if export_button is not None else -1
+            if insert_index >= 0 and hasattr(layout, "insertWidget"):
+                layout.insertWidget(insert_index, button)
+            else:
+                layout.addWidget(button)
+
         button.clicked.connect(lambda: self.refresh_build_container_page_data(manual=True))
         self.build_container_refresh_button = button
 
@@ -4701,6 +6459,7 @@ class MainWindow(QMainWindow):
             ("onOrder_button", "onOrder_page"),
             ("buildContainerSheet_button", "buildContainer_page"),
             ("orderAnalasys_button", "orderAnalysy_page"),
+            ("leftShipments_button", "shipments_page"),
             ("sabaReview_button", "sabaReview_page"),
             ("updateData_button", "update_page"),
         ]
@@ -4761,6 +6520,12 @@ class MainWindow(QMainWindow):
             return
         menu = QMenu(button)
         label_text = (button_label or page_name or "page").strip()
+        if page_name == "shipments_page":
+            refresh_action = menu.addAction("Refresh Shipments")
+            chosen = menu.exec(button.mapToGlobal(pos))
+            if chosen == refresh_action:
+                self.open_shipments_window()
+            return
         open_action = menu.addAction(f"Open {label_text} in new window")
         chosen = menu.exec(button.mapToGlobal(pos))
         if chosen == open_action:
@@ -4807,11 +6572,9 @@ class MainWindow(QMainWindow):
         return detached
 
     def navigation_selected_style(self):
-        if hasattr(self.ui, "radioHighContrast") and self.ui.radioHighContrast.isChecked():
-            return "background: #005a9e; color: white; border: 2px solid cyan; font-weight: 700;"
         if hasattr(self.ui, "radioLight") and self.ui.radioLight.isChecked():
-            return "background: #6d6d6d; color: white; border: 1px solid #4f4f4f; font-weight: 700;"
-        return "background: #b0b4b9; color: #111111; border: 1px solid #8a8d91; font-weight: 700;"
+            return "background: #d4deea; color: #111827; border: 1px solid #9eabb9; font-weight: 800;"
+        return "background: #d8dee6; color: #111827; border: 1px solid #f1f5f9; font-weight: 800;"
 
     def update_navigation_button_highlight(self, *_args):
         stacked_widget = getattr(self.ui, "stackedWidget", None)
@@ -4834,6 +6597,11 @@ class MainWindow(QMainWindow):
 
         to_order_page = getattr(self.ui, "toOrderSheet_page", None)
         build_container_page = getattr(self.ui, "buildContainer_page", None)
+        shipments_page = getattr(self.ui, "shipments_page", None)
+
+        if current_page is shipments_page:
+            self.open_shipments_window()
+            return
 
         if current_page in {to_order_page, build_container_page}:
             self.load_reference_lists()
@@ -4856,6 +6624,10 @@ class MainWindow(QMainWindow):
                 self.refresh_item_summary_context_boxes()
 
     def add_left_shipments_nav_button(self):
+        existing_ui_button = getattr(self.ui, "leftShipments_button", None)
+        if existing_ui_button is not None:
+            self.left_shipments_button = existing_ui_button
+            return
         if getattr(self, "left_shipments_button", None) is not None:
             return
 
@@ -4902,6 +6674,56 @@ class MainWindow(QMainWindow):
         return
 
     def add_container_management_buttons(self):
+        """Wire container-management controls.
+
+        The rebuilt Build Container page creates these controls directly in the
+        code-built UI.  Older/generated layouts built the action panel here, so
+        this method still supports both paths.  Prefer the prebuilt path to avoid
+        moving widgets around after the new layout has been constructed.
+        """
+        prebuilt_panel = getattr(self.ui, "container_management_panel", None)
+        if prebuilt_panel is None:
+            try:
+                prebuilt_panel = self.findChild(QFrame, "container_management_panel")
+            except Exception:
+                prebuilt_panel = None
+        prebuilt_load = getattr(self.ui, "loadContainer_pushButton", None)
+        prebuilt_close = getattr(self.ui, "closeContainer_pushButton", None)
+        prebuilt_email = getattr(self.ui, "emailContainer_pushButton", None)
+        export_button = getattr(self.ui, "exportEmail_pushButton", None)
+
+        if prebuilt_panel is not None and prebuilt_load is not None and prebuilt_close is not None and export_button is not None:
+            self.container_action_panel = prebuilt_panel
+            self.load_container_button = prebuilt_load
+            self.close_container_button = prebuilt_close
+            self.email_container_button = prebuilt_email
+            self.export_container_button = export_button
+
+            capacity_panel = getattr(self.ui, "container_capacity_panel", None)
+            if capacity_panel is not None:
+                self.container_capacity_panel = capacity_panel
+            ui_capacity = getattr(self.ui, "container_capacity_widgets", None)
+            if ui_capacity and not getattr(self, "container_capacity_widgets", None):
+                self.container_capacity_widgets = ui_capacity
+
+            if not bool(prebuilt_panel.property("_container_buttons_connected")):
+                prebuilt_load.clicked.connect(self.load_or_start_container)
+                prebuilt_close.clicked.connect(self.close_current_container)
+                add_line_button = getattr(self.ui, "addContainerLine_pushButton", None)
+                if add_line_button is not None:
+                    add_line_button.clicked.connect(self.add_container_line_from_inputs)
+                prebuilt_panel.setProperty("_container_buttons_connected", True)
+
+            self.update_container_capacity_panel()
+            return
+
+        # The code-built Build Container screen owns its right-side actions,
+        # saved-container list, and capacity guide.  If one of those widgets is
+        # unexpectedly missing, do not fall back to the old generated-UI patcher
+        # because it moves widgets into the wrong cards and creates duplicates.
+        if getattr(self.ui, "buildContainer_splitter", None) is not None:
+            return
+
         if getattr(self, "container_action_panel", None) is not None:
             return
 
@@ -4942,9 +6764,10 @@ class MainWindow(QMainWindow):
 
         panel = QWidget(frame or self)
         panel.setObjectName("container_management_panel")
-        panel_layout = QVBoxLayout(panel)
+        panel_layout = QGridLayout(panel)
         panel_layout.setContentsMargins(0, 0, 0, 0)
-        panel_layout.setSpacing(6)
+        panel_layout.setHorizontalSpacing(8)
+        panel_layout.setVerticalSpacing(6)
 
         self.container_action_panel = panel
         self.load_container_button = QPushButton("Load / New", panel)
@@ -4969,14 +6792,18 @@ class MainWindow(QMainWindow):
                 button.setFont(export_button.font())
             except Exception:
                 pass
-            button.setMinimumWidth(150)
-            button.setMaximumWidth(150)
-            button.setMinimumHeight(32)
+            button.setMinimumWidth(0)
+            button.setMaximumWidth(16777215)
+            button.setMinimumHeight(30)
             button.setMaximumHeight(32)
-            button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-            panel_layout.addWidget(button)
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        panel_layout.addStretch(1)
+        panel_layout.addWidget(self.load_container_button, 0, 0)
+        panel_layout.addWidget(self.close_container_button, 0, 1)
+        panel_layout.addWidget(self.export_container_button, 1, 0)
+        panel_layout.addWidget(self.email_container_button, 1, 1)
+        panel_layout.setColumnStretch(0, 1)
+        panel_layout.setColumnStretch(1, 1)
 
         try:
             frame.setMinimumWidth(430)
@@ -5012,9 +6839,10 @@ class MainWindow(QMainWindow):
             capacity_panel.setFrameShape(QFrame.StyledPanel)
             capacity_panel.setFrameShadow(QFrame.Raised)
 
-            capacity_layout = QVBoxLayout(capacity_panel)
+            capacity_layout = QGridLayout(capacity_panel)
             capacity_layout.setContentsMargins(8, 10, 8, 10)
-            capacity_layout.setSpacing(10)
+            capacity_layout.setHorizontalSpacing(8)
+            capacity_layout.setVerticalSpacing(6)
 
             heading = QLabel("Container Avg Cartons", capacity_panel)
             heading.setAlignment(Qt.AlignCenter)
@@ -5025,10 +6853,10 @@ class MainWindow(QMainWindow):
                 heading.setFont(heading_font)
             except Exception:
                 pass
-            capacity_layout.addWidget(heading)
+            capacity_layout.addWidget(heading, 0, 0, 1, 2)
 
             self.container_capacity_widgets = {}
-            for size_text, avg_cartons in (("40'", 1350), ("20'", 600)):
+            for capacity_col, (size_text, avg_cartons) in enumerate((("40'", 1350), ("20'", 600))):
                 row_frame = QFrame(capacity_panel)
                 row_frame.setObjectName(f"containerCapacity{size_text.replace("'", '')}_frame")
                 row_frame.setFrameShape(QFrame.StyledPanel)
@@ -5072,7 +6900,9 @@ class MainWindow(QMainWindow):
                 row_layout.addWidget(avg_label)
                 row_layout.addWidget(progress_label)
 
-                capacity_layout.addWidget(row_frame)
+                row_frame.setMinimumHeight(62)
+                row_frame.setMaximumHeight(72)
+                capacity_layout.addWidget(row_frame, 1, capacity_col)
                 self.container_capacity_widgets[size_text] = {
                     "frame": row_frame,
                     "size_label": size_label,
@@ -5082,11 +6912,34 @@ class MainWindow(QMainWindow):
                     "capacity": avg_cartons,
                 }
 
-            capacity_layout.addStretch(1)
+            capacity_layout.setColumnStretch(0, 1)
+            capacity_layout.setColumnStretch(1, 1)
             if not bool(top_layout.property("_container_capacity_stretch_added")):
-                top_layout.addStretch(1)
+                # The rebuilt Build Container page may use a QGridLayout here,
+                # while the older generated UI used a QHBoxLayout.  QGridLayout
+                # has no addStretch(), so use the right API for whichever layout
+                # is present instead of crashing at startup.
+                try:
+                    if hasattr(top_layout, "addStretch"):
+                        top_layout.addStretch(1)
+                    elif hasattr(top_layout, "setColumnStretch"):
+                        top_layout.setColumnStretch(max(0, top_layout.columnCount()), 1)
+                except Exception:
+                    pass
                 top_layout.setProperty("_container_capacity_stretch_added", True)
-            top_layout.addWidget(capacity_panel, 0, Qt.AlignTop)
+
+            try:
+                if hasattr(top_layout, "rowCount") and hasattr(top_layout, "columnCount"):
+                    top_layout.addWidget(capacity_panel, 0, max(0, top_layout.columnCount()), Qt.AlignTop)
+                else:
+                    top_layout.addWidget(capacity_panel, 0, Qt.AlignTop)
+            except TypeError:
+                try:
+                    top_layout.addWidget(capacity_panel)
+                except Exception:
+                    pass
+            except Exception:
+                pass
             self.container_capacity_panel = capacity_panel
 
         self.update_container_capacity_panel()
@@ -5215,36 +7068,78 @@ class MainWindow(QMainWindow):
             self.open_shipments_window_detached()
 
     def open_shipments_window(self):
-        needs_new_window = self.shipments_window is None
-        if not needs_new_window:
+        """Show Shipments embedded in the main stacked widget, not as a pop-out window."""
+        stacked_widget = getattr(self.ui, "stackedWidget", None)
+        shipments_page = getattr(self.ui, "shipments_page", None)
+        if stacked_widget is not None and shipments_page is not None and stacked_widget.currentWidget() is not shipments_page:
+            stacked_widget.setCurrentWidget(shipments_page)
+            return
+
+        host = getattr(self.ui, "shipmentsEmbed_frame", None)
+        host_layout = getattr(self.ui, "shipmentsEmbed_layout", None)
+        if host is None or host_layout is None:
+            # Fallback for any older layout that does not have the embedded host.
+            if self.shipments_window is None:
+                self.shipments_window = ShipmentsWindow(self)
+            self.shipments_window.show()
+            return
+
+        needs_new_panel = self.shipments_window is None
+        if not needs_new_panel:
             try:
-                self.shipments_window.isVisible()
                 table = self.shipments_window.table_widget()
                 if table is not None:
                     table.rowCount()
             except RuntimeError:
                 self.shipments_window = None
-                needs_new_window = True
+                needs_new_panel = True
 
-        if needs_new_window:
-            self.shipments_window = ShipmentsWindow(self)
+        if needs_new_panel:
+            placeholder = getattr(self.ui, "shipmentsPlaceholder_label", None)
+            if placeholder is not None:
+                try:
+                    placeholder.hide()
+                    host_layout.removeWidget(placeholder)
+                    placeholder.setParent(None)
+                except Exception:
+                    pass
+
+            panel = ShipmentsWindow(self)
+            panel.setObjectName("embeddedShipments_panel")
+            panel.setWindowFlags(Qt.Widget)
+            panel.setParent(host)
+            try:
+                panel.menuBar().hide()
+            except Exception:
+                pass
+            try:
+                panel.statusBar().hide()
+            except Exception:
+                pass
+            try:
+                panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+                central = panel.centralWidget()
+                if central is not None:
+                    central.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+                    central.setContentsMargins(0, 0, 0, 0)
+            except Exception:
+                pass
+            host_layout.addWidget(panel, 1)
+            self.shipments_window = panel
         else:
             self.shipments_window.refresh_from_database()
 
-        self.shipments_window.show()
-        if self.shipments_window.isMinimized():
-            self.shipments_window.showNormal()
-        self.shipments_window.raise_()
-        self.shipments_window.activateWindow()
+        try:
+            self.shipments_window.show()
+            self.shipments_window.refresh_from_database()
+        except Exception:
+            pass
 
     def setup_theme_controls(self):
         if hasattr(self.ui, "radioLight"):
             self.ui.radioLight.toggled.connect(lambda checked: checked and self.apply_theme("light"))
         if hasattr(self.ui, "radioDark"):
             self.ui.radioDark.toggled.connect(lambda checked: checked and self.apply_theme("dark"))
-        if hasattr(self.ui, "radioHighContrast"):
-            self.ui.radioHighContrast.toggled.connect(lambda checked: checked and self.apply_theme("high"))
-
         if self.lead_time_picker is not None:
             self.lead_time_picker.setRange(1, 24)
             self.lead_time_picker.setSingleStep(1)
@@ -5404,12 +7299,20 @@ class MainWindow(QMainWindow):
         if containers_list is not None:
             containers_list.cellDoubleClicked.connect(self.handle_saved_container_double_click)
 
-        create_yu_order_button = getattr(self.ui, "createYUOrder_pushButton", None)
-        if create_yu_order_button is not None:
+        create_yu_buttons = []
+        for button_name in ("createYUOrder_pushButton", "updateDataCreateYUOrder_pushButton"):
+            button = getattr(self.ui, button_name, None)
+            if button is not None and button not in create_yu_buttons:
+                create_yu_buttons.append(button)
+        for create_yu_order_button in create_yu_buttons:
             create_yu_order_button.clicked.connect(self.open_yu_order_entry_dialog)
 
-        update_orders_button = getattr(self.ui, "updateOrders_button", None) or getattr(self.ui, "updatOrders_pushButton_3", None)
-        if update_orders_button is not None:
+        update_order_buttons = []
+        for button_name in ("updateOrders_button", "updatOrders_pushButton_3"):
+            button = getattr(self.ui, button_name, None)
+            if button is not None and button not in update_order_buttons:
+                update_order_buttons.append(button)
+        for update_orders_button in update_order_buttons:
             update_orders_button.clicked.connect(self.import_orders_from_dialog)
 
         update_sales_button = getattr(self.ui, "updateSales_pushButton", None)
@@ -5669,15 +7572,6 @@ class MainWindow(QMainWindow):
             }
             return light_colors.get(normalised_status, light_colors[PLANNING_STATUS_ACTIVE])
 
-        if theme_name == "high":
-            high_colors = {
-                PLANNING_STATUS_ACTIVE: {"bg": "#000000", "fg": "#ffff00", "border": "#ffff00", "check_bg": "#000000", "check_border": "#ffff00"},
-                PLANNING_STATUS_SPECIAL_ORDER: {"bg": "#000000", "fg": "#00ffff", "border": "#00ffff", "check_bg": "#000000", "check_border": "#00ffff"},
-                PLANNING_STATUS_PHASE_OUT: {"bg": "#000000", "fg": "#ffcc00", "border": "#ffcc00", "check_bg": "#000000", "check_border": "#ffcc00"},
-                PLANNING_STATUS_OBSOLETE: {"bg": "#000000", "fg": "#ff66ff", "border": "#ff66ff", "check_bg": "#000000", "check_border": "#ff66ff"},
-            }
-            return high_colors.get(normalised_status, high_colors[PLANNING_STATUS_ACTIVE])
-
         dark_colors = dict(PLANNING_STATUS_COLORS.get(normalised_status, PLANNING_STATUS_COLORS[PLANNING_STATUS_ACTIVE]))
         dark_colors.setdefault("check_bg", "#202124")
         dark_colors.setdefault("check_border", dark_colors.get("border", "#5A5F69"))
@@ -5754,14 +7648,29 @@ class MainWindow(QMainWindow):
         if self.item_status_value_label is not None:
             self.item_status_value_label.setText(self.planning_status_display_text(status))
         if self.item_status_frame is not None:
-            check_bg = colors.get("check_bg", colors.get("bg", "#ffffff"))
-            check_border = colors.get("check_border", colors.get("border", "#5A5F69"))
+            is_light = self.current_theme_name() == "light"
+            check_border = colors.get("border", "#5A5F69")
+            if is_light:
+                frame_bg = "#f8fafc"
+                title_fg = "#455365"
+                value_fg = "#111827"
+                check_fg = "#111827"
+                check_bg = "#ffffff"
+                checked_border = "#244f7f"
+            else:
+                frame_bg = "#242830"
+                title_fg = "#aeb7c2"
+                value_fg = colors.get("fg", "#f0f3f6")
+                check_fg = "#f0f3f6"
+                check_bg = "#1f2228"
+                checked_border = colors.get("fg", "#f0f3f6")
             self.item_status_frame.setStyleSheet(
-                f"QFrame#itemStatus_frame {{ background-color: {colors['bg']}; border: 2px solid {colors['border']}; border-radius: 8px; }}"
-                f"QFrame#itemStatus_frame QLabel {{ color: {colors['fg']}; font-weight: 800; background-color: transparent; }}"
-                f"QFrame#itemStatus_frame QCheckBox {{ color: {colors['fg']}; spacing: 6px; font-weight: 700; background-color: transparent; }}"
-                f"QFrame#itemStatus_frame QCheckBox::indicator {{ width: 15px; height: 15px; border: 1px solid {check_border}; background-color: {check_bg}; }}"
-                f"QFrame#itemStatus_frame QCheckBox::indicator:checked {{ background-color: {colors['border']}; border: 1px solid {colors['fg']}; }}"
+                f"QFrame#itemStatus_frame {{ background-color: {frame_bg}; border: 2px solid {colors['border']}; border-radius: 8px; }}"
+                f"QFrame#itemStatus_frame QLabel#itemStatus_title {{ color: {title_fg}; font-weight: 700; background-color: transparent; }}"
+                f"QFrame#itemStatus_frame QLabel#itemStatus_value {{ color: {value_fg}; font-weight: 800; background-color: transparent; }}"
+                f"QFrame#itemStatus_frame QCheckBox {{ color: {check_fg}; spacing: 5px; font-weight: 600; background-color: transparent; }}"
+                f"QFrame#itemStatus_frame QCheckBox::indicator {{ width: 13px; height: 13px; border: 1px solid {check_border}; background-color: {check_bg}; }}"
+                f"QFrame#itemStatus_frame QCheckBox::indicator:checked {{ background-color: {colors['border']}; border: 1px solid {checked_border}; }}"
             )
 
     def toggle_item_planning_status(self, status):
@@ -5777,57 +7686,62 @@ class MainWindow(QMainWindow):
         self.update_order_analysis_status_cache(self.current_item_number, new_status)
 
     def setup_item_status_controls(self):
-        top_frame = getattr(self.ui, "frame_18", None)
-        layout = top_frame.layout() if top_frame is not None else None
-        if top_frame is None or layout is None:
+        host = getattr(self.ui, "itemStatusHost_frame", None)
+        layout = host.layout() if host is not None else None
+        if host is None or layout is None:
+            # Fallback for older UI builds. Keep the app running instead of failing if
+            # a partial UI rebuild is loaded.
+            host = getattr(self.ui, "frame_18", None)
+            layout = host.layout() if host is not None else None
+        if host is None or layout is None:
             return
-
-        try:
-            top_frame.setMaximumWidth(16777215)
-            top_frame.setMinimumWidth(1056)
-            size_policy = top_frame.sizePolicy()
-            size_policy.setHorizontalPolicy(QSizePolicy.Expanding)
-            top_frame.setSizePolicy(size_policy)
-        except Exception:
-            pass
 
         if self.item_status_frame is not None:
             self.update_item_status_controls(self.current_item_planning_status)
             return
 
-        try:
-            layout.addStretch(1)
-        except Exception:
-            pass
-
-        status_frame = QFrame(top_frame)
+        status_frame = QFrame(host)
         status_frame.setObjectName("itemStatus_frame")
+        status_frame.setFrameShape(QFrame.StyledPanel)
+        status_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         status_layout = QVBoxLayout(status_frame)
-        status_layout.setContentsMargins(10, 8, 10, 8)
-        status_layout.setSpacing(6)
+        status_layout.setContentsMargins(8, 4, 8, 5)
+        status_layout.setSpacing(3)
+
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.setSpacing(6)
 
         title_label = QLabel("Planning Status", status_frame)
         title_label.setObjectName("itemStatus_title")
-        status_layout.addWidget(title_label)
+        title_label.setProperty("role", "metricTitle")
+        title_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        header_row.addWidget(title_label, 1)
 
         value_label = QLabel(self.planning_status_display_text(PLANNING_STATUS_ACTIVE), status_frame)
         value_label.setObjectName("itemStatus_value")
-        status_layout.addWidget(value_label)
+        value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        value_label.setMinimumWidth(110)
+        header_row.addWidget(value_label)
+        status_layout.addLayout(header_row)
 
         checkbox_row = QHBoxLayout()
         checkbox_row.setContentsMargins(0, 0, 0, 0)
-        checkbox_row.setSpacing(12)
+        checkbox_row.setSpacing(6)
 
         self.item_status_checkboxes = {}
         self.item_status_checkbox_map = {}
-        for status, text_label in (
-            (PLANNING_STATUS_SPECIAL_ORDER, "Special Order"),
-            (PLANNING_STATUS_PHASE_OUT, "Phase Out"),
-            (PLANNING_STATUS_OBSOLETE, "Obsolete"),
+        for status, short_label, full_label in (
+            (PLANNING_STATUS_SPECIAL_ORDER, "Special", "Special Order"),
+            (PLANNING_STATUS_PHASE_OUT, "Phase Out", "Phase Out"),
+            (PLANNING_STATUS_OBSOLETE, "Obsolete", "Obsolete"),
         ):
-            checkbox = QCheckBox(text_label, status_frame)
-            checkbox.setToolTip("Double-click to set this status. Double-click again to return the item to Active.")
+            checkbox = QCheckBox(short_label, status_frame)
+            checkbox.setObjectName(f"itemStatus_{status.lower()}_checkBox")
+            checkbox.setToolTip(f"Double-click to set this item as {full_label}. Double-click again to return it to Active.")
             checkbox.installEventFilter(self)
+            checkbox.setMinimumWidth(82)
+            checkbox.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
             self.item_status_checkboxes[status] = checkbox
             self.item_status_checkbox_map[checkbox] = status
             checkbox_row.addWidget(checkbox)
@@ -5835,7 +7749,12 @@ class MainWindow(QMainWindow):
         checkbox_row.addStretch(1)
         status_layout.addLayout(checkbox_row)
 
-        layout.addWidget(status_frame, 0, Qt.AlignRight)
+        # The rebuilt item summary exposes a dedicated host with a QVBoxLayout.
+        # If the fallback host is a grid/toolbar, add the frame in a safe place.
+        if isinstance(layout, QGridLayout):
+            layout.addWidget(status_frame, 2, 0, 1, 8)
+        else:
+            layout.addWidget(status_frame)
         self.item_status_frame = status_frame
         self.item_status_value_label = value_label
         self.update_item_status_controls(PLANNING_STATUS_ACTIVE)
@@ -6206,6 +8125,7 @@ class MainWindow(QMainWindow):
                 )
         self.db_conn.commit()
 
+
     def setup_on_order_page(self):
         parent = getattr(self.ui, "frame_onOrder", None)
         layout = getattr(self.ui, "verticalLayout_onOrder_inner", None)
@@ -6217,50 +8137,61 @@ class MainWindow(QMainWindow):
             if widget is not None:
                 widget.deleteLater()
 
-        top_frame = QWidget(parent)
-        top_layout = QHBoxLayout(top_frame)
-        top_layout.setContentsMargins(0, 0, 0, 0)
-        top_layout.setSpacing(14)
-
-        entry_frame = QFrame(top_frame)
+        entry_frame = QFrame(parent)
         entry_frame.setObjectName("onOrderEntry_frame")
-        entry_frame.setMinimumSize(760, 120)
-        entry_frame.setMaximumHeight(140)
-        entry_layout = QHBoxLayout(entry_frame)
-        entry_layout.setContentsMargins(16, 12, 16, 12)
-        entry_layout.setSpacing(18)
+        entry_frame.setProperty("role", "toolbarCard")
+        entry_frame.setFrameShape(QFrame.StyledPanel)
+        entry_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        entry_frame.setMinimumHeight(112)
+        entry_frame.setMaximumHeight(142)
+        entry_layout = QVBoxLayout(entry_frame)
+        entry_layout.setContentsMargins(12, 10, 12, 10)
+        entry_layout.setSpacing(8)
 
-        primary_frame = QWidget(entry_frame)
-        primary_layout = QFormLayout(primary_frame)
-        primary_layout.setContentsMargins(0, 0, 0, 0)
-        primary_layout.setHorizontalSpacing(12)
-        primary_layout.setVerticalSpacing(10)
+        entry_title = QLabel("Add incoming order line", entry_frame)
+        entry_title.setObjectName("onOrderEntryTitle_label")
+        entry_title.setProperty("role", "sectionTitle")
+        entry_title.setMaximumHeight(24)
+        entry_layout.addWidget(entry_title)
 
-        secondary_frame = QWidget(entry_frame)
-        secondary_layout = QFormLayout(secondary_frame)
-        secondary_layout.setContentsMargins(0, 0, 0, 0)
-        secondary_layout.setHorizontalSpacing(12)
-        secondary_layout.setVerticalSpacing(10)
+        entry_grid = QGridLayout()
+        entry_grid.setContentsMargins(0, 0, 0, 0)
+        entry_grid.setHorizontalSpacing(8)
+        entry_grid.setVerticalSpacing(6)
+        entry_layout.addLayout(entry_grid)
 
-        self.onOrderOrderNumber_label = QLabel("Order No", primary_frame)
-        self.onOrderItem_label = QLabel("Enter Item", primary_frame)
-        self.onOrderQty_label = QLabel("Enter Qty", primary_frame)
-        self.onOrderReadyDate_label = QLabel("Ready Date (optional)", secondary_frame)
-        self.onOrderComments_label = QLabel("Comments (optional)", secondary_frame)
+        self.onOrderOrderNumber_label = QLabel("Order No", entry_frame)
+        self.onOrderItem_label = QLabel("Item", entry_frame)
+        self.onOrderQty_label = QLabel("Qty", entry_frame)
+        self.onOrderReadyDate_label = QLabel("Ready Date", entry_frame)
+        self.onOrderComments_label = QLabel("Comments", entry_frame)
+        for label in (
+            self.onOrderOrderNumber_label,
+            self.onOrderItem_label,
+            self.onOrderQty_label,
+            self.onOrderReadyDate_label,
+            self.onOrderComments_label,
+        ):
+            label.setProperty("role", "fieldLabel")
+            label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            label.setMinimumHeight(28)
 
-        self.onOrderOrderNumber_lineEdit = QLineEdit(primary_frame)
+        self.onOrderOrderNumber_lineEdit = QLineEdit(entry_frame)
         self.onOrderOrderNumber_lineEdit.setObjectName("onOrderOrderNumber_lineEdit")
-        self.onOrderItem_lineEdit = QLineEdit(primary_frame)
+        self.onOrderOrderNumber_lineEdit.setPlaceholderText("Supplier order number")
+        self.onOrderItem_lineEdit = QLineEdit(entry_frame)
         self.onOrderItem_lineEdit.setObjectName("onOrderItem_lineEdit")
-        self.onOrderQty_lineEdit = QLineEdit(primary_frame)
+        self.onOrderItem_lineEdit.setPlaceholderText("Item number")
+        self.onOrderQty_lineEdit = QLineEdit(entry_frame)
         self.onOrderQty_lineEdit.setObjectName("onOrderQty_lineEdit")
+        self.onOrderQty_lineEdit.setPlaceholderText("0")
 
-        self.onOrderReadyDate_dateEdit = QDateEdit(secondary_frame)
+        self.onOrderReadyDate_dateEdit = QDateEdit(entry_frame)
         self.onOrderReadyDate_dateEdit.setObjectName("onOrderReadyDate_dateEdit")
         self.onOrderReadyDate_dateEdit.setCalendarPopup(True)
         self.onOrderReadyDate_dateEdit.setDisplayFormat("dd/MM/yy")
         self.onOrderReadyDate_dateEdit.setDate(QDate.currentDate())
-        self.onOrderComments_lineEdit = QLineEdit(secondary_frame)
+        self.onOrderComments_lineEdit = QLineEdit(entry_frame)
         self.onOrderComments_lineEdit.setObjectName("onOrderComments_lineEdit")
         self.onOrderComments_lineEdit.setPlaceholderText("Optional notes")
 
@@ -6268,88 +8199,95 @@ class MainWindow(QMainWindow):
         qty_validator.setNotation(QDoubleValidator.StandardNotation)
         self.onOrderQty_lineEdit.setValidator(qty_validator)
 
-        label_widgets = [
-            self.onOrderOrderNumber_label,
-            self.onOrderItem_label,
-            self.onOrderQty_label,
-            self.onOrderReadyDate_label,
-            self.onOrderComments_label,
-        ]
-        input_widgets = [
+        for widget in (
             self.onOrderOrderNumber_lineEdit,
             self.onOrderItem_lineEdit,
             self.onOrderQty_lineEdit,
             self.onOrderReadyDate_dateEdit,
             self.onOrderComments_lineEdit,
-        ]
+        ):
+            widget.setMinimumHeight(32)
+            widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        for label in label_widgets:
-            try:
-                label_font = label.font()
-                label_font.setPointSize(max(label_font.pointSize(), 11))
-                label_font.setBold(True)
-                label.setFont(label_font)
-            except Exception:
-                pass
+        self.onOrderOrderNumber_lineEdit.setMinimumWidth(170)
+        self.onOrderItem_lineEdit.setMinimumWidth(240)
+        self.onOrderQty_lineEdit.setMinimumWidth(100)
+        self.onOrderQty_lineEdit.setMaximumWidth(140)
+        self.onOrderReadyDate_dateEdit.setMinimumWidth(130)
+        self.onOrderComments_lineEdit.setMinimumWidth(260)
 
-        for widget in input_widgets:
-            try:
-                widget.setMinimumHeight(34)
-            except Exception:
-                pass
+        self.onOrderAdd_button = QPushButton("Add Line", entry_frame)
+        self.onOrderAdd_button.setObjectName("onOrderAdd_button")
+        self.onOrderAdd_button.setMinimumWidth(120)
+        self.onOrderAdd_button.setMinimumHeight(32)
+        self.onOrderAdd_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
-        self.onOrderOrderNumber_lineEdit.setMinimumWidth(210)
-        self.onOrderItem_lineEdit.setMinimumWidth(210)
-        self.onOrderQty_lineEdit.setMinimumWidth(210)
-        self.onOrderReadyDate_dateEdit.setMinimumWidth(150)
-        self.onOrderComments_lineEdit.setMinimumWidth(280)
+        self.onOrderAction_frame = QFrame(entry_frame)
+        self.onOrderAction_frame.setObjectName("onOrderAction_frame")
+        self.onOrderAction_frame.setFrameShape(QFrame.NoFrame)
+        action_layout = QHBoxLayout(self.onOrderAction_frame)
+        action_layout.setContentsMargins(0, 0, 0, 0)
+        action_layout.setSpacing(8)
+        action_layout.addWidget(self.onOrderAdd_button)
+        action_layout.addStretch(1)
 
-        primary_layout.setWidget(0, QFormLayout.ItemRole.LabelRole, self.onOrderOrderNumber_label)
-        primary_layout.setWidget(0, QFormLayout.ItemRole.FieldRole, self.onOrderOrderNumber_lineEdit)
-        primary_layout.setWidget(1, QFormLayout.ItemRole.LabelRole, self.onOrderItem_label)
-        primary_layout.setWidget(1, QFormLayout.ItemRole.FieldRole, self.onOrderItem_lineEdit)
-        primary_layout.setWidget(2, QFormLayout.ItemRole.LabelRole, self.onOrderQty_label)
-        primary_layout.setWidget(2, QFormLayout.ItemRole.FieldRole, self.onOrderQty_lineEdit)
+        entry_grid.addWidget(self.onOrderOrderNumber_label, 0, 0)
+        entry_grid.addWidget(self.onOrderOrderNumber_lineEdit, 0, 1)
+        entry_grid.addWidget(self.onOrderItem_label, 0, 2)
+        entry_grid.addWidget(self.onOrderItem_lineEdit, 0, 3, 1, 3)
+        entry_grid.addWidget(self.onOrderQty_label, 0, 6)
+        entry_grid.addWidget(self.onOrderQty_lineEdit, 0, 7)
+        entry_grid.addWidget(self.onOrderReadyDate_label, 1, 0)
+        entry_grid.addWidget(self.onOrderReadyDate_dateEdit, 1, 1)
+        entry_grid.addWidget(self.onOrderComments_label, 1, 2)
+        entry_grid.addWidget(self.onOrderComments_lineEdit, 1, 3, 1, 3)
+        entry_grid.addWidget(self.onOrderAction_frame, 1, 6, 1, 2)
+        entry_grid.setColumnStretch(3, 1)
+        entry_grid.setColumnStretch(4, 1)
+        entry_grid.setColumnStretch(5, 1)
+        layout.addWidget(entry_frame)
 
-        secondary_layout.setWidget(0, QFormLayout.ItemRole.LabelRole, self.onOrderReadyDate_label)
-        secondary_layout.setWidget(0, QFormLayout.ItemRole.FieldRole, self.onOrderReadyDate_dateEdit)
-        secondary_layout.setWidget(1, QFormLayout.ItemRole.LabelRole, self.onOrderComments_label)
-        secondary_layout.setWidget(1, QFormLayout.ItemRole.FieldRole, self.onOrderComments_lineEdit)
+        table_frame = QFrame(parent)
+        table_frame.setObjectName("onOrderTable_frame")
+        table_frame.setProperty("role", "contentCard")
+        table_frame.setFrameShape(QFrame.StyledPanel)
+        table_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        table_layout = QVBoxLayout(table_frame)
+        table_layout.setContentsMargins(10, 10, 10, 10)
+        table_layout.setSpacing(8)
 
-        entry_layout.addWidget(primary_frame, 0)
-        entry_layout.addWidget(secondary_frame, 0)
+        self.onOrderTableTitle_label = QLabel("Incoming order lines", table_frame)
+        self.onOrderTableTitle_label.setObjectName("onOrderTableTitle_label")
+        self.onOrderTableTitle_label.setProperty("role", "sectionTitle")
+        table_layout.addWidget(self.onOrderTableTitle_label)
 
-        self.onOrderAdd_button = QPushButton("Add Line", top_frame)
-        self.onOrderAdd_button.setMinimumSize(160, 72)
-        self.onOrderAdd_button.setMaximumSize(160, 72)
-
-        top_layout.addWidget(entry_frame, 0)
-        top_layout.addWidget(self.onOrderAdd_button, 0)
-        top_layout.addStretch(1)
-        layout.addWidget(top_frame)
-
-        self.onOrder_table = QTableWidget(parent)
+        self.onOrder_table = QTableWidget(table_frame)
         self.onOrder_table.setObjectName("onOrder_table")
-        self.onOrder_table.setMinimumSize(528, 176)
-        layout.addWidget(self.onOrder_table, 1)
+        self.onOrder_table.setMinimumHeight(280)
+        self.onOrder_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.onOrder_table.setAlternatingRowColors(True)
+        self.onOrder_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.onOrder_table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        table_layout.addWidget(self.onOrder_table, 1)
+        layout.addWidget(table_frame, 1)
 
         comments_frame = QFrame(parent)
         comments_frame.setObjectName("onOrderGeneralComments_frame")
+        comments_frame.setProperty("role", "subtleCard")
+        comments_frame.setFrameShape(QFrame.StyledPanel)
+        comments_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         comments_layout = QVBoxLayout(comments_frame)
-        comments_layout.setContentsMargins(0, 0, 0, 0)
+        comments_layout.setContentsMargins(10, 8, 10, 10)
         comments_layout.setSpacing(6)
-        self.onOrderGeneralComments_label = QLabel("General Comments / Sundries", comments_frame)
-        try:
-            _font = self.onOrderGeneralComments_label.font()
-            _font.setPointSize(max(_font.pointSize(), 11))
-            _font.setBold(True)
-            self.onOrderGeneralComments_label.setFont(_font)
-        except Exception:
-            pass
+
+        self.onOrderGeneralComments_label = QLabel("General comments / sundries", comments_frame)
+        self.onOrderGeneralComments_label.setObjectName("onOrderGeneralComments_label")
+        self.onOrderGeneralComments_label.setProperty("role", "sectionTitle")
         comments_layout.addWidget(self.onOrderGeneralComments_label)
         self.onOrderGeneralComments_textEdit = QTextEdit(comments_frame)
         self.onOrderGeneralComments_textEdit.setObjectName("onOrderGeneralComments_textEdit")
-        self.onOrderGeneralComments_textEdit.setMinimumHeight(90)
+        self.onOrderGeneralComments_textEdit.setMinimumHeight(76)
+        self.onOrderGeneralComments_textEdit.setMaximumHeight(115)
         self.onOrderGeneralComments_textEdit.setPlaceholderText("Add sundries or general comments that are not MYOB item numbers...")
         comments_layout.addWidget(self.onOrderGeneralComments_textEdit)
         layout.addWidget(comments_frame)
@@ -7645,6 +9583,27 @@ class MainWindow(QMainWindow):
 
         supplier_names = []
         supplier_seen = set()
+        customer_name_keys = {
+            str(name or "").strip().casefold()
+            for name in self.customer_names
+            if str(name or "").strip()
+        }
+
+        supplier_master_names = self.get_supplier_master_names()
+        if not supplier_master_names and EMBEDDED_SUPPLIER_MASTER:
+            supplier_master_names = list(EMBEDDED_SUPPLIER_MASTER)
+
+        trusted_supplier_keys = set()
+        for supplier_name in supplier_master_names:
+            supplier_name = (supplier_name or "").strip()
+            if not supplier_name:
+                continue
+            key = supplier_name.casefold()
+            trusted_supplier_keys.add(key)
+            if key in supplier_seen:
+                continue
+            supplier_seen.add(key)
+            supplier_names.append(supplier_name)
 
         supplier_columns = self.get_items_supplier_column_names()
         if supplier_columns:
@@ -7663,22 +9622,13 @@ class MainWindow(QMainWindow):
                 key = supplier_name.casefold()
                 if key in supplier_seen:
                     continue
+                # Some legacy item imports use a vague Column1-style field, which can contain
+                # customer names rather than supplier names. Do not let those customer names pollute
+                # the Order Analysis supplier selector unless they are explicitly in supplier_master.
+                if key in customer_name_keys and key not in trusted_supplier_keys:
+                    continue
                 supplier_seen.add(key)
                 supplier_names.append(supplier_name)
-
-        supplier_master_names = self.get_supplier_master_names()
-        if not supplier_master_names and EMBEDDED_SUPPLIER_MASTER:
-            supplier_master_names = list(EMBEDDED_SUPPLIER_MASTER)
-
-        for supplier_name in supplier_master_names:
-            supplier_name = (supplier_name or "").strip()
-            if not supplier_name:
-                continue
-            key = supplier_name.casefold()
-            if key in supplier_seen:
-                continue
-            supplier_seen.add(key)
-            supplier_names.append(supplier_name)
 
         self.supplier_names = sorted(supplier_names, key=lambda value: value.casefold())
 
@@ -7753,24 +9703,32 @@ class MainWindow(QMainWindow):
             self.combine_threads_checkbox = checkbox
 
     def setup_top_items_button(self):
-        frame = getattr(self.ui, "frame_17", None)
-        layout = frame.layout() if frame is not None else None
-        if frame is None or layout is None:
-            self.top_items_button = None
-            return
-
         existing = getattr(self, "top_items_button", None)
         if existing is not None:
             return
 
-        button = QPushButton("Top 100", frame)
-        button.setObjectName("topItems_button")
-        button.setToolTip("Open Top 100 views for quantity, value, and frequency over a selected period.")
-        button.clicked.connect(self.open_top_items_dialog)
-        button.setMinimumHeight(30)
+        button = getattr(self.ui, "topItems_button", None)
+        if button is None:
+            frame = getattr(self.ui, "frame_17", None)
+            layout = frame.layout() if frame is not None else None
+            if frame is None or layout is None:
+                self.top_items_button = None
+                return
+            button = QPushButton("Top 100", frame)
+            button.setObjectName("topItems_button")
+            layout.addWidget(button)
+
+        button.setToolTip("Open Top 100 views for quantity, value, and frequency over the selected period.")
+        if not bool(button.property("_top_items_connected")):
+            button.clicked.connect(self.open_top_items_dialog)
+            button.setProperty("_top_items_connected", True)
+        button.setMinimumHeight(28)
         button.setMaximumHeight(30)
+        button.setMinimumWidth(88)
+        button.setMaximumWidth(110)
         button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.top_items_button = button
+
 
     def configure_item_summary_top_controls(self):
         frame = getattr(self.ui, "frame_17", None)
@@ -7778,17 +9736,16 @@ class MainWindow(QMainWindow):
         lead_label = getattr(self.ui, "leadTimeLabel", None)
         lead_picker = getattr(self, "lead_time_picker", None)
         checkbox = getattr(self, "combine_threads_checkbox", None) or getattr(self.ui, "combineThreads_checkBox", None)
-        button = getattr(self, "top_items_button", None)
+        button = getattr(self, "top_items_button", None) or getattr(self.ui, "topItems_button", None)
         item_edit = getattr(self.ui, "enterItem", None)
         load_button = getattr(self.ui, "loadItem", None)
-        planning_frame = getattr(self, "item_status_frame", None)
 
         if frame is None or layout is None:
             return
 
         try:
-            layout.setContentsMargins(6, 4, 6, 4)
-            layout.setSpacing(8)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(10)
         except Exception:
             pass
 
@@ -7800,106 +9757,79 @@ class MainWindow(QMainWindow):
 
         if item_edit is not None:
             try:
-                item_edit.setMinimumWidth(190)
-                item_edit.setMaximumWidth(220)
+                item_edit.setMinimumWidth(420)
+                item_edit.setMaximumWidth(16777215)
+                item_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             except Exception:
                 pass
 
         if load_button is not None:
             try:
-                load_button.setMinimumWidth(78)
-                load_button.setMaximumWidth(82)
-                load_button.setMinimumHeight(28)
-                load_button.setMaximumHeight(28)
+                load_button.setMinimumWidth(104)
+                load_button.setMaximumWidth(128)
+                load_button.setMinimumHeight(30)
+                load_button.setMaximumHeight(34)
             except Exception:
                 pass
 
         if lead_label is not None:
             try:
-                lead_label.setWordWrap(True)
-                lead_label.setAlignment(Qt.AlignCenter)
-                lead_label.setText("Lead\nTime\nWeeks")
-                lead_label.setMinimumWidth(52)
-                lead_label.setMaximumWidth(60)
+                lead_label.setWordWrap(False)
+                lead_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                lead_label.setText("Lead Weeks")
+                lead_label.setMinimumWidth(78)
+                lead_label.setMaximumWidth(96)
             except Exception:
                 pass
 
         if lead_picker is not None:
             try:
-                lead_picker.setMinimumWidth(76)
+                lead_picker.setMinimumWidth(74)
                 lead_picker.setMaximumWidth(86)
                 lead_picker.setMinimumHeight(28)
                 lead_picker.setMaximumHeight(28)
             except Exception:
                 pass
 
-        if planning_frame is not None:
+        if checkbox is not None:
             try:
-                planning_frame.setMinimumWidth(255)
-                planning_frame.setMaximumWidth(285)
+                checkbox.setText("Combine Threads")
+                checkbox.setMinimumWidth(142)
+                checkbox.setMaximumWidth(168)
+                checkbox.setToolTip(
+                    "Combine sales for the India thread code and the Liberty code with trailing L, for example BN40 101 + BN40 101 L."
+                )
             except Exception:
                 pass
+            if layout.indexOf(checkbox) == -1:
+                try:
+                    checkbox.setParent(frame)
+                    layout.addWidget(checkbox)
+                except Exception:
+                    pass
 
-        if checkbox is None or button is None:
-            if button is not None and layout.indexOf(button) == -1:
-                layout.addWidget(button)
-            return
-
-        existing_container = getattr(self, "item_summary_top100_container", None)
-        if existing_container is None:
+        if button is not None:
             try:
-                layout.removeWidget(checkbox)
+                button.setMinimumWidth(88)
+                button.setMaximumWidth(110)
+                button.setMinimumHeight(28)
+                button.setMaximumHeight(30)
             except Exception:
                 pass
-            try:
-                layout.removeWidget(button)
-            except Exception:
-                pass
-
-            container = QWidget(frame)
-            container.setObjectName("itemSummaryTop100Container")
-            container_layout = QVBoxLayout(container)
-            container_layout.setContentsMargins(0, 0, 0, 0)
-            container_layout.setSpacing(4)
-
-            try:
-                checkbox.setParent(container)
-            except Exception:
-                pass
-            try:
-                button.setParent(container)
-            except Exception:
-                pass
-
-            container_layout.addWidget(checkbox, 0, Qt.AlignLeft)
-            container_layout.addWidget(button, 0, Qt.AlignLeft)
-            layout.addWidget(container)
-            self.item_summary_top100_container = container
-            existing_container = container
+            if layout.indexOf(button) == -1:
+                try:
+                    button.setParent(frame)
+                    layout.addWidget(button)
+                except Exception:
+                    pass
 
         try:
-            checkbox.setText("Combine Threads")
-            checkbox.setMinimumWidth(126)
-            checkbox.setMaximumWidth(126)
-            checkbox.setToolTip(
-                "Combine sales for the India thread code and the Liberty code with trailing L, for example BN40 101 + BN40 101 L."
-            )
+            frame.setMinimumWidth(420)
+            frame.setMaximumWidth(16777215)
+            frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         except Exception:
             pass
 
-        try:
-            button.setMinimumWidth(92)
-            button.setMaximumWidth(110)
-            button.setMinimumHeight(24)
-            button.setMaximumHeight(24)
-        except Exception:
-            pass
-
-        try:
-            existing_container.setMinimumWidth(132)
-            existing_container.setMaximumWidth(140)
-        except Exception:
-            pass
 
     def open_top_items_dialog(self):
         dialog = TopItemsDialog(self, self)
@@ -8294,29 +10224,16 @@ class MainWindow(QMainWindow):
                 )
 
     def setup_date_ranges(self):
-        row = self.db_one(
-            """
-            SELECT MIN(DATE(sale_date)) AS min_date,
-                   MAX(DATE(sale_date)) AS max_date
-            FROM sales
-            WHERE sale_date IS NOT NULL AND TRIM(CAST(sale_date AS TEXT)) <> ''
-            """
-        )
+        """Set all MonthYearPicker date ranges to the rolling previous-12-month default.
 
-        if not row or not row["min_date"] or not row["max_date"]:
-            today = date.today()
-            start_qdate = QDate(today.year, today.month, 1)
-            end_qdate = start_qdate
-        else:
-            min_date = self.parse_date_value(row["min_date"])
-            max_date = self.parse_date_value(row["max_date"])
-            if min_date is None or max_date is None:
-                today = date.today()
-                start_qdate = QDate(today.year, today.month, 1)
-                end_qdate = start_qdate
-            else:
-                start_qdate = QDate(min_date.year, min_date.month, 1)
-                end_qdate = QDate(max_date.year, max_date.month, 1)
+        The old behaviour used the min/max dates from the sales table.  That is useful
+        for historic reporting, but it makes the day-to-day screens open far too wide.
+        Default every paired picker to this month minus 12 months through the current
+        month; users can still expand the range manually when they need older data.
+        """
+        today = QDate.currentDate()
+        end_qdate = QDate(today.year(), today.month(), 1)
+        start_qdate = end_qdate.addMonths(-12)
 
         self.default_period_start_qdate = start_qdate
         self.default_period_end_qdate = end_qdate
@@ -8352,28 +10269,32 @@ class MainWindow(QMainWindow):
         frame = getattr(self.ui, "frame_4", None)
         if frame is not None:
             try:
-                frame.setMinimumHeight(188)
-                frame.setMaximumHeight(188)
+                frame.setMinimumHeight(48)
+                frame.setMaximumHeight(64)
                 frame.setMaximumWidth(16777215)
+                frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             except Exception:
                 pass
 
         layout = getattr(self.ui, "horizontalLayout_3", None)
         if layout is not None:
             try:
-                layout.setContentsMargins(10, 10, 10, 10)
-                layout.setSpacing(12)
-                layout.setStretch(0, 3)
-                layout.setStretch(1, 5)
-                layout.setStretch(2, 2)
+                layout.setContentsMargins(12, 10, 12, 10)
+                layout.setSpacing(10)
+                layout.setStretch(0, 0)
+                layout.setStretch(1, 1)
+                layout.setStretch(2, 0)
+                layout.setStretch(3, 0)
+                layout.setStretch(4, 0)
             except Exception:
                 pass
 
         info_table = getattr(self.ui, "customer_Info", None)
         if info_table is not None:
             try:
-                info_table.setMinimumWidth(260)
+                info_table.setMinimumWidth(300)
                 info_table.setMinimumHeight(150)
+                info_table.setMaximumHeight(220)
                 info_table.verticalHeader().setDefaultSectionSize(24)
                 info_table.setWordWrap(False)
             except Exception:
@@ -8383,7 +10304,7 @@ class MainWindow(QMainWindow):
         if customer_edit is not None:
             try:
                 customer_edit.setMinimumWidth(420)
-                customer_edit.setMinimumHeight(34)
+                customer_edit.setMinimumHeight(36)
             except Exception:
                 pass
 
@@ -8398,35 +10319,57 @@ class MainWindow(QMainWindow):
         for picker in (self.customer_start_picker, self.customer_end_picker):
             self.set_month_year_picker_compact(picker, month_width=110, year_width=82, control_height=30)
 
-        search_button = getattr(self.ui, "searchButton", None)
-        if search_button is not None:
-            try:
-                search_button.setMinimumHeight(32)
-                search_button.setMaximumHeight(32)
-                search_button.setMinimumWidth(96)
-                search_button.setMaximumWidth(110)
-            except Exception:
-                pass
-
-        load_button = getattr(self.ui, "loadFile", None)
-        if load_button is not None:
-            try:
-                load_button.setMinimumHeight(32)
-                load_button.setMaximumHeight(32)
-                load_button.setMinimumWidth(180)
-                load_button.setMaximumWidth(220)
-            except Exception:
-                pass
+        for button_name, min_width in (("searchButton", 96), ("loadFile", 170)):
+            button = getattr(self.ui, button_name, None)
+            if button is not None:
+                try:
+                    button.setMinimumHeight(36)
+                    button.setMaximumHeight(38)
+                    button.setMinimumWidth(min_width)
+                except Exception:
+                    pass
 
         freight_box = getattr(self.ui, "chargeFreight_textBrowser", None)
         if freight_box is not None:
             try:
-                freight_box.setMinimumSize(190, 128)
-                freight_box.setMaximumSize(190, 128)
+                freight_box.setMinimumSize(300, 118)
+                freight_box.setMaximumHeight(150)
                 freight_box.document().setDocumentMargin(0)
                 freight_box.setAlignment(Qt.AlignCenter)
                 freight_box.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
                 freight_box.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            except Exception:
+                pass
+
+        main_frame = getattr(self.ui, "customerSummaryMain_frame", None)
+        if main_frame is not None:
+            try:
+                main_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            except Exception:
+                pass
+
+        stats_frame = getattr(self.ui, "customerSummaryStats_frame", None)
+        if stats_frame is not None:
+            try:
+                stats_frame.setMinimumHeight(46)
+                stats_frame.setMaximumHeight(58)
+                stats_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            except Exception:
+                pass
+
+        intro = getattr(self.ui, "customerSummary_intro", None)
+        if intro is not None:
+            try:
+                intro.setMaximumHeight(26)
+                intro.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            except Exception:
+                pass
+
+        title = getattr(self.ui, "customerSummary_page_title", None)
+        if title is not None:
+            try:
+                title.setMaximumHeight(40)
+                title.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             except Exception:
                 pass
 
@@ -8465,16 +10408,16 @@ class MainWindow(QMainWindow):
             mode_layout.setContentsMargins(0, 0, 0, 0)
             mode_layout.setSpacing(5)
 
-            supplier_button = QPushButton("Enter Supplier", mode_frame)
+            supplier_button = QPushButton("Supplier", mode_frame)
             supplier_button.setObjectName("orderAnalysisSupplierMode_button")
-            group_button = QPushButton("Enter Groups", mode_frame)
+            group_button = QPushButton("Groups", mode_frame)
             group_button.setObjectName("orderAnalysisGroupMode_button")
             for button in (supplier_button, group_button):
                 button.setCheckable(True)
                 button.setMinimumWidth(150)
-                button.setMaximumWidth(160)
-                button.setMinimumHeight(34)
-                button.setMaximumHeight(34)
+                button.setMaximumWidth(170)
+                button.setMinimumHeight(40)
+                button.setMaximumHeight(40)
                 mode_layout.addWidget(button)
 
             supplier_button.clicked.connect(lambda _checked=False: self.set_order_analysis_mode("supplier"))
@@ -8490,8 +10433,8 @@ class MainWindow(QMainWindow):
         self.update_order_analysis_mode_button_styles()
 
         try:
-            supplier_edit.setMinimumWidth(280)
-            supplier_edit.setMaximumWidth(360)
+            supplier_edit.setMinimumWidth(340)
+            supplier_edit.setMaximumWidth(520)
             supplier_edit.setMinimumHeight(34)
         except Exception:
             pass
@@ -8569,7 +10512,11 @@ class MainWindow(QMainWindow):
         """
         if table is not None:
             try:
-                table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+                if bool(table.property("_uses_frozen_external_hscroll")):
+                    table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                    table.horizontalScrollBar().hide()
+                else:
+                    table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
                 table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
                 table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
                 table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
@@ -8670,10 +10617,10 @@ class MainWindow(QMainWindow):
         self.configure_monthly_sales_table_visibility(
             table,
             getattr(self.ui, "itemSales_graph", None),
-            table_min_height=155,
-            table_max_height=225,
-            graph_min_height=205,
-            graph_max_height=265,
+            table_min_height=190,
+            table_max_height=None,
+            graph_min_height=210,
+            graph_max_height=None,
         )
         try:
             for object_name, minimum_height in (("frame_13", 420), ("frame_19", 505)):
@@ -8689,6 +10636,36 @@ class MainWindow(QMainWindow):
             header.setSectionResizeMode(col, QHeaderView.Interactive)
             table.resizeColumnToContents(col)
         table.verticalHeader().setVisible(False)
+
+    def setup_frozen_column_tables(self):
+        """Freeze high-value identifier columns on wide scrolling summary tables."""
+        sales_table = getattr(self.ui, "salesTable", None)
+        if sales_table is not None and self.sales_table_frozen_helper is None:
+            self.sales_table_frozen_helper = FrozenColumnsHelper(
+                sales_table,
+                2,
+                click_handler=lambda index: self.show_customer_row_chart(index.row(), index.column()),
+                double_click_handler=lambda index: self.handle_customer_table_double_click(index.row(), index.column()),
+                frozen_min_widths={0: 125, 1: 285},
+            )
+
+        customer_purchase_table = getattr(self.ui, "customerPurchase_table", None)
+        if customer_purchase_table is not None and self.customer_purchase_frozen_helper is None:
+            self.customer_purchase_frozen_helper = FrozenColumnsHelper(
+                customer_purchase_table,
+                1,
+                double_click_handler=self.handle_customer_purchase_double_click,
+                frozen_min_widths={0: 245},
+            )
+
+    def refresh_frozen_column_tables(self):
+        for helper in (self.sales_table_frozen_helper, self.customer_purchase_frozen_helper):
+            if helper is None:
+                continue
+            try:
+                helper.rebind()
+            except Exception:
+                pass
 
     def sales_import_instruction_text(self):
         return (
@@ -9681,6 +11658,13 @@ class MainWindow(QMainWindow):
         worksheet = workbook.active
         worksheet.title = "Order Analysis"
 
+        thin_side = Side(style="thin", color="808080") if Side is not None else None
+        cell_border = (
+            Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+            if Border is not None and thin_side is not None
+            else None
+        )
+
         headers = []
         for column in range(table.columnCount()):
             header_item = table.horizontalHeaderItem(column)
@@ -9822,11 +11806,13 @@ class MainWindow(QMainWindow):
 
         avg_label = getattr(self.ui, "weeksPurchase_label", None)
         if avg_label is not None:
-            avg_label.setText("Average weeks between purchases")
+            avg_label.setText("")
+            avg_label.hide()
 
         last_label = getattr(self.ui, "weeksSinceLast_label", None)
         if last_label is not None:
-            last_label.setText("Weeks since last purchase")
+            last_label.setText("")
+            last_label.hide()
 
         edit = self.get_saba_customer_edit()
         if edit is not None:
@@ -9846,8 +11832,8 @@ class MainWindow(QMainWindow):
             edit.setCompleter(completer)
             self.saba_customer_completer = completer
 
-        layout = getattr(self.ui, "horizontalLayout_14", None)
-        parent = getattr(self.ui, "frame_39", None)
+        parent = getattr(self.ui, "frame_saba_controls", None)
+        layout = parent.layout() if parent is not None else None
         if layout is not None and parent is not None:
             if self.saba_show_all_checkbox is None:
                 checkbox = QCheckBox("All Customers", parent)
@@ -9909,8 +11895,8 @@ class MainWindow(QMainWindow):
                 widget.setPlainText("No matching rows")
 
     def rebuild_saba_review_top_controls(self):
-        frame = getattr(self.ui, "frame_39", None)
-        layout = getattr(self.ui, "horizontalLayout_14", None)
+        frame = getattr(self.ui, "frame_saba_controls", None)
+        layout = frame.layout() if frame is not None else None
         label = getattr(self.ui, "sabaCustomer_label", None)
         edit = self.get_saba_customer_edit()
         if frame is None or layout is None or label is None or edit is None:
@@ -10213,8 +12199,6 @@ class MainWindow(QMainWindow):
     }
 
     def current_theme_name(self):
-        if hasattr(self.ui, "radioHighContrast") and self.ui.radioHighContrast.isChecked():
-            return "high"
         if hasattr(self.ui, "radioLight") and self.ui.radioLight.isChecked():
             return "light"
         return "dark"
@@ -10223,22 +12207,12 @@ class MainWindow(QMainWindow):
         theme_name = self.current_theme_name()
         if theme_name == "light":
             return {"bg": "#f4f7fa", "fg": "#26313d", "border": "#93a1af", "frame": "#8b98a7"}
-        if theme_name == "high":
-            return {"bg": "#000000", "fg": "#ffff00", "border": "#ffff00", "frame": "#ffff00"}
         return {"bg": "#24272b", "fg": "#c9d5e3", "border": "#66707c", "frame": "#b7bcc2"}
 
     def customer_flag_frame_style(self):
         colors = self.customer_flag_inactive_colors()
         theme_name = self.current_theme_name()
         selector = "QTextBrowser#chargeFreight_textBrowser"
-        if theme_name == "high":
-            return (
-                f"{selector} {{"
-                "background-color: #000000;"
-                "border: 2px solid #ffff00;"
-                "border-radius: 8px;"
-                "}"
-            )
         if theme_name == "light":
             return (
                 f"{selector} {{"
@@ -10331,17 +12305,9 @@ class MainWindow(QMainWindow):
             definition = self.CUSTOMER_FLAG_DEFINITIONS[flag_key]
             active = bool(state.get(flag_key, False))
             label = definition["label"] if active else f"No {definition['label']}"
-            if active and self.current_theme_name() == "high":
-                high_active = {
-                    "charge_freight": ("#ffff00", "#000000", "#ffffff"),
-                    "card_on_file": ("#00ffff", "#000000", "#ffffff"),
-                    "send_proforma": ("#ff66ff", "#000000", "#ffffff"),
-                }
-                bg, fg, border = high_active.get(flag_key, ("#ffff00", "#000000", "#ffffff"))
-            else:
-                bg = definition["active_bg"] if active else inactive["bg"]
-                fg = definition["active_fg"] if active else inactive["fg"]
-                border = definition["active_border"] if active else inactive["border"]
+            bg = definition["active_bg"] if active else inactive["bg"]
+            fg = definition["active_fg"] if active else inactive["fg"]
+            border = definition["active_border"] if active else inactive["border"]
             border_width = 2 if active else 1
             weight = "900" if active else "800"
             label_widget = labels.get(flag_key)
@@ -11310,10 +13276,12 @@ class MainWindow(QMainWindow):
                 self.refresh_on_order_statuses_from_container_data(persist=True)
 
     def get_order_item_edit(self):
-        return getattr(self.ui, "enterItemOrder_lineEdit", None)
+        widget = getattr(self.ui, "enterItemOrder_lineEdit", None)
+        return widget if qt_object_is_alive(widget) else None
 
     def get_order_qty_widget(self):
-        return getattr(self.ui, "enterItemOrder_lineEdit_2", None)
+        widget = getattr(self.ui, "enterItemOrder_lineEdit_2", None)
+        return widget if qt_object_is_alive(widget) else None
 
     def get_order_qty_editor(self):
         return self.get_order_qty_widget()
@@ -11323,24 +13291,45 @@ class MainWindow(QMainWindow):
         qty_widget = self.get_order_qty_widget()
         qty_editor = self.get_order_qty_editor()
 
-        if item_edit is not None:
-            item_edit.installEventFilter(self)
-            completer = QCompleter(self.item_numbers, self)
-            completer.setCaseSensitivity(Qt.CaseInsensitive)
-            completer.setFilterMode(Qt.MatchStartsWith)
-            completer.setCompletionMode(QCompleter.PopupCompletion)
-            completer.setModelSorting(QCompleter.CaseInsensitivelySortedModel)
-            item_edit.setCompleter(completer)
-            completer.activated.connect(self.order_item_completion_selected)
-            self.order_item_completer = completer
-            item_edit.textEdited.connect(lambda _text: self.update_order_item_completion())
+        if item_edit is not None and not bool(item_edit.property("_windsor_order_setup_done")):
+            try:
+                item_edit.installEventFilter(self)
+                completer = QCompleter(self.item_numbers, self)
+                completer.setCaseSensitivity(Qt.CaseInsensitive)
+                completer.setFilterMode(Qt.MatchStartsWith)
+                completer.setCompletionMode(QCompleter.PopupCompletion)
+                completer.setModelSorting(QCompleter.CaseInsensitivelySortedModel)
+                item_edit.setCompleter(completer)
+                completer.activated.connect(self.order_item_completion_selected)
+                self.order_item_completer = completer
+                item_edit.textEdited.connect(lambda _text: self.update_order_item_completion())
+                item_edit.setProperty("_windsor_order_setup_done", True)
+            except RuntimeError:
+                item_edit = None
 
-        if qty_widget is not None:
-            validator = QDoubleValidator(0.0, 999999999.0, 3, qty_widget)
-            validator.setNotation(QDoubleValidator.StandardNotation)
-            qty_widget.setValidator(validator)
-        if qty_editor is not None:
-            qty_editor.installEventFilter(self)
+        if qty_widget is not None and not bool(qty_widget.property("_windsor_qty_setup_done")):
+            try:
+                validator = QDoubleValidator(0.0, 999999999.0, 3, qty_widget)
+                validator.setNotation(QDoubleValidator.StandardNotation)
+                qty_widget.setValidator(validator)
+                qty_widget.setProperty("_windsor_qty_setup_done", True)
+            except RuntimeError:
+                qty_widget = None
+
+        if qty_editor is not None and qt_object_is_alive(qty_editor) and not bool(qty_editor.property("_windsor_qty_filter_done")):
+            try:
+                qty_editor.installEventFilter(self)
+                qty_editor.setProperty("_windsor_qty_filter_done", True)
+            except RuntimeError:
+                pass
+
+        add_button = getattr(self.ui, "toOrderAdd_button", None)
+        if add_button is not None and qt_object_is_alive(add_button) and not bool(add_button.property("_windsor_order_add_connected")):
+            try:
+                add_button.clicked.connect(self.add_order_line_from_inputs)
+                add_button.setProperty("_windsor_order_add_connected", True)
+            except RuntimeError:
+                pass
 
     def eventFilter(self, obj, event):
         item_edit = self.get_order_item_edit()
@@ -11348,6 +13337,8 @@ class MainWindow(QMainWindow):
         qty_widget = self.get_order_qty_widget()
         container_ref_widget = getattr(self.ui, "nextContainer_box", None)
         freight_box = getattr(self.ui, "chargeFreight_textBrowser", None)
+        if not qt_object_is_alive(freight_box):
+            freight_box = None
         freight_viewport = freight_box.viewport() if freight_box is not None else None
 
         if event.type() == QEvent.Resize:
@@ -12644,7 +14635,6 @@ class MainWindow(QMainWindow):
         self.refresh_item_summary_context_boxes()
         self.rerun_order_analysis_if_ready()
         item_edit.clear()
-        order_widget.clear()
         qty_widget.clear()
         item_edit.setFocus()
 
@@ -13799,28 +15789,10 @@ $mail.Display()
         return sign * magnitude
 
     def item_summary_accent_color_map(self):
-        return {
-            "suggested_min": "#E49EDD",
-            "suggestedMin_box": "#E49EDD",
-            "suggestedOrder_label": "#E49EDD",
-            "suggestedOrder_box": "#E49EDD",
-            "atRisk_label": "#E49EDD",
-            "atRisk_box": "#E49EDD",
-            "itemName_label_2": "#B5E6A2",
-            "itemName_box": "#B5E6A2",
-            "itemNumber_label_2": "#B5E6A2",
-            "itemNumber_box": "#B5E6A2",
-            "itemGroup_label_2": "#B5E6A2",
-            "itemGroup_box": "#B5E6A2",
-            "stockOnHand_label": "#B5E6A2",
-            "stockOnHand_box": "#B5E6A2",
-            "onOrderForm_label": "#D9E1F2",
-            "onOrderForm_box": "#D9E1F2",
-            "onNextContainer_label": "#D9E1F2",
-            "onNextContainer_box": "#D9E1F2",
-            "shippedContainer_label": "#D9E1F2",
-            "shippedContainer_box": "#D9E1F2",
-        }
+        # The original item summary used strong coloured blocks for several fields.
+        # In the rebuilt UI these colours fought the theme and made text harder to read,
+        # so normal fields stay neutral. Warning states are still handled separately.
+        return {}
 
     def build_item_summary_accent_stylesheet(self, object_name, warning=False):
         color = self.item_summary_accent_color_map().get(object_name)
@@ -14182,6 +16154,9 @@ $mail.Display()
     def clear_item_summary_fields(self):
         self.current_item_number = None
         self.current_item_planning_status = PLANNING_STATUS_ACTIVE
+        status_label = getattr(self.ui, "itemSummary_statusLabel", None)
+        if status_label is not None:
+            status_label.setText("Search an item to review demand, stock position, inbound supply and suggested ordering.")
         self.update_item_status_controls(PLANNING_STATUS_ACTIVE)
         label_names = [
             "itemNumber_box", "itemName_box", "itemGroup_box", "rollSpool_box", "mtUnit_box",
@@ -14207,316 +16182,328 @@ $mail.Display()
     # Theme handling
     # -----------------------------
     def theme_scrollbar_stylesheet(self, theme_name):
+        theme_name = "light" if str(theme_name).lower() == "light" else "dark"
         if theme_name == "light":
             return """
                 QScrollBar:horizontal, QScrollBar:vertical {
-                    background: #d7dde4;
-                    border: 1px solid #9ca8b5;
+                    background: #d8dee6;
+                    border: 1px solid #aeb8c4;
                     margin: 0px;
                 }
                 QScrollBar:horizontal { height: 18px; }
                 QScrollBar:vertical { width: 18px; }
                 QScrollBar::handle:horizontal, QScrollBar::handle:vertical {
-                    background: #77889a;
-                    border: 1px solid #566575;
-                    border-radius: 4px;
-                    min-width: 36px;
-                    min-height: 36px;
+                    background: #8593a3;
+                    border: 1px solid #6b7786;
+                    border-radius: 5px;
+                    min-width: 38px;
+                    min-height: 38px;
                 }
                 QScrollBar::handle:horizontal:hover, QScrollBar::handle:vertical:hover {
-                    background: #64778a;
+                    background: #748395;
                 }
                 QScrollBar::add-line, QScrollBar::sub-line {
-                    background: #c3cbd3;
-                    border: 1px solid #9ca8b5;
+                    background: #c8d0da;
+                    border: 1px solid #aeb8c4;
                     width: 16px;
                     height: 16px;
                 }
-                QScrollBar::add-page, QScrollBar::sub-page { background: #d7dde4; }
-                QCheckBox { spacing: 6px; color: #1b1f23; }
+                QScrollBar::add-page, QScrollBar::sub-page { background: #d8dee6; }
+                QCheckBox { spacing: 6px; color: #172033; background: transparent; }
                 QCheckBox::indicator {
                     width: 16px;
                     height: 16px;
-                    border: 1px solid #697684;
-                    background: #f8fafb;
+                    border: 1px solid #667487;
+                    background: #f8fafc;
                     border-radius: 3px;
                 }
                 QCheckBox::indicator:checked {
-                    background: #2f80d0;
-                    border: 1px solid #1f5f9f;
-                }
-            """
-        if theme_name == "high":
-            return """
-                QScrollBar:horizontal, QScrollBar:vertical {
-                    background: #000000;
-                    border: 2px solid #ffff00;
-                    margin: 0px;
-                }
-                QScrollBar:horizontal { height: 20px; }
-                QScrollBar:vertical { width: 20px; }
-                QScrollBar::handle:horizontal, QScrollBar::handle:vertical {
-                    background: #00ffff;
-                    border: 2px solid #ffffff;
-                    border-radius: 3px;
-                    min-width: 40px;
-                    min-height: 40px;
-                }
-                QScrollBar::add-line, QScrollBar::sub-line {
-                    background: #000000;
-                    border: 2px solid #ffff00;
-                    width: 18px;
-                    height: 18px;
-                }
-                QScrollBar::add-page, QScrollBar::sub-page { background: #000000; }
-                QCheckBox { spacing: 6px; color: #ffff00; }
-                QCheckBox::indicator {
-                    width: 17px;
-                    height: 17px;
-                    border: 2px solid #ffff00;
-                    background: #000000;
-                }
-                QCheckBox::indicator:checked {
-                    background: #00ffff;
-                    border: 2px solid #ffffff;
+                    background: #2f6fae;
+                    border: 1px solid #24588d;
                 }
             """
         return """
                 QScrollBar:horizontal, QScrollBar:vertical {
-                    background: #24272b;
-                    border: 1px solid #5f6368;
+                    background: #242a32;
+                    border: 1px solid #4a5462;
                     margin: 0px;
                 }
                 QScrollBar:horizontal { height: 18px; }
                 QScrollBar:vertical { width: 18px; }
                 QScrollBar::handle:horizontal, QScrollBar::handle:vertical {
-                    background: #8a949f;
-                    border: 1px solid #c1c7ce;
-                    border-radius: 4px;
-                    min-width: 36px;
-                    min-height: 36px;
+                    background: #7f8a98;
+                    border: 1px solid #b2bbc6;
+                    border-radius: 5px;
+                    min-width: 38px;
+                    min-height: 38px;
                 }
                 QScrollBar::handle:horizontal:hover, QScrollBar::handle:vertical:hover {
-                    background: #a4afba;
+                    background: #96a2af;
                 }
                 QScrollBar::add-line, QScrollBar::sub-line {
-                    background: #303134;
-                    border: 1px solid #5f6368;
+                    background: #303742;
+                    border: 1px solid #4a5462;
                     width: 16px;
                     height: 16px;
                 }
-                QScrollBar::add-page, QScrollBar::sub-page { background: #24272b; }
-                QCheckBox { spacing: 6px; color: #e8eaed; }
+                QScrollBar::add-page, QScrollBar::sub-page { background: #242a32; }
+                QCheckBox { spacing: 6px; color: #e7edf4; background: transparent; }
                 QCheckBox::indicator {
                     width: 16px;
                     height: 16px;
-                    border: 1px solid #9aa0a6;
-                    background: #202124;
+                    border: 1px solid #98a4b3;
+                    background: #20262d;
                     border-radius: 3px;
                 }
                 QCheckBox::indicator:checked {
-                    background: #8ab4f8;
-                    border: 1px solid #d2e3fc;
+                    background: #7fb3f5;
+                    border: 1px solid #c8defc;
                 }
             """
 
     def restore_theme(self):
-        theme = self.settings.value("theme", "dark")
+        theme = str(self.settings.value("theme", "dark") or "dark").strip().lower()
+        if theme not in {"light", "dark"}:
+            theme = "dark"
+            self.settings.setValue("theme", theme)
         if theme == "light" and hasattr(self.ui, "radioLight"):
             self.ui.radioLight.setChecked(True)
-        elif theme == "high" and hasattr(self.ui, "radioHighContrast"):
-            self.ui.radioHighContrast.setChecked(True)
         elif hasattr(self.ui, "radioDark"):
             self.ui.radioDark.setChecked(True)
         self.apply_theme(theme)
 
     def apply_theme(self, theme_name):
+        theme_name = "light" if str(theme_name).strip().lower() == "light" else "dark"
         self.settings.setValue("theme", theme_name)
         app = QApplication.instance()
         if app is None:
             return
 
         if theme_name == "light":
-            arrow_color = "#1b1f23"
-        elif theme_name == "high":
-            arrow_color = "#ffff00"
+            colors = {
+                "app_bg": "#edf1f5",
+                "page_bg": "#edf1f5",
+                "card_bg": "#f8fafc",
+                "card_bg_2": "#f2f5f8",
+                "card_border": "#b8c2ce",
+                "field_bg": "#ffffff",
+                "field_text": "#111827",
+                "field_border": "#9ba8b6",
+                "header_bg": "#d9e1ea",
+                "header_text": "#111827",
+                "table_bg": "#f8fafc",
+                "table_alt": "#eef3f8",
+                "table_grid": "#b5c0cc",
+                "text": "#111827",
+                "muted": "#455365",
+                "button_bg": "#e0e6ee",
+                "button_hover": "#d2dae4",
+                "button_border": "#9aa8b8",
+                "primary_bg": "#d6e0ec",
+                "primary_hover": "#c8d5e3",
+                "nav_bg": "#eef3f8",
+                "nav_border": "#b8c2ce",
+                "nav_panel_bg": "#dde5ee",
+                "nav_panel_border": "#bcc7d3",
+                "nav_button": "#f8fafc",
+                "nav_button_hover": "#e1e9f2",
+                "nav_button_border": "#b7c3d0",
+                "nav_selected_bg": "#d4deea",
+                "nav_selected_text": "#111827",
+                "nav_text": "#111827",
+                "side_label_bg": "#e4eaf1",
+                "side_value_bg": "#f8fafc",
+            }
+            arrow_color = colors["field_text"]
         else:
-            arrow_color = "#e8eaed"
+            colors = {
+                "app_bg": "#1f2329",
+                "page_bg": "#1f2329",
+                "card_bg": "#272c33",
+                "card_bg_2": "#232830",
+                "card_border": "#3f4854",
+                "field_bg": "#1e232a",
+                "field_text": "#e7edf4",
+                "field_border": "#5a6573",
+                "header_bg": "#1b1f25",
+                "header_text": "#f4f7fb",
+                "table_bg": "#2a2f36",
+                "table_alt": "#30363e",
+                "table_grid": "#596472",
+                "text": "#e7edf4",
+                "muted": "#b6c1ce",
+                "button_bg": "#303742",
+                "button_hover": "#3c4552",
+                "button_border": "#566170",
+                "primary_bg": "#343d49",
+                "primary_hover": "#424d5c",
+                "nav_bg": "#222832",
+                "nav_border": "#111827",
+                "nav_panel_bg": "#1d222b",
+                "nav_panel_border": "#3a4350",
+                "nav_button": "#303846",
+                "nav_button_hover": "#3b4554",
+                "nav_button_border": "#485365",
+                "nav_selected_bg": "#d8dee6",
+                "nav_selected_text": "#111827",
+                "nav_text": "#f8fafc",
+                "side_label_bg": "#252b34",
+                "side_value_bg": "#20262d",
+            }
+            arrow_color = colors["field_text"]
 
         up_arrow_url = self.ensure_spin_arrow_icon("up", arrow_color)
         down_arrow_url = self.ensure_spin_arrow_icon("down", arrow_color)
 
-        if theme_name == "light":
-            app.setStyleSheet(f"""
-                QWidget {{ background: #e3e8ee; color: #1b1f23; }}
-                QMainWindow, QStackedWidget, QScrollArea, QScrollArea > QWidget > QWidget {{
-                    background: #e3e8ee;
-                    color: #1b1f23;
-                }}
-                QFrame#frame_3, QFrame#frame_11, QFrame#frame_12, QFrame#frame_18,
-                QFrame#frame_23, QFrame#frame_28, QFrame#frame_30, QFrame#frame_31,
-                QFrame#frame_32, QFrame#frame_33, QFrame#frame_37, QFrame#frame_38,
-                QFrame#frame_39, QFrame#frame_40, QFrame#frame_41, QFrame#frame_42,
-                QFrame#frame_43, QFrame#frame_44, QFrame#frame_45 {{
-                    background: #eef2f5;
-                    border: 1px solid #c3cbd3;
-                    border-radius: 8px;
-                }}
-                QLineEdit, QComboBox, QSpinBox, QTableWidget, QTableView, QTextEdit, QTextBrowser, QDateEdit {{
-                    background: #f8fafb;
-                    color: #111111;
-                    border: 1px solid #aab4be;
-                    border-radius: 4px;
-                    selection-background-color: #c9def5;
-                    selection-color: #111111;
-                }}
-                QSpinBox {{
-                    padding-right: 24px;
-                }}
-                QSpinBox::up-button, QSpinBox::down-button {{
-                    subcontrol-origin: border;
-                    width: 22px;
-                    background: #dde3e9;
-                    border-left: 1px solid #aab4be;
-                }}
-                QSpinBox::up-button {{
-                    subcontrol-position: top right;
-                    border-bottom: 1px solid #aab4be;
-                }}
-                QSpinBox::down-button {{
-                    subcontrol-position: bottom right;
-                }}
-                QSpinBox::up-button:hover, QSpinBox::down-button:hover {{
-                    background: #d1d9e1;
-                }}
-                QSpinBox::up-arrow {{
-                    image: url("{up_arrow_url}");
-                    width: 12px;
-                    height: 12px;
-                }}
-                QSpinBox::down-arrow {{
-                    image: url("{down_arrow_url}");
-                    width: 12px;
-                    height: 12px;
-                }}
-                QPushButton {{
-                    background: #d6dce3;
-                    color: #1b1f23;
-                    border: 1px solid #97a4b0;
-                    border-radius: 5px;
-                    padding: 6px;
-                }}
-                QPushButton:hover {{ background: #c9d1d9; }}
-                QHeaderView::section {{
-                    background: #d7dde4;
-                    color: #111111;
-                    border: 1px solid #aab4be;
-                    padding: 4px;
-                }}
-                QRadioButton {{
-                    color: #1b1f23; spacing: 6px; padding: 3px 6px; border-radius: 4px;
-                }}
-                QRadioButton:checked {{
-                    color: white; background: #5c6b7a; font-weight: 700;
-                }}
-            """)
-        elif theme_name == "high":
-            app.setStyleSheet(f"""
-                QWidget {{ background: black; color: yellow; }}
-                QLineEdit, QComboBox, QSpinBox, QTableWidget, QTableView, QTextEdit, QTextBrowser, QDateEdit {{
-                    background: black; color: yellow; border: 2px solid yellow;
-                }}
-                QSpinBox {{
-                    padding-right: 24px;
-                }}
-                QSpinBox::up-button, QSpinBox::down-button {{
-                    subcontrol-origin: border;
-                    width: 22px;
-                    background: #111111;
-                    border-left: 2px solid yellow;
-                }}
-                QSpinBox::up-button {{
-                    subcontrol-position: top right;
-                    border-bottom: 2px solid yellow;
-                }}
-                QSpinBox::down-button {{
-                    subcontrol-position: bottom right;
-                }}
-                QSpinBox::up-button:hover, QSpinBox::down-button:hover {{
-                    background: #1c1c1c;
-                }}
-                QSpinBox::up-arrow {{
-                    image: url("{up_arrow_url}");
-                    width: 12px;
-                    height: 12px;
-                }}
-                QSpinBox::down-arrow {{
-                    image: url("{down_arrow_url}");
-                    width: 12px;
-                    height: 12px;
-                }}
-                QPushButton {{
-                    background: black; color: cyan; border: 2px solid cyan; padding: 6px;
-                }}
-                QHeaderView::section {{
-                    background: black; color: yellow; border: 1px solid yellow;
-                }}
-                QRadioButton {{
-                    color: yellow; spacing: 6px; padding: 3px 6px; border-radius: 4px;
-                }}
-                QRadioButton:checked {{
-                    color: white; background: #005a9e; font-weight: 700;
-                }}
-            """)
-        else:
-            app.setStyleSheet(f"""
-                QWidget {{ background: #202124; color: #e8eaed; }}
-                QLineEdit, QComboBox, QSpinBox, QTableWidget, QTableView, QTextEdit, QTextBrowser, QDateEdit {{
-                    background: #2b2d30; color: #e8eaed; border: 1px solid #5f6368;
-                }}
-                QSpinBox {{
-                    padding-right: 24px;
-                }}
-                QSpinBox::up-button, QSpinBox::down-button {{
-                    subcontrol-origin: border;
-                    width: 22px;
-                    background: #37393d;
-                    border-left: 1px solid #5f6368;
-                }}
-                QSpinBox::up-button {{
-                    subcontrol-position: top right;
-                    border-bottom: 1px solid #5f6368;
-                }}
-                QSpinBox::down-button {{
-                    subcontrol-position: bottom right;
-                }}
-                QSpinBox::up-button:hover, QSpinBox::down-button:hover {{
-                    background: #43464b;
-                }}
-                QSpinBox::up-arrow {{
-                    image: url("{up_arrow_url}");
-                    width: 12px;
-                    height: 12px;
-                }}
-                QSpinBox::down-arrow {{
-                    image: url("{down_arrow_url}");
-                    width: 12px;
-                    height: 12px;
-                }}
-                QPushButton {{
-                    background: #303134; border: 1px solid #5f6368; padding: 6px;
-                }}
-                QPushButton:hover {{ background: #3c4043; }}
-                QHeaderView::section {{
-                    background: #303134; color: #e8eaed; border: 1px solid #5f6368;
-                }}
-                QRadioButton {{
-                    color: #e8eaed; spacing: 6px; padding: 3px 6px; border-radius: 4px;
-                }}
-                QRadioButton:checked {{
-                    color: white; background: #4a4d52; font-weight: 700;
-                }}
-            """)
+        app.setStyleSheet(f"""
+            QWidget {{
+                background: {colors['app_bg']};
+                color: {colors['text']};
+                font-family: Segoe UI, Arial, sans-serif;
+                font-size: 10pt;
+            }}
+            QMainWindow, QStackedWidget, QScrollArea, QScrollArea > QWidget > QWidget {{
+                background: {colors['page_bg']};
+                color: {colors['text']};
+            }}
+            QFrame#frame_6 {{
+                background: {colors['nav_bg']};
+                border-right: 1px solid {colors['nav_border']};
+            }}
+            QFrame#logo {{ background: transparent; border: none; }}
+            QFrame#frame_7 QPushButton {{
+                background: {colors['nav_button']};
+                color: {colors['nav_text']};
+                border: 1px solid {colors['nav_button_border']};
+                border-radius: 7px;
+                padding: 7px 12px;
+                text-align: left;
+                font-weight: 650;
+            }}
+            QFrame#frame_7 QPushButton:hover {{ background: {colors['nav_button_hover']}; }}
+            QFrame#frame_8 {{
+                background: {colors['nav_panel_bg']};
+                border: 1px solid {colors['nav_panel_border']};
+                border-radius: 8px;
+            }}
+            QFrame#frame_8 QRadioButton {{
+                color: {colors['nav_text']};
+                background: transparent;
+                spacing: 6px;
+                padding: 3px 7px;
+                border-radius: 4px;
+            }}
+            QFrame#frame_8 QRadioButton:checked {{
+                background: {colors['nav_selected_bg']};
+                color: {colors['nav_selected_text']};
+                font-weight: 800;
+            }}
+            QTextEdit#textEdit {{
+                background: {colors['field_bg']};
+                color: {colors['field_text']};
+                border: 1px solid {colors['field_border']};
+                border-radius: 6px;
+            }}
+            QLabel {{ background: transparent; color: {colors['text']}; }}
+            QLabel[role="pageTitle"] {{
+                color: {colors['text']};
+                font-size: 22px;
+                font-weight: 800;
+                padding: 0;
+            }}
+            QLabel[role="pageSubtitle"] {{
+                color: {colors['muted']};
+                font-size: 10pt;
+                padding: 0;
+            }}
+            QLabel[role="sectionTitle"] {{
+                color: {colors['header_text']};
+                background: transparent;
+                font-size: 11pt;
+                font-weight: 800;
+                padding: 2px 0 4px 0;
+            }}
+            QLabel[role="fieldLabel"] {{
+                color: {colors['header_text']};
+                font-weight: 800;
+            }}
+            QLabel[role="metricTitle"] {{ color: {colors['muted']}; font-size: 8.5pt; }}
+            QLabel[role="metricValue"] {{ color: {colors['text']}; font-size: 10.5pt; font-weight: 800; }}
+            QFrame[role="toolbarCard"], QFrame[role="subtleCard"], QFrame[role="contentCard"],
+            QFrame[role="sideCard"], QFrame[role="metricCard"], QFrame[role="pageBody"] {{
+                background: {colors['card_bg']};
+                border: 1px solid {colors['card_border']};
+                border-radius: 10px;
+            }}
+            QFrame[role="metricCard"] {{ background: {colors['card_bg_2']}; }}
+            QFrame[role="sideMetricSection"] {{
+                background: {colors['card_bg']};
+                border: 1px solid {colors['card_border']};
+                border-radius: 10px;
+            }}
+            QLabel[role="sideMetricLabel"], QLabel[role="sideMetricValue"] {{
+                border: 1px solid {colors['field_border']};
+                border-radius: 6px;
+                padding: 3px 6px;
+            }}
+            QLabel[role="sideMetricLabel"] {{
+                color: {colors['header_text']};
+                background: {colors['side_label_bg']};
+                font-weight: 800;
+            }}
+            QLabel[role="sideMetricValue"] {{
+                color: {colors['text']};
+                background: {colors['side_value_bg']};
+                font-weight: 850;
+            }}
+            QLineEdit, QComboBox, QSpinBox, QTableWidget, QTableView, QTextEdit, QTextBrowser, QDateEdit {{
+                background: {colors['field_bg']};
+                color: {colors['field_text']};
+                border: 1px solid {colors['field_border']};
+                border-radius: 5px;
+                selection-background-color: #7aa7df;
+                selection-color: #ffffff;
+            }}
+            QTableWidget, QTableView {{
+                background: {colors['table_bg']};
+                alternate-background-color: {colors['table_alt']};
+                gridline-color: {colors['table_grid']};
+            }}
+            QHeaderView::section {{
+                background: {colors['header_bg']};
+                color: {colors['header_text']};
+                border: 1px solid {colors['table_grid']};
+                padding: 4px;
+                font-weight: 650;
+            }}
+            QPushButton {{
+                background: {colors['button_bg']};
+                color: {colors['text']};
+                border: 1px solid {colors['button_border']};
+                border-radius: 6px;
+                padding: 6px 10px;
+                min-height: 28px;
+                font-weight: 600;
+            }}
+            QPushButton:hover {{ background: {colors['button_hover']}; }}
+            QPushButton[role="primaryButton"] {{ background: {colors['primary_bg']}; }}
+            QPushButton[role="primaryButton"]:hover {{ background: {colors['primary_hover']}; }}
+            QSpinBox {{ padding-right: 24px; }}
+            QSpinBox::up-button, QSpinBox::down-button {{
+                subcontrol-origin: border;
+                width: 22px;
+                background: {colors['button_bg']};
+                border-left: 1px solid {colors['field_border']};
+            }}
+            QSpinBox::up-button {{
+                subcontrol-position: top right;
+                border-bottom: 1px solid {colors['field_border']};
+            }}
+            QSpinBox::down-button {{ subcontrol-position: bottom right; }}
+            QSpinBox::up-button:hover, QSpinBox::down-button:hover {{ background: {colors['button_hover']}; }}
+            QSpinBox::up-arrow {{ image: url("{up_arrow_url}"); width: 12px; height: 12px; }}
+            QSpinBox::down-arrow {{ image: url("{down_arrow_url}"); width: 12px; height: 12px; }}
+        """)
 
         try:
             app.setStyleSheet(app.styleSheet() + self.theme_scrollbar_stylesheet(theme_name))
@@ -14555,18 +16542,14 @@ $mail.Display()
             self.load_item_summary()
 
     def chart_text_color(self):
-        if hasattr(self.ui, "radioHighContrast") and self.ui.radioHighContrast.isChecked():
-            return QColor("yellow")
         if hasattr(self.ui, "radioLight") and self.ui.radioLight.isChecked():
-            return QColor("#202124")
+            return QColor("#172033")
         return QColor("#e8eaed")
 
     def chart_background_color(self):
-        if hasattr(self.ui, "radioHighContrast") and self.ui.radioHighContrast.isChecked():
-            return QColor("black")
         if hasattr(self.ui, "radioLight") and self.ui.radioLight.isChecked():
-            return QColor("#eef2f5")
-        return QColor("#202124")
+            return QColor("#f6f8fb")
+        return QColor("#1f2329")
 
     # -----------------------------
     # Customer page
@@ -14574,6 +16557,35 @@ $mail.Display()
     def rerun_search_if_ready(self, *_args):
         if hasattr(self.ui, "customerEdit") and (self.ui.customerEdit.text() or "").strip():
             self.search_customer_sales()
+
+    def update_customer_summary_cards(self, customer_name, matched_customers, start_date, end_date, pivot, monthly_totals, combine_accounts):
+        period_text = f"{start_date.strftime('%b %Y')} - {end_date.strftime('%b %Y')}"
+        total_units = sum(monthly_totals.values()) if monthly_totals else 0.0
+        accounts_text = str(len(matched_customers or []))
+        if combine_accounts and len(matched_customers or []) > 1:
+            accounts_text += " combined"
+
+        card_values = {
+            "customerSummaryPeriod_box": period_text,
+            "customerSummaryItems_box": self.format_value(len(pivot or {})),
+            "customerSummaryUnits_box": self.format_value(total_units),
+            "customerSummaryAccounts_box": accounts_text,
+        }
+        for object_name, value in card_values.items():
+            widget = getattr(self.ui, object_name, None)
+            if widget is not None:
+                try:
+                    widget.setText(str(value))
+                except Exception:
+                    pass
+
+        intro = getattr(self.ui, "customerSummary_intro", None)
+        if intro is not None:
+            try:
+                suffix = " (combined state accounts)" if combine_accounts else ""
+                intro.setText(f"Showing sales demand for {customer_name}{suffix}.")
+            except Exception:
+                pass
 
     def search_customer_sales(self):
         typed_customer = self.ui.customerEdit.text() if hasattr(self.ui, "customerEdit") else ""
@@ -14666,6 +16678,15 @@ $mail.Display()
         self.current_customer_pivot = pivot
         self.current_customer_name = valid_customer
         self.current_customer_combine_accounts = combine_accounts
+        self.update_customer_summary_cards(
+            valid_customer,
+            matched_customers,
+            start_date,
+            end_date,
+            pivot,
+            monthly_totals,
+            combine_accounts,
+        )
 
         self.populate_monthly_item_table(pivot, months, valid_customer, combine_accounts)
         self.populate_customer_info(valid_customer)
@@ -15189,6 +17210,8 @@ $mail.Display()
         if table.columnCount() > 4:
             table.setColumnWidth(4, max(table.columnWidth(4), 100))
         table.resizeRowsToContents()
+        if self.sales_table_frozen_helper is not None:
+            self.sales_table_frozen_helper.rebind()
 
         if combine_accounts:
             base_name = self.normalize_customer_name(customer_name)
@@ -15823,11 +17846,15 @@ $mail.Display()
         )
         adjusted_order = self.round_order_quantity(adjusted_order, carton_size, pallet_size)
 
+        item_display_name = self.get_first(item_row, "item_name", "Item Name", "description", "Description")
         self.current_item_number = valid_item
         self.current_item_planning_status = planning_status
+        status_label = getattr(self.ui, "itemSummary_statusLabel", None)
+        if status_label is not None:
+            status_label.setText(f"Showing demand and purchasing context for {valid_item}" + (f" - {item_display_name}" if item_display_name else ""))
         self.update_item_status_controls(planning_status)
         self.set_label_text("itemNumber_box", valid_item)
-        self.set_label_text("itemName_box", self.get_first(item_row, "item_name", "Item Name", "description", "Description"))
+        self.set_label_text("itemName_box", item_display_name)
         self.set_label_text("itemGroup_box", self.get_first(item_row, "Custom List 1", default=""))
         self.set_label_text("rollSpool_box", self.safe_text(self.get_first(item_row, "roll", "ROLL")))
         self.set_label_text("mtUnit_box", self.safe_text(self.get_first(item_row, "per_roll", "PER ROLL")))
@@ -15994,10 +18021,10 @@ $mail.Display()
         self.configure_monthly_sales_table_visibility(
             table,
             getattr(self.ui, "itemSales_graph", None),
-            table_min_height=155,
-            table_max_height=225,
-            graph_min_height=205,
-            graph_max_height=265,
+            table_min_height=190,
+            table_max_height=None,
+            graph_min_height=210,
+            graph_max_height=None,
         )
 
         months = []
@@ -16047,10 +18074,16 @@ $mail.Display()
             table.setColumnWidth(2, max(table.columnWidth(2), 95))
         table.resizeRowsToContents()
         try:
-            table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+            if bool(table.property("_uses_frozen_external_hscroll")):
+                table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                table.horizontalScrollBar().hide()
+            else:
+                table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
             table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         except Exception:
             pass
+        if self.customer_purchase_frozen_helper is not None:
+            self.customer_purchase_frozen_helper.rebind()
 
 
     def create_order_analysis_progress_dialog(self, total_items, supplier_name):
@@ -16955,11 +18988,7 @@ $mail.Display()
 
         is_item_chart = chart_view is self.item_chart_view
 
-        if hasattr(self.ui, "radioHighContrast") and self.ui.radioHighContrast.isChecked():
-            main_color = QColor("#00FFFF") if is_item_chart else QColor("#00FF00")
-            trend_color = QColor("#FF8C00")
-            grid_color = QColor(255, 255, 0, 70)
-        elif hasattr(self.ui, "radioLight") and self.ui.radioLight.isChecked():
+        if hasattr(self.ui, "radioLight") and self.ui.radioLight.isChecked():
             main_color = QColor("#005BBB") if is_item_chart else QColor("#006400")
             trend_color = QColor("#C45500")
             grid_color = QColor(32, 33, 36, 45)
