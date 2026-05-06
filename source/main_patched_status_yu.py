@@ -4273,31 +4273,207 @@ class Ui_MainWindow(object):
     # ------------------------------------------------------------------
     def _build_home_guide_page(self):
         self.homeGuide_page, layout = self._page("homeGuide_page", "Windsor Widget - How To Guide")
-        self.howToGuide_textBrowser = QTextBrowser(self.homeGuide_page)
-        self.howToGuide_textBrowser.setObjectName("howToGuide_textBrowser")
-        self.howToGuide_textBrowser.setOpenExternalLinks(True)
-        self.howToGuide_textBrowser.setHtml(self._home_guide_html())
-        layout.addWidget(self.howToGuide_textBrowser, 1)
+        layout.setContentsMargins(16, 12, 16, 16)
+        layout.setSpacing(10)
+
+        self.homeGuide_tabs = QTabWidget(self.homeGuide_page)
+        self.homeGuide_tabs.setObjectName("homeGuide_tabs")
+        self.homeGuide_tabs.setDocumentMode(True)
+        self.homeGuide_tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        def add_guide_tab(title, html, object_name):
+            browser = QTextBrowser(self.homeGuide_tabs)
+            browser.setObjectName(object_name)
+            browser.setOpenExternalLinks(True)
+            browser.setHtml(html)
+            self.homeGuide_tabs.addTab(browser, title)
+            return browser
+
+        self.howToGuide_textBrowser = add_guide_tab("Overview", self._home_guide_html(), "howToGuide_textBrowser")
+        add_guide_tab("Customer Summary", self._customer_summary_guide_html(), "customerSummaryGuide_textBrowser")
+        add_guide_tab("Item Summary", self._item_summary_guide_html(), "itemSummaryGuide_textBrowser")
+        add_guide_tab("To Order", self._to_order_guide_html(), "toOrderGuide_textBrowser")
+        add_guide_tab("On Order", self._on_order_guide_html(), "onOrderGuide_textBrowser")
+        add_guide_tab("Build Container", self._build_container_guide_html(), "buildContainerGuide_textBrowser")
+        add_guide_tab("Order Analysis", self._order_analysis_guide_html(), "orderAnalysisGuide_textBrowser")
+        add_guide_tab("Shipments", self._shipments_guide_html(), "shipmentsGuide_textBrowser")
+        add_guide_tab("SABA Review", self._saba_review_guide_html(), "sabaReviewGuide_textBrowser")
+        add_guide_tab("Update Data", self._update_data_guide_html(), "updateDataGuide_textBrowser")
+
+        layout.addWidget(self.homeGuide_tabs, 1)
+
+    def _guide_page_html(self, title, intro, steps, notes=None):
+        step_html = "".join(f"<li>{step}</li>" for step in steps)
+        note_html = ""
+        if notes:
+            note_items = "".join(f"<li>{note}</li>" for note in notes)
+            note_html = f"<h2>Notes</h2><ul>{note_items}</ul>"
+        return f"""
+        <h1>{title}</h1>
+        <p>{intro}</p>
+        <h2>How to use this page</h2>
+        <ol>{step_html}</ol>
+        {note_html}
+        """
 
     def _home_guide_html(self):
         return """
         <h1>Windsor Widget</h1>
-        <p>This page is the starting point for the rebuilt code-based interface.</p>
-        <h2>Basic workflow</h2>
+        <p><b>Windsor Widget</b> is the central purchasing and stock review tool for customer demand, item demand, order planning, incoming stock, containers, shipments, and data imports.</p>
+        <h2>Main workflow</h2>
         <ol>
-          <li><b>Customer Summary</b> - search customer sales history and open linked customer files.</li>
-          <li><b>Item Summary</b> - review item stock, sales, on-order quantities and purchasing context.</li>
-          <li><b>To Order</b> - review suggested ordering and manage purchasing lines.</li>
-          <li><b>On Order</b> - review incoming orders and order comments.</li>
-          <li><b>Build Container</b> - prepare and review container lines.</li>
-          <li><b>Order Analysis</b> - compare sales, stock and forecast demand.</li>
-          <li><b>SABA Review</b> - review SABA purchasing patterns.</li>
-          <li><b>Update Data</b> - import sales, stock and order updates.</li>
+          <li><b>Update Data</b> first when you have new sales, stock, or order exports.</li>
+          <li><b>Customer Summary</b> checks what a customer has bought and identifies customer-specific demand.</li>
+          <li><b>Item Summary</b> checks stock position, sales trend, inbound supply, and suggested ordering for one item.</li>
+          <li><b>Order Analysis</b> reviews supplier or product-group demand across many items.</li>
+          <li><b>To Order / On Order / Build Container</b> move from planning into order and container workflow.</li>
+          <li><b>Shipments</b> tracks shipment dates, vessel/container details, and arrival status.</li>
         </ol>
-        <h2>UI rebuild note</h2>
-        <p>The overall shell has now been moved out of the generated Qt file.  Each section can be rebuilt one at a time while keeping the existing object names stable.</p>
-        <p><b>Current priority:</b> keep the app functional while the layout becomes more consistent.</p>
+        <h2>Tips</h2>
+        <ul>
+          <li>Use the left navigation to move between sections.</li>
+          <li>Most tables support sorting, right-click formatting, and pop-out review.</li>
+          <li>Default date ranges open to the previous 12 months so the screen starts on a useful working period.</li>
+          <li>Double-click behaviours are used throughout the app to drill into related detail.</li>
+        </ul>
         """
+
+    def _customer_summary_guide_html(self):
+        return self._guide_page_html(
+            "Customer Summary",
+            "Use Customer Summary to review a customer's buying history by item and month.",
+            [
+                "Type a customer name and press <b>Search</b>.",
+                "Use <b>Combine state accounts</b> when a customer has separate state-based account names.",
+                "Use the date range to control which months are included.",
+                "Click an item row to redraw the monthly sales chart for that item.",
+                "Double-click an item number to open that item in Item Summary.",
+                "Use <b>Open Customer File</b> to open the linked customer spreadsheet where available.",
+            ],
+            [
+                "The Item Number and Description columns stay visible while scrolling sideways.",
+                "Customer details and account flags appear on the right.",
+            ],
+        )
+
+    def _item_summary_guide_html(self):
+        return self._guide_page_html(
+            "Item Summary",
+            "Use Item Summary to review demand, stock position, inbound supply, and suggested ordering for one item.",
+            [
+                "Type an item number and press <b>Load Item</b>.",
+                "Use the From/To date range to control the demand period.",
+                "Adjust <b>Lead Weeks</b> when the ordering lead time changes.",
+                "Use <b>Combine Threads</b> when thread variants should be reviewed together.",
+                "Use <b>Top 100</b> to open the top-selling item view for the selected period.",
+                "Double-click a customer row to open Customer Summary for that customer.",
+                "Double-click a month column to view invoice-level detail.",
+            ],
+            [
+                "Suggested order remains review-only until added to a real order or container workflow.",
+                "The Customer column stays visible while scrolling sideways.",
+            ],
+        )
+
+    def _to_order_guide_html(self):
+        return self._guide_page_html(
+            "To Order",
+            "Use To Order to review and build lines that need purchasing attention.",
+            [
+                "Review suggested or manually entered order lines.",
+                "Enter item/quantity details and use <b>Add Line</b> where required.",
+                "Use <b>Create YU Order</b> when preparing a YU supplier order.",
+                "Use import tools when loading updated order data.",
+                "Sort and review the table before committing order action.",
+            ],
+        )
+
+    def _on_order_guide_html(self):
+        return self._guide_page_html(
+            "On Order",
+            "Use On Order to review incoming purchase order lines and readiness details.",
+            [
+                "Review open order lines in the incoming order table.",
+                "Use the entry fields to add or update order-related information.",
+                "Use ready dates and comments to track what needs follow-up.",
+                "Sort the table by item, order number, ready date, or comments as required.",
+            ],
+        )
+
+    def _build_container_guide_html(self):
+        return self._guide_page_html(
+            "Build Container",
+            "Use Build Container to create and manage container load lines.",
+            [
+                "Enter or load a container reference first.",
+                "Set the ETA and any additional carton values.",
+                "Enter Order, Item, and Qty, then press <b>Add Line</b> or Enter in Qty.",
+                "Double-click <b>Urgent</b> or <b>Additional</b> cells to flag rows.",
+                "Double-click Remove to remove a line after confirmation.",
+                "Use Export or Email when the container is ready to send.",
+            ],
+            [
+                "Notes and dog lead rows are pinned to the bottom.",
+                "The capacity guide tracks 20' and 40' container usage.",
+            ],
+        )
+
+    def _order_analysis_guide_html(self):
+        return self._guide_page_html(
+            "Order Analysis",
+            "Use Order Analysis to review demand and suggested ordering by supplier or product group.",
+            [
+                "Choose <b>Supplier</b> or <b>Groups</b> mode.",
+                "Double-click the Supplier or Groups mode button to show available selections.",
+                "Type or select the supplier/product group.",
+                "Set the date range and status filters.",
+                "Press <b>Show Data</b> to build the suggested order detail.",
+                "Use <b>Export</b> to export the analysis to Excel.",
+            ],
+            [
+                "Special, Phase Out, and Obsolete filters control which planning statuses are shown.",
+            ],
+        )
+
+    def _shipments_guide_html(self):
+        return self._guide_page_html(
+            "Shipments",
+            "Use Shipments to review shipment status without leaving the main app window.",
+            [
+                "Use the date field and <b>Add New Shipment</b> to create a shipment entry.",
+                "Use Melbourne, Sydney, and SABA filters to review shipment groups.",
+                "Use the filter type dropdown to narrow visible rows.",
+                "Review shipment date, due date, status, vessel, container, and notes in the table.",
+            ],
+        )
+
+    def _saba_review_guide_html(self):
+        return self._guide_page_html(
+            "SABA Review",
+            "Use SABA Review for SABA-specific order and purchasing checks.",
+            [
+                "Use the SABA controls to load the relevant review period/data.",
+                "Review table lines for purchasing patterns or follow-up requirements.",
+                "Sort columns as needed to identify the highest priority lines.",
+            ],
+        )
+
+    def _update_data_guide_html(self):
+        return self._guide_page_html(
+            "Update Data",
+            "Use Update Data to import refreshed exports from MYOB and other working data files.",
+            [
+                "Choose the import section that matches the file you are updating.",
+                "Check the instructions tab on the right before importing.",
+                "For sales imports, use MYOB AccountRight Import/Export Assistant data.",
+                "Make sure required columns are present before upload.",
+                "After import, return to Customer Summary, Item Summary, or Order Analysis to review the new data.",
+            ],
+            [
+                "Sales imports require Invoice No. and duplicate checks include Invoice No. + Date + Customer + Item + Quantity + Price.",
+                "Good source formatting matters. Bad exports create bad summaries.",
+            ],
+        )
 
     # ------------------------------------------------------------------
     # Pages
@@ -4502,7 +4678,7 @@ class Ui_MainWindow(object):
         self.frame_18.setProperty("role", "toolbarCard")
         self.frame_18.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.frame_18.setMinimumHeight(92)
-        self.frame_18.setMaximumHeight(112)
+        self.frame_18.setMaximumHeight(108)
         toolbar.setContentsMargins(10, 8, 10, 8)
         toolbar.setHorizontalSpacing(10)
         toolbar.setVerticalSpacing(8)
@@ -4517,14 +4693,25 @@ class Ui_MainWindow(object):
         self.enterItem = self._line_edit(self.frame_18, "enterItem", "Search item number")
         self.enterItem.setMinimumWidth(360)
         self.enterItem.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        toolbar.addWidget(self.enterItem, 0, 1, 1, 6)
+        toolbar.addWidget(self.enterItem, 0, 1, 1, 5)
 
-        self.loadItem = QPushButton("Load Item", self.frame_18)
+        self.loadItem = QPushButton("Load", self.frame_18)
         self.loadItem.setObjectName("loadItem")
-        self.loadItem.setMinimumHeight(32)
-        self.loadItem.setMinimumWidth(104)
+        self.loadItem.setToolTip("Load the selected item summary.")
+        self.loadItem.setMinimumSize(QSize(58, 26))
+        self.loadItem.setMaximumSize(QSize(66, 28))
         self.loadItem.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        toolbar.addWidget(self.loadItem, 0, 7)
+        self.loadItem.setStyleSheet("QPushButton { padding: 2px 6px; min-height: 22px; }")
+        toolbar.addWidget(self.loadItem, 0, 6)
+
+        self.topItems_button = QPushButton("Top 100", self.frame_18)
+        self.topItems_button.setObjectName("topItems_button")
+        self.topItems_button.setToolTip("Open Top 100 item views for the selected date range.")
+        self.topItems_button.setMinimumSize(QSize(66, 26))
+        self.topItems_button.setMaximumSize(QSize(76, 28))
+        self.topItems_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.topItems_button.setStyleSheet("QPushButton { padding: 2px 6px; min-height: 22px; }")
+        toolbar.addWidget(self.topItems_button, 0, 7)
 
         from_label = QLabel("From", self.frame_18)
         from_label.setObjectName("itemFrom_label")
@@ -4578,21 +4765,15 @@ class Ui_MainWindow(object):
         self.combineThreads_checkBox.setMaximumWidth(190)
         self.horizontalLayout_itemTopTools.addWidget(self.combineThreads_checkBox)
 
-        self.topItems_button = QPushButton("Top 100", self.frame_17)
-        self.topItems_button.setObjectName("topItems_button")
-        self.topItems_button.setToolTip("Open Top 100 item views for the selected date range.")
-        self.topItems_button.setMinimumWidth(116)
-        self.topItems_button.setMaximumWidth(136)
-        self.topItems_button.setMinimumHeight(32)
-        self.topItems_button.setMaximumHeight(34)
-        self.horizontalLayout_itemTopTools.addWidget(self.topItems_button)
         self.horizontalLayout_itemTopTools.addStretch(1)
 
         toolbar.addWidget(self.frame_17, 1, 4, 1, 4)
         toolbar.setColumnStretch(1, 0)
         toolbar.setColumnStretch(3, 0)
         toolbar.setColumnStretch(4, 1)
-        toolbar.setColumnStretch(6, 1)
+        toolbar.setColumnStretch(5, 1)
+        toolbar.setColumnStretch(6, 0)
+        toolbar.setColumnStretch(7, 0)
 
         # Top item identity band.  Keep this as compact neutral information,
         # not loud highlight blocks, so long descriptions and group names remain readable.
@@ -9722,11 +9903,10 @@ class MainWindow(QMainWindow):
         if not bool(button.property("_top_items_connected")):
             button.clicked.connect(self.open_top_items_dialog)
             button.setProperty("_top_items_connected", True)
-        button.setMinimumHeight(28)
-        button.setMaximumHeight(30)
-        button.setMinimumWidth(88)
-        button.setMaximumWidth(110)
+        button.setMinimumSize(QSize(66, 26))
+        button.setMaximumSize(QSize(76, 28))
         button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        button.setStyleSheet("QPushButton { padding: 2px 6px; min-height: 22px; }")
         self.top_items_button = button
 
 
@@ -9765,10 +9945,11 @@ class MainWindow(QMainWindow):
 
         if load_button is not None:
             try:
-                load_button.setMinimumWidth(104)
-                load_button.setMaximumWidth(128)
-                load_button.setMinimumHeight(30)
-                load_button.setMaximumHeight(34)
+                load_button.setText("Load")
+                load_button.setMinimumSize(QSize(58, 26))
+                load_button.setMaximumSize(QSize(66, 28))
+                load_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+                load_button.setStyleSheet("QPushButton { padding: 2px 6px; min-height: 22px; }")
             except Exception:
                 pass
 
@@ -9810,10 +9991,10 @@ class MainWindow(QMainWindow):
 
         if button is not None:
             try:
-                button.setMinimumWidth(88)
-                button.setMaximumWidth(110)
-                button.setMinimumHeight(28)
-                button.setMaximumHeight(30)
+                button.setMinimumSize(QSize(66, 26))
+                button.setMaximumSize(QSize(76, 28))
+                button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+                button.setStyleSheet("QPushButton { padding: 2px 6px; min-height: 22px; }")
             except Exception:
                 pass
             if layout.indexOf(button) == -1:
@@ -15789,20 +15970,51 @@ $mail.Display()
         return sign * magnitude
 
     def item_summary_accent_color_map(self):
-        # The original item summary used strong coloured blocks for several fields.
-        # In the rebuilt UI these colours fought the theme and made text harder to read,
-        # so normal fields stay neutral. Warning states are still handled separately.
-        return {}
+        """Theme-aware accent styling for the key item-planning numbers."""
+        is_light = bool(getattr(self.ui, "radioLight", None) and self.ui.radioLight.isChecked())
+        if is_light:
+            accents = {
+                "suggested_min": {"bg": "#fff3c4", "fg": "#5f3b00", "border": "#d69e2e"},
+                "suggestedMin_box": {"bg": "#fff3c4", "fg": "#5f3b00", "border": "#d69e2e"},
+                "stockOnHand_label": {"bg": "#dbeafe", "fg": "#123b73", "border": "#4c88d9"},
+                "stockOnHand_box": {"bg": "#dbeafe", "fg": "#123b73", "border": "#4c88d9"},
+                "suggestedOrder_label": {"bg": "#d9f2df", "fg": "#0f3b1d", "border": "#38a169"},
+                "suggestedOrder_box": {"bg": "#d9f2df", "fg": "#0f3b1d", "border": "#38a169"},
+                "atRisk_label": {"bg": "#ffe2e2", "fg": "#7f1d1d", "border": "#e05a5a"},
+                "atRisk_box": {"bg": "#ffe2e2", "fg": "#7f1d1d", "border": "#e05a5a"},
+            }
+        else:
+            accents = {
+                "suggested_min": {"bg": "#5a431a", "fg": "#fff3c4", "border": "#d69e2e"},
+                "suggestedMin_box": {"bg": "#5a431a", "fg": "#fff3c4", "border": "#d69e2e"},
+                "stockOnHand_label": {"bg": "#17365f", "fg": "#dbeafe", "border": "#4c88d9"},
+                "stockOnHand_box": {"bg": "#17365f", "fg": "#dbeafe", "border": "#4c88d9"},
+                "suggestedOrder_label": {"bg": "#164d2b", "fg": "#d9f2df", "border": "#38a169"},
+                "suggestedOrder_box": {"bg": "#164d2b", "fg": "#d9f2df", "border": "#38a169"},
+                "atRisk_label": {"bg": "#5a1f1f", "fg": "#ffe2e2", "border": "#e05a5a"},
+                "atRisk_box": {"bg": "#5a1f1f", "fg": "#ffe2e2", "border": "#e05a5a"},
+            }
+        return accents
 
     def build_item_summary_accent_stylesheet(self, object_name, warning=False):
         color = self.item_summary_accent_color_map().get(object_name)
         if not color:
             return ""
-        border_color = "#e5b500" if warning else "#4a4a4a"
+        if isinstance(color, dict):
+            background = color.get("bg", "#fff3c4")
+            foreground = color.get("fg", "#111111")
+            border_color = "#e5b500" if warning else color.get("border", "#4a4a4a")
+        else:
+            background = color
+            foreground = "#111111"
+            border_color = "#e5b500" if warning else "#4a4a4a"
         return (
-            f"background-color: {color}; "
-            f"color: #111111; "
-            f"border: 3px solid {border_color};"
+            f"background-color: {background}; "
+            f"color: {foreground}; "
+            f"border: 2px solid {border_color}; "
+            f"border-radius: 6px; "
+            f"padding: 3px 6px; "
+            f"font-weight: 900;"
         )
 
     def apply_item_summary_accent_styles(self):

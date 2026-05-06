@@ -1,5 +1,5 @@
 #define MyAppName "Windsor Widget"
-#define MyAppVersion "1.0.2"
+#define MyAppVersion "1.1.0"
 #define MyAppPublisher "Brad Mayze"
 #define MyAppExeName "WindsorWidget.exe"
 
@@ -11,7 +11,7 @@ AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\Windsor Widget
 DefaultGroupName=Windsor Widget
 DisableProgramGroupPage=yes
-OutputBaseFilename=WindsorWidget_Client_1_0_2
+OutputBaseFilename=WindsorWidget_Client_1_1_0
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
@@ -233,7 +233,7 @@ begin
   SqlPage.Add('Username:', False);
   SqlPage.Add('Password:', True);
 
-  SqlPage.Values[0] := ReadExistingConfigValue('server', '');
+  SqlPage.Values[0] := ReadExistingConfigValue('server', '192.168.1.133');
   SqlPage.Values[1] := ReadExistingConfigValue('port', '14330');
   SqlPage.Values[2] := ReadExistingConfigValue('database', 'WindsorWidget');
   SqlPage.Values[3] := ReadExistingConfigValue('username', 'windsor_app');
