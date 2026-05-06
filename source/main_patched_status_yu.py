@@ -94,7 +94,7 @@ from yu_order_workflow import YUOrderEntryDialog, load_yu_review_module
 TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
 TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
 TABLE_FORMAT_SETTINGS_PREFIX = "table_format"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 APP_DESIGNER = "Bradley Mayze"
 UPDATE_REPO_OWNER = "Kuillemaul"
 UPDATE_REPO_NAME = "Windsor_Widget_Code"
@@ -10384,6 +10384,41 @@ class MainWindow(QMainWindow):
         self.setup_order_analysis_autocomplete()
         self.update_order_analysis_mode_button_styles()
 
+    def show_order_analysis_selection_list(self, mode):
+        mode = "group" if str(mode or "").strip().lower() == "group" else "supplier"
+        try:
+            self.load_reference_lists()
+        except Exception:
+            pass
+
+        self.set_order_analysis_mode(mode, clear_text=True)
+        edit = self.get_order_analysis_supplier_edit()
+        if edit is None:
+            return True
+
+        try:
+            edit.setFocus()
+            edit.clear()
+            completer = edit.completer()
+            if completer is not None:
+                completer.setCompletionPrefix("")
+                popup = completer.popup()
+                if popup is not None:
+                    popup.setMinimumWidth(max(360, edit.width()))
+
+                def _open_order_analysis_popup():
+                    if not qt_object_is_alive(edit):
+                        return
+                    try:
+                        completer.complete(edit.rect())
+                    except Exception:
+                        pass
+
+                QTimer.singleShot(0, _open_order_analysis_popup)
+        except Exception:
+            pass
+        return True
+
     def update_order_analysis_mode_button_styles(self):
         buttons = getattr(self, "order_analysis_mode_buttons", {}) or {}
         active_mode = self.get_order_analysis_mode()
@@ -10601,8 +10636,15 @@ class MainWindow(QMainWindow):
                 button.setMaximumHeight(40)
                 mode_layout.addWidget(button)
 
+            supplier_button.setProperty("_order_analysis_mode", "supplier")
+            group_button.setProperty("_order_analysis_mode", "group")
             supplier_button.clicked.connect(lambda _checked=False: self.set_order_analysis_mode("supplier"))
             group_button.clicked.connect(lambda _checked=False: self.set_order_analysis_mode("group"))
+            for mode_button in (supplier_button, group_button):
+                try:
+                    mode_button.installEventFilter(self)
+                except Exception:
+                    pass
             self.order_analysis_mode_buttons = {"supplier": supplier_button, "group": group_button}
             self._order_analysis_mode_frame = mode_frame
 
@@ -11738,15 +11780,17 @@ class MainWindow(QMainWindow):
         layout = parent.layout() if parent is not None else None
         if layout is None:
             return
-        existing = getattr(self.ui, "orderAnalysisClear_button", None)
-        if existing is None:
+        clear_button = getattr(self.ui, "orderAnalysisClear_button", None)
+        if clear_button is None:
             clear_button = QPushButton("Clear", parent)
             clear_button.setObjectName("orderAnalysisClear_button")
             clear_button.setMinimumHeight(32)
             clear_button.setMaximumHeight(32)
-            clear_button.clicked.connect(self.clear_order_analysis_page)
             layout.addWidget(clear_button)
             self.ui.orderAnalysisClear_button = clear_button
+        if not bool(clear_button.property("_order_analysis_clear_connected")):
+            clear_button.clicked.connect(self.clear_order_analysis_page)
+            clear_button.setProperty("_order_analysis_clear_connected", True)
 
     def setup_order_analysis_export_button(self):
         supplier_edit = self.get_order_analysis_supplier_edit()
@@ -11756,15 +11800,17 @@ class MainWindow(QMainWindow):
         layout = parent.layout() if parent is not None else None
         if layout is None:
             return
-        existing = getattr(self.ui, "orderAnalysisExport_button", None)
-        if existing is None:
-            export_button = QPushButton("Export to Excel", parent)
+        export_button = getattr(self.ui, "orderAnalysisExport_button", None)
+        if export_button is None:
+            export_button = QPushButton("Export", parent)
             export_button.setObjectName("orderAnalysisExport_button")
             export_button.setMinimumHeight(32)
             export_button.setMaximumHeight(32)
-            export_button.clicked.connect(self.export_order_analysis_to_excel)
             layout.addWidget(export_button)
             self.ui.orderAnalysisExport_button = export_button
+        if not bool(export_button.property("_order_analysis_export_connected")):
+            export_button.clicked.connect(self.export_order_analysis_to_excel)
+            export_button.setProperty("_order_analysis_export_connected", True)
 
     def handle_order_analysis_header_double_click(self, logical_index):
         table = self.get_order_analysis_table()
@@ -13547,6 +13593,12 @@ class MainWindow(QMainWindow):
                 return True
 
         if event.type() == QEvent.MouseButtonDblClick:
+            try:
+                order_analysis_mode = obj.property("_order_analysis_mode")
+            except Exception:
+                order_analysis_mode = None
+            if order_analysis_mode in ("supplier", "group"):
+                return self.show_order_analysis_selection_list(order_analysis_mode)
             if obj is freight_box or obj is freight_viewport:
                 flag_key = self.customer_flag_from_y_position(obj, event)
                 return self.toggle_customer_flag_for_current_customer(flag_key)
