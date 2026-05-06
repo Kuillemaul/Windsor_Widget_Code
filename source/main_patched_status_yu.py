@@ -15,8 +15,21 @@ import json
 import subprocess
 import warnings
 import threading
+import logging
+from logging.handlers import RotatingFileHandler
+import platform
+import traceback
 import urllib.error
 import urllib.request
+import ssl
+try:
+    import truststore
+except Exception:
+    truststore = None
+try:
+    import certifi
+except Exception:
+    certifi = None
 from pathlib import Path
 from datetime import datetime, date, timedelta
 from collections import Counter
@@ -94,7 +107,7 @@ from yu_order_workflow import YUOrderEntryDialog, load_yu_review_module
 TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
 TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
 TABLE_FORMAT_SETTINGS_PREFIX = "table_format"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 APP_DESIGNER = "Bradley Mayze"
 UPDATE_REPO_OWNER = "Kuillemaul"
 UPDATE_REPO_NAME = "Windsor_Widget_Code"
@@ -102,6 +115,113 @@ UPDATE_RELEASES_API_URL = f"https://api.github.com/repos/{UPDATE_REPO_OWNER}/{UP
 UPDATE_RELEASES_PAGE_URL = f"https://github.com/{UPDATE_REPO_OWNER}/{UPDATE_REPO_NAME}/releases/latest"
 UPDATE_INSTALLER_EXTENSIONS = (".exe", ".msi", ".msix", ".msixbundle")
 UPDATE_INSTALLER_KEYWORDS = ("setup", "installer", "install", "windsor", "widget")
+
+UPDATE_LOGGER_NAME = "windsor_widget.update"
+UPDATE_LOG_FILE_NAME = "update.log"
+
+
+def get_update_log_path():
+    """Return a per-user writable path for update diagnostics.
+
+    Do not write update logs beside the installed EXE because normal users may
+    not have permission there on shared PCs.
+    """
+    candidates = [
+        os.environ.get("LOCALAPPDATA"),
+        os.environ.get("APPDATA"),
+        str(Path.home() / "AppData" / "Local") if os.name == "nt" else "",
+        tempfile.gettempdir(),
+    ]
+    base = next((Path(value) for value in candidates if value), Path(tempfile.gettempdir()))
+    return base / "WindsorWidget" / "logs" / UPDATE_LOG_FILE_NAME
+
+
+def get_update_logger():
+    logger = logging.getLogger(UPDATE_LOGGER_NAME)
+    if getattr(logger, "_windsor_update_logger_ready", False):
+        return logger
+
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    try:
+        log_path = get_update_log_path()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            log_path,
+            maxBytes=1024 * 1024,
+            backupCount=3,
+            encoding="utf-8",
+        )
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+        logger.addHandler(handler)
+        logger._windsor_update_logger_ready = True
+        logger.info("Update logger ready. Log file: %s", log_path)
+    except Exception:
+        # Logging must never stop the app from launching.
+        logger.addHandler(logging.NullHandler())
+        logger._windsor_update_logger_ready = True
+
+    return logger
+
+
+def log_update_event(message, *args, exc_info=False):
+    """Best-effort update logger wrapper."""
+    try:
+        get_update_logger().info(message, *args, exc_info=exc_info)
+    except Exception:
+        pass
+
+
+def log_update_exception(message, *args):
+    """Best-effort update exception logger wrapper."""
+    try:
+        get_update_logger().exception(message, *args)
+    except Exception:
+        pass
+
+
+def update_log_location_text():
+    try:
+        return str(get_update_log_path())
+    except Exception:
+        return "Update log path unavailable"
+
+
+def build_update_ssl_context():
+    """Build the SSL context used by the updater.
+
+    Frozen Python apps can fail HTTPS verification on some PCs if the packaged
+    certificate bundle is missing or if the network uses a company SSL
+    inspection certificate. Prefer the Windows certificate store via
+    truststore, then fall back to certifi, then Python defaults.
+    """
+    try:
+        if truststore is not None:
+            context = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.load_default_certs()
+            log_update_event("SSL context created using truststore/Windows certificate store.")
+            return context
+    except Exception:
+        log_update_exception("Could not create truststore SSL context; falling back.")
+
+    try:
+        if certifi is not None:
+            ca_file = certifi.where()
+            context = ssl.create_default_context(cafile=ca_file)
+            log_update_event("SSL context created using certifi CA bundle: %s", ca_file)
+            return context
+    except Exception:
+        log_update_exception("Could not create certifi SSL context; falling back.")
+
+    try:
+        context = ssl.create_default_context()
+        log_update_event("SSL context created using Python default certificate store.")
+        return context
+    except Exception:
+        log_update_exception("Could not create any SSL context; urllib will use its default.")
+        return None
+
 
 PLANNING_STATUS_ACTIVE = "ACTIVE"
 PLANNING_STATUS_SPECIAL_ORDER = "SPECIAL_ORDER"
@@ -5922,11 +6042,23 @@ class MainWindow(QMainWindow):
     def check_for_updates_on_startup(self):
         """Check GitHub Releases for a newer published Windsor Widget version.
 
-        This is deliberately quiet on network failure so app startup is not interrupted.
+        This remains quiet in the UI on network failure so app startup is not
+        interrupted, but every step is now written to the update log.
         """
         if bool(getattr(self, "_update_check_started", False)):
+            log_update_event("Update check skipped because it already started.")
             return
         self._update_check_started = True
+        log_update_event(
+            "Starting update check. app_version=%s api_url=%s executable=%s cwd=%s frozen=%s python=%s platform=%s",
+            APP_VERSION,
+            UPDATE_RELEASES_API_URL,
+            sys.executable,
+            os.getcwd(),
+            bool(getattr(sys, "frozen", False)),
+            sys.version.replace("\n", " "),
+            platform.platform(),
+        )
         worker = threading.Thread(target=self._update_check_worker, name="WindsorUpdateCheck", daemon=True)
         worker.start()
 
@@ -5939,29 +6071,88 @@ class MainWindow(QMainWindow):
                     "User-Agent": f"WindsorWidget/{APP_VERSION}",
                 },
             )
-            with urllib.request.urlopen(request, timeout=6) as response:
-                payload = json.loads(response.read().decode("utf-8", errors="replace"))
+            log_update_event("Requesting latest GitHub release: %s", UPDATE_RELEASES_API_URL)
+            ssl_context = build_update_ssl_context()
+            with urllib.request.urlopen(request, timeout=6, context=ssl_context) as response:
+                status = getattr(response, "status", "unknown")
+                content_type = response.headers.get("Content-Type", "")
+                raw_payload = response.read()
+                log_update_event(
+                    "Release API response received. status=%s content_type=%s bytes=%s",
+                    status,
+                    content_type,
+                    len(raw_payload),
+                )
+                payload = json.loads(raw_payload.decode("utf-8", errors="replace"))
+        except urllib.error.HTTPError as exc:
+            body = ""
+            try:
+                body = exc.read().decode("utf-8", errors="replace")[:1000]
+            except Exception:
+                body = ""
+            log_update_exception(
+                "Update check failed with HTTPError. code=%s reason=%s body=%s",
+                getattr(exc, "code", ""),
+                getattr(exc, "reason", ""),
+                body,
+            )
+            return
+        except urllib.error.URLError as exc:
+            log_update_exception("Update check failed with URLError. reason=%s", getattr(exc, "reason", exc))
+            return
         except Exception:
+            log_update_exception("Update check failed before release payload could be processed.")
             return
 
-        latest_tag = str(payload.get("tag_name") or payload.get("name") or "").strip()
-        if not latest_tag:
-            return
-        latest_version = latest_tag.lstrip("vV")
-        if not is_newer_version(latest_version, APP_VERSION):
-            return
+        try:
+            latest_tag = str(payload.get("tag_name") or payload.get("name") or "").strip()
+            release_url = str(payload.get("html_url") or UPDATE_RELEASES_PAGE_URL).strip()
+            assets = payload.get("assets") if isinstance(payload, dict) else []
+            asset_names = [
+                str(asset.get("name") or "")
+                for asset in (assets or [])
+                if isinstance(asset, dict)
+            ]
+            log_update_event(
+                "Release payload parsed. latest_tag=%s release_url=%s asset_count=%s assets=%s",
+                latest_tag,
+                release_url,
+                len(asset_names),
+                asset_names,
+            )
+            if not latest_tag:
+                log_update_event("Update check stopped: release payload did not contain tag_name or name.")
+                return
+            latest_version = latest_tag.lstrip("vV")
+            if not is_newer_version(latest_version, APP_VERSION):
+                log_update_event(
+                    "No update required. installed_version=%s latest_version=%s",
+                    APP_VERSION,
+                    latest_version,
+                )
+                return
 
-        installer_asset = find_installer_asset(payload)
-        update_info = {
-            "latest_version": latest_version,
-            "release_url": str(payload.get("html_url") or UPDATE_RELEASES_PAGE_URL).strip(),
-            "release_name": str(payload.get("name") or latest_tag).strip(),
-            "release_notes": str(payload.get("body") or "").strip(),
-            "installer_name": installer_asset.get("name", ""),
-            "installer_url": installer_asset.get("url", ""),
-            "installer_size": installer_asset.get("size", 0),
-        }
-        self.update_check_signals.update_available.emit(update_info)
+            installer_asset = find_installer_asset(payload)
+            log_update_event(
+                "Update available. installed_version=%s latest_version=%s installer_name=%s installer_url_present=%s installer_size=%s",
+                APP_VERSION,
+                latest_version,
+                installer_asset.get("name", ""),
+                bool(installer_asset.get("url", "")),
+                installer_asset.get("size", 0),
+            )
+            update_info = {
+                "latest_version": latest_version,
+                "release_url": release_url,
+                "release_name": str(payload.get("name") or latest_tag).strip(),
+                "release_notes": str(payload.get("body") or "").strip(),
+                "installer_name": installer_asset.get("name", ""),
+                "installer_url": installer_asset.get("url", ""),
+                "installer_size": installer_asset.get("size", 0),
+            }
+            self.update_check_signals.update_available.emit(update_info)
+        except Exception:
+            log_update_exception("Update check failed while processing release details.")
 
     def show_update_available_message(self, update_info):
         update_info = update_info or {}
@@ -6006,25 +6197,42 @@ class MainWindow(QMainWindow):
             )
             message.addButton("Open Release Page", QMessageBox.AcceptRole)
         message.addButton("Not Now", QMessageBox.RejectRole)
+        log_update_event(
+            "Showing update prompt. latest_version=%s installer_name=%s installer_url_present=%s release_url=%s",
+            latest_version,
+            installer_name,
+            bool(installer_url),
+            release_url,
+        )
         message.exec()
 
         clicked = message.clickedButton()
         clicked_text = clicked.text() if clicked is not None else ""
+        log_update_event("Update prompt closed. clicked_button=%s", clicked_text)
         if install_button is not None and clicked == install_button:
             self.download_and_install_update(update_info)
         elif "Open Release" in clicked_text and release_url:
+            log_update_event("Opening release page: %s", release_url)
             QDesktopServices.openUrl(QUrl(release_url))
 
     def download_and_install_update(self, update_info):
         installer_url = str((update_info or {}).get("installer_url") or "").strip()
+        log_update_event(
+            "Download/install requested. update_info_keys=%s installer_url_present=%s",
+            sorted((update_info or {}).keys()),
+            bool(installer_url),
+        )
         if not installer_url:
+            log_update_event("Download/install stopped: release has no installer URL.")
             QMessageBox.warning(
                 self,
                 "Update Installer Missing",
-                "This release does not have an installer attached. Open the GitHub release page and download it manually.",
+                "This release does not have an installer attached. Open the GitHub release page and download it manually.\n\n"
+                f"Update log:\n{update_log_location_text()}",
             )
             release_url = str((update_info or {}).get("release_url") or UPDATE_RELEASES_PAGE_URL).strip()
             if release_url:
+                log_update_event("Opening release page because installer is missing: %s", release_url)
                 QDesktopServices.openUrl(QUrl(release_url))
             return
 
@@ -6037,6 +6245,13 @@ class MainWindow(QMainWindow):
         update_dir.mkdir(parents=True, exist_ok=True)
         installer_path = update_dir / asset_name
         download_path = installer_path.with_suffix(installer_path.suffix + ".download")
+        log_update_event(
+            "Prepared update download paths. update_dir=%s asset_name=%s installer_path=%s download_path=%s",
+            update_dir,
+            asset_name,
+            installer_path,
+            download_path,
+        )
 
         progress = QProgressDialog("Downloading Windsor Widget update...", "Cancel", 0, 100, self)
         progress.setWindowTitle("Downloading Update")
@@ -6049,11 +6264,19 @@ class MainWindow(QMainWindow):
                 installer_url,
                 headers={"User-Agent": f"WindsorWidget/{APP_VERSION}"},
             )
-            with urllib.request.urlopen(request, timeout=30) as response:
+            log_update_event("Starting installer download. url=%s", installer_url)
+            ssl_context = build_update_ssl_context()
+            with urllib.request.urlopen(request, timeout=30, context=ssl_context) as response:
                 try:
                     total_bytes = int(response.headers.get("Content-Length") or 0)
                 except Exception:
                     total_bytes = 0
+                log_update_event(
+                    "Installer download response received. status=%s content_length=%s content_type=%s",
+                    getattr(response, "status", "unknown"),
+                    total_bytes,
+                    response.headers.get("Content-Type", ""),
+                )
                 downloaded_bytes = 0
                 with open(download_path, "wb") as handle:
                     while True:
@@ -6076,17 +6299,26 @@ class MainWindow(QMainWindow):
                     pass
             download_path.replace(installer_path)
             progress.setValue(100)
+            log_update_event(
+                "Installer download completed. downloaded_bytes=%s installer_path=%s exists=%s size=%s",
+                downloaded_bytes,
+                installer_path,
+                installer_path.exists(),
+                installer_path.stat().st_size if installer_path.exists() else 0,
+            )
         except Exception as exc:
+            log_update_exception("Update download failed. installer_url=%s download_path=%s", installer_url, download_path)
             try:
                 if download_path.exists():
                     download_path.unlink()
+                    log_update_event("Partial update download removed: %s", download_path)
             except Exception:
-                pass
+                log_update_exception("Could not remove partial update download: %s", download_path)
             progress.close()
             QMessageBox.warning(
                 self,
                 "Update Download Failed",
-                f"The update could not be downloaded.\n\n{exc}",
+                f"The update could not be downloaded.\n\n{exc}\n\nUpdate log:\n{update_log_location_text()}",
             )
             return
         finally:
@@ -6099,29 +6331,37 @@ class MainWindow(QMainWindow):
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.Yes,
         )
+        log_update_event("Install confirmation reply=%s", "Yes" if reply == QMessageBox.Yes else "No")
         if reply != QMessageBox.Yes:
+            log_update_event("Install cancelled by user after download. installer_path=%s", installer_path)
             return
 
         if not self.launch_update_installer_and_close(installer_path):
+            log_update_event("Update launcher returned False. installer_path=%s", installer_path)
             QMessageBox.warning(
                 self,
                 "Update Launch Failed",
-                f"The installer was downloaded, but could not be started.\n\nInstaller location:\n{installer_path}",
+                f"The installer was downloaded, but could not be started.\n\nInstaller location:\n{installer_path}\n\nUpdate log:\n{update_log_location_text()}",
             )
 
     def launch_update_installer_and_close(self, installer_path):
         installer_path = Path(installer_path)
+        log_update_event("Preparing to launch update installer. installer_path=%s", installer_path)
         if not installer_path.exists():
+            log_update_event("Installer launch stopped: file does not exist. installer_path=%s", installer_path)
             return False
 
         try:
             if os.name == "nt":
                 batch_path = installer_path.with_name(f"run_windsor_update_{os.getpid()}.cmd")
+                log_path = get_update_log_path()
                 batch_text = (
                     "@echo off\r\n"
                     "setlocal\r\n"
                     f"set \"APP_PID={os.getpid()}\"\r\n"
                     f"set \"INSTALLER={installer_path}\"\r\n"
+                    f"set \"UPDATE_LOG={log_path}\"\r\n"
+                    "echo [%DATE% %TIME%] [BATCH] Waiting for Windsor Widget PID %APP_PID% to close...>>\"%UPDATE_LOG%\"\r\n"
                     "echo Waiting for Windsor Widget to close...\r\n"
                     ":wait_for_app\r\n"
                     "tasklist /FI \"PID eq %APP_PID%\" 2>NUL | findstr /R /C:\"%APP_PID%\" >NUL\r\n"
@@ -6129,11 +6369,19 @@ class MainWindow(QMainWindow):
                     "    timeout /t 1 /nobreak >NUL\r\n"
                     "    goto wait_for_app\r\n"
                     ")\r\n"
+                    "if not exist \"%INSTALLER%\" (\r\n"
+                    "    echo [%DATE% %TIME%] [BATCH] Installer missing: %INSTALLER%>>\"%UPDATE_LOG%\"\r\n"
+                    "    exit /b 2\r\n"
+                    ")\r\n"
+                    "echo [%DATE% %TIME%] [BATCH] Starting installer: %INSTALLER%>>\"%UPDATE_LOG%\"\r\n"
                     "echo Starting installer...\r\n"
                     "start \"\" \"%INSTALLER%\"\r\n"
+                    "set \"START_ERROR=%ERRORLEVEL%\"\r\n"
+                    "echo [%DATE% %TIME%] [BATCH] start command returned %START_ERROR%>>\"%UPDATE_LOG%\"\r\n"
                     "endlocal\r\n"
                 )
                 batch_path.write_text(batch_text, encoding="utf-8")
+                log_update_event("Update launcher batch written. batch_path=%s log_path=%s", batch_path, log_path)
                 creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
                 subprocess.Popen(
                     f'start "" "{batch_path}"',
@@ -6141,15 +6389,20 @@ class MainWindow(QMainWindow):
                     cwd=str(installer_path.parent),
                     creationflags=creationflags,
                 )
+                log_update_event("Update launcher batch started. batch_path=%s", batch_path)
             else:
                 subprocess.Popen([str(installer_path)], cwd=str(installer_path.parent))
+                log_update_event("Non-Windows update installer process started. installer_path=%s", installer_path)
         except Exception:
+            log_update_exception("Failed to launch update installer. installer_path=%s", installer_path)
             return False
 
         app = QApplication.instance()
         if app is not None:
+            log_update_event("Closing app so updater can run.")
             QTimer.singleShot(250, app.quit)
         else:
+            log_update_event("Closing main window so updater can run.")
             self.close()
         return True
 
