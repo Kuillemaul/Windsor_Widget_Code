@@ -107,7 +107,7 @@ from yu_order_workflow import YUOrderEntryDialog, load_yu_review_module
 TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
 TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
 TABLE_FORMAT_SETTINGS_PREFIX = "table_format"
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.1.3"
 APP_DESIGNER = "Bradley Mayze"
 UPDATE_REPO_OWNER = "Kuillemaul"
 UPDATE_REPO_NAME = "Windsor_Widget_Code"
@@ -266,18 +266,58 @@ def qt_object_is_alive(obj):
     except Exception:
         return True
 
+TABLE_SORT_ROLE = Qt.UserRole + 950
+
+
+def _sortable_role_value(item):
+    """Return the value used for table/model sorting without disturbing existing UserRole data."""
+    if item is None:
+        return None
+    value = None
+    try:
+        value = item.data(TABLE_SORT_ROLE)
+    except Exception:
+        value = None
+    if value is None:
+        try:
+            value = item.data(Qt.UserRole)
+        except Exception:
+            value = None
+    # Some existing cells use Qt.UserRole for click metadata dictionaries.
+    # Those are not sortable values, so fall back to the visible text.
+    if isinstance(value, (dict, list, tuple, set)):
+        return None
+    return value
+
+
+def _compare_sort_values(left, right, fallback_left="", fallback_right=""):
+    if left is None and right is None:
+        return str(fallback_left) < str(fallback_right)
+    left = "" if left is None else left
+    right = "" if right is None else right
+    try:
+        return left < right
+    except Exception:
+        return str(left) < str(right)
+
+
 class SortableTableWidgetItem(QTableWidgetItem):
     def __lt__(self, other):
         if isinstance(other, QTableWidgetItem):
-            left = self.data(Qt.UserRole)
-            right = other.data(Qt.UserRole)
+            left = _sortable_role_value(self)
+            right = _sortable_role_value(other)
             if left is not None or right is not None:
-                left = "" if left is None else left
-                right = "" if right is None else right
-                try:
-                    return left < right
-                except Exception:
-                    return str(left) < str(right)
+                return _compare_sort_values(left, right, self.text(), other.text())
+        return super().__lt__(other)
+
+
+class SortableStandardItem(QStandardItem):
+    def __lt__(self, other):
+        if isinstance(other, QStandardItem):
+            left = _sortable_role_value(self)
+            right = _sortable_role_value(other)
+            if left is not None or right is not None:
+                return _compare_sort_values(left, right, self.text(), other.text())
         return super().__lt__(other)
 
 
@@ -2084,6 +2124,16 @@ class ShipmentsWindow(QMainWindow):
             return self.normalise_status_value(value)
         return str(value)
 
+    def shipment_sort_value_for_field(self, field_name, value):
+        if field_name in {"entry_date", "ready_date", "shipment_date", "due_date"}:
+            parsed = self.parse_shipment_date(value)
+            return parsed.toordinal() if parsed is not None else -1
+        if field_name == "qty":
+            numeric = self.main_window.parse_float(value)
+            if abs(numeric) > 0.000001 or str(value or "").strip() in {"0", "0.0", "0.00"}:
+                return numeric
+        return str(value or "").casefold()
+
     def current_shipment_type_filter(self):
         filter_combo = getattr(self, "_shipment_filter_combo", None)
         if filter_combo is None:
@@ -2144,7 +2194,9 @@ class ShipmentsWindow(QMainWindow):
                 row_index = table.rowCount()
                 table.insertRow(row_index)
                 for column_index, (_header, field_name) in enumerate(SHIPMENT_FIELD_MAP):
-                    item = QTableWidgetItem(self.format_cell_text(field_name, row_data[field_name]))
+                    display_text = self.format_cell_text(field_name, row_data[field_name])
+                    item = SortableTableWidgetItem(display_text)
+                    item.setData(TABLE_SORT_ROLE, self.shipment_sort_value_for_field(field_name, display_text))
                     if column_index == 0:
                         item.setData(self.RECORD_ID_ROLE, row_data["id"])
                     if field_name in {"entry_date", "shipment_type", "qty", "ready_date", "shipment_date", "due_date", "status"}:
@@ -2192,6 +2244,7 @@ class ShipmentsWindow(QMainWindow):
                 values[field_name] = normalised_value
                 if item.text() != normalised_value:
                     item.setText(normalised_value)
+                item.setData(TABLE_SORT_ROLE, self.shipment_sort_value_for_field(field_name, normalised_value))
                 if field_name in {"entry_date", "shipment_type", "qty", "ready_date", "shipment_date", "due_date", "status"}:
                     item.setTextAlignment(Qt.AlignCenter)
         finally:
@@ -4779,6 +4832,40 @@ class Ui_MainWindow(object):
         details_layout.addWidget(self.customerSummaryHelp_textBrowser)
         details_layout.addStretch(1)
 
+        self.customerTrend_frame = QFrame(self.customerDetails_frame)
+        self.customerTrend_frame.setObjectName("customerTrend_frame")
+        self.customerTrend_frame.setProperty("role", "sideMetricSection")
+        self.customerTrend_frame.setFrameShape(QFrame.StyledPanel)
+        self.customerTrend_frame.setMinimumHeight(118)
+        self.customerTrend_frame.setMaximumHeight(150)
+        customer_trend_layout = QVBoxLayout(self.customerTrend_frame)
+        customer_trend_layout.setContentsMargins(8, 7, 8, 8)
+        customer_trend_layout.setSpacing(6)
+
+        self.customerTrendTitle_label = QLabel("Trend", self.customerTrend_frame)
+        self.customerTrendTitle_label.setObjectName("customerTrendTitle_label")
+        self.customerTrendTitle_label.setProperty("role", "sectionTitle")
+        self.customerTrendTitle_label.setAlignment(Qt.AlignCenter)
+        customer_trend_layout.addWidget(self.customerTrendTitle_label)
+
+        self.customerTrendMode_label = QLabel("3/3 Trend", self.customerTrend_frame)
+        self.customerTrendMode_label.setObjectName("customerTrendMode_label")
+        self.customerTrendMode_label.setProperty("role", "sideMetricLabel")
+        self.customerTrendMode_label.setAlignment(Qt.AlignCenter)
+        self.customerTrendMode_label.setFrameShape(QFrame.StyledPanel)
+        self.customerTrendMode_label.setMinimumHeight(30)
+        customer_trend_layout.addWidget(self.customerTrendMode_label)
+
+        self.customerTrendValue_box = QLabel("No data", self.customerTrend_frame)
+        self.customerTrendValue_box.setObjectName("customerTrendValue_box")
+        self.customerTrendValue_box.setProperty("role", "sideMetricValue")
+        self.customerTrendValue_box.setAlignment(Qt.AlignCenter)
+        self.customerTrendValue_box.setFrameShape(QFrame.StyledPanel)
+        self.customerTrendValue_box.setMinimumHeight(34)
+        customer_trend_layout.addWidget(self.customerTrendValue_box)
+
+        details_layout.addWidget(self.customerTrend_frame)
+
     def _build_item_summary_page(self):
         self.itemSummary_page, layout = self._page("itemSummary_page", "Item Summary")
         layout.setContentsMargins(8, 6, 8, 8)
@@ -5129,9 +5216,10 @@ class Ui_MainWindow(object):
             [
                 ("suggestedOrder_label", "Suggested", "suggestedOrder_box", 112),
                 ("atRisk_label", "At Risk", "atRisk_box", 112),
-                ("trendingOrder_label", "Trend", "trendingOrder_box", 112),
+                ("trendingOrder_label", "3/3 Trend", "trendingOrder_box", 112),
                 ("seasonalOrder_label", "Seasonal", "seasonalOrder_box", 112),
                 ("adjustedOrder_label", "Adjusted", "adjustedOrder_box", 112),
+                ("yearOnYear_label", "YoY Var", "yearOnYear_box", 112),
             ],
         )
 
@@ -5661,11 +5749,23 @@ class Ui_MainWindow(object):
         self.orderAnalysisClear_button.setObjectName("orderAnalysisClear_button")
         self.orderAnalysisExport_button = QPushButton("Export", self.frame_39)
         self.orderAnalysisExport_button.setObjectName("orderAnalysisExport_button")
+        self.orderAnalysisCritical_button = QPushButton("Critical", self.frame_39)
+        self.orderAnalysisCritical_button.setObjectName("orderAnalysisCritical_button")
+        self.orderAnalysisClear_button.setToolTip("Clear the current Order Analysis selection and table.")
+        self.orderAnalysisExport_button.setToolTip("Export the currently displayed Order Analysis table to Excel.")
+        self.orderAnalysisCritical_button.setToolTip(
+            "Show Critical Order Analysis across all suppliers. This ignores the Supplier / Group box and scans every item. "
+            "Criteria: Sales for the selected period must be greater than 0, and either At Risk is greater than 0 "
+            "or stock cover is under one month. Stock cover is calculated as SOH + On Order Form + On Next Container "
+            "+ Shipped Container compared with Avg Monthly Sales. The Special Order / Phase Out / Obsolete checkboxes "
+            "still control whether those statuses are included."
+        )
         for widget in (
             self.enterSupplier_label,
             self.customer_lineEdit,
             self.orderAnalysisClear_button,
             self.orderAnalysisExport_button,
+            self.orderAnalysisCritical_button,
         ):
             self.horizontalLayout_14.addWidget(widget)
         self.horizontalLayout_14.addStretch(1)
@@ -5879,7 +5979,12 @@ class MainWindow(QMainWindow):
         self.current_customer_pivot = {}
         self.current_customer_name = None
         self.current_customer_file_path = None
+        self.current_customer_matched_customers = []
+        self.current_customer_selected_item_number = None
         self.current_item_number = None
+        self.item_trend_comparison_months = 3
+        self.customer_trend_modes = ("3v3", "6v6", "yoy")
+        self.customer_trend_mode_index = 0
         self._last_item_total_value = 0.0
         self.customer_file_preview_dialog = None
         self.sales_table_frozen_helper = None
@@ -5895,6 +6000,8 @@ class MainWindow(QMainWindow):
         self.default_period_start_qdate = QDate.currentDate()
         self.default_period_end_qdate = QDate.currentDate()
         self.order_analysis_load_button = None
+        self.order_analysis_critical_button = None
+        self.current_order_analysis_critical_only = False
         self.lead_time_picker = getattr(self.ui, "leadTimePicker", None)
         self.customer_chart_view = None
         self.item_chart_view = None
@@ -7780,6 +7887,20 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+        for object_name in ("trendingOrder_label", "customerTrendTitle_label", "customerTrendMode_label", "customerTrendValue_box"):
+            widget = getattr(self.ui, object_name, None)
+            if widget is None:
+                continue
+            widget.installEventFilter(self)
+            widget.setCursor(Qt.PointingHandCursor)
+            try:
+                if object_name == "trendingOrder_label":
+                    widget.setToolTip("Double-click to switch between 3/3 Trend and 6/6 Trend.")
+                else:
+                    widget.setToolTip("Double-click to cycle Trend through 3/3 Trend, 6/6 Trend, and Year on Year.")
+            except Exception:
+                pass
+
     # -----------------------------
     # Database helpers
     # -----------------------------
@@ -8918,7 +9039,9 @@ class MainWindow(QMainWindow):
             table.setItem(row, self.on_order_supplier_column, supplier_item)
 
             ready_date_text = self.format_on_order_ready_date(line.get("ready_date", ""))
-            table.setItem(row, self.on_order_ready_date_column, self.make_order_table_item(ready_date_text, editable=True, align=Qt.AlignCenter))
+            ready_date_item = self.make_order_table_item(ready_date_text, editable=True, align=Qt.AlignCenter)
+            ready_date_item.setData(TABLE_SORT_ROLE, self.sort_date_value(ready_date_text))
+            table.setItem(row, self.on_order_ready_date_column, ready_date_item)
             table.setItem(row, self.on_order_comments_column, self.make_order_table_item(line.get("comments", ""), editable=True))
             table.setItem(row, self.on_order_status_column, self.build_on_order_status_item(line.get("status", "")))
             table.setItem(row, self.on_order_add_column, self.build_on_order_add_item())
@@ -9500,6 +9623,7 @@ class MainWindow(QMainWindow):
             self._updating_on_order_table = True
             item.setText(self.format_value(new_qty))
             item.setData(Qt.UserRole, new_qty)
+            item.setData(TABLE_SORT_ROLE, new_qty)
             self.apply_on_order_row_styles(item.row())
             self._updating_on_order_table = False
             self.save_on_order_table_state()
@@ -9516,6 +9640,7 @@ class MainWindow(QMainWindow):
 
             self._updating_on_order_table = True
             item.setText(self.format_on_order_ready_date(parsed))
+            item.setData(TABLE_SORT_ROLE, self.sort_date_value(parsed))
             self.apply_on_order_row_styles(item.row())
             self._updating_on_order_table = False
             self.save_on_order_table_state()
@@ -10879,8 +11004,10 @@ class MainWindow(QMainWindow):
 
             supplier_button = QPushButton("Supplier", mode_frame)
             supplier_button.setObjectName("orderAnalysisSupplierMode_button")
+            supplier_button.setToolTip("Analyse items by supplier. Double-click to open the supplier selection list.")
             group_button = QPushButton("Groups", mode_frame)
             group_button.setObjectName("orderAnalysisGroupMode_button")
+            group_button.setToolTip("Analyse items by product group. Double-click to open the group selection list.")
             for button in (supplier_button, group_button):
                 button.setCheckable(True)
                 button.setMinimumWidth(150)
@@ -10945,7 +11072,8 @@ class MainWindow(QMainWindow):
             load_button.setObjectName("orderAnalysisLoad_button")
             load_button.setMinimumHeight(32)
             load_button.setMaximumHeight(32)
-            load_button.clicked.connect(self.load_order_analysis)
+            load_button.setToolTip("Run the full Order Analysis for the selected supplier/group and date range. Shows items with a suggested order or at-risk quantity.")
+            load_button.clicked.connect(lambda _checked=False: self.load_order_analysis(show_warning=True, critical_only=False))
             controls_layout.addWidget(load_button)
 
             filter_frame = QFrame(controls_frame)
@@ -10957,6 +11085,9 @@ class MainWindow(QMainWindow):
             show_special = QCheckBox("Special Order", filter_frame)
             show_phase_out = QCheckBox("Phase Out", filter_frame)
             show_obsolete = QCheckBox("Obsolete", filter_frame)
+            show_special.setToolTip("Include Special Order items in the Order Analysis results. Active items are always shown.")
+            show_phase_out.setToolTip("Include Phase Out items in the Order Analysis results. Active items are always shown.")
+            show_obsolete.setToolTip("Include Obsolete items in the Order Analysis results. Active items are always shown.")
             for checkbox in (show_special, show_phase_out, show_obsolete):
                 checkbox.setChecked(False)
                 checkbox.toggled.connect(self.apply_order_analysis_filters)
@@ -12024,6 +12155,7 @@ class MainWindow(QMainWindow):
 
         self.setup_order_analysis_clear_button()
         self.setup_order_analysis_export_button()
+        self.setup_order_analysis_critical_button()
 
     def setup_order_analysis_clear_button(self):
         supplier_edit = self.get_order_analysis_supplier_edit()
@@ -12041,6 +12173,10 @@ class MainWindow(QMainWindow):
             clear_button.setMaximumHeight(32)
             layout.addWidget(clear_button)
             self.ui.orderAnalysisClear_button = clear_button
+        try:
+            clear_button.setToolTip("Clear the current Order Analysis selection and table.")
+        except Exception:
+            pass
         if not bool(clear_button.property("_order_analysis_clear_connected")):
             clear_button.clicked.connect(self.clear_order_analysis_page)
             clear_button.setProperty("_order_analysis_clear_connected", True)
@@ -12061,9 +12197,59 @@ class MainWindow(QMainWindow):
             export_button.setMaximumHeight(32)
             layout.addWidget(export_button)
             self.ui.orderAnalysisExport_button = export_button
+        try:
+            export_button.setToolTip("Export the currently displayed Order Analysis table to Excel.")
+        except Exception:
+            pass
         if not bool(export_button.property("_order_analysis_export_connected")):
             export_button.clicked.connect(self.export_order_analysis_to_excel)
             export_button.setProperty("_order_analysis_export_connected", True)
+
+    def setup_order_analysis_critical_button(self):
+        export_button = getattr(self.ui, "orderAnalysisExport_button", None)
+        if export_button is not None:
+            parent = export_button.parentWidget()
+            layout = parent.layout() if parent is not None else None
+        else:
+            supplier_edit = self.get_order_analysis_supplier_edit()
+            parent = supplier_edit.parentWidget() if supplier_edit is not None else None
+            layout = parent.layout() if parent is not None else None
+        if parent is None or layout is None:
+            return
+
+        critical_button = getattr(self.ui, "orderAnalysisCritical_button", None)
+        if critical_button is None:
+            critical_button = QPushButton("Critical", parent)
+            critical_button.setObjectName("orderAnalysisCritical_button")
+            critical_button.setMinimumHeight(32)
+            critical_button.setMaximumHeight(32)
+            if export_button is not None:
+                insert_index = layout.indexOf(export_button) + 1
+                if insert_index <= 0:
+                    layout.addWidget(critical_button)
+                else:
+                    layout.insertWidget(insert_index, critical_button)
+            else:
+                layout.addWidget(critical_button)
+            self.ui.orderAnalysisCritical_button = critical_button
+
+        self.order_analysis_critical_button = critical_button
+        try:
+            critical_button.setToolTip(self.order_analysis_critical_tooltip())
+        except Exception:
+            pass
+        if not bool(critical_button.property("_order_analysis_critical_connected")):
+            critical_button.clicked.connect(lambda _checked=False: self.load_order_analysis_critical())
+            critical_button.setProperty("_order_analysis_critical_connected", True)
+
+    def order_analysis_critical_tooltip(self):
+        return (
+            "Show Critical Order Analysis across all suppliers. This ignores the Supplier / Group box and scans every item. "
+            "Criteria: Sales for the selected period must be greater than 0, and either At Risk is greater than 0 "
+            "or stock cover is under one month. Stock cover is calculated as SOH + On Order Form + On Next Container "
+            "+ Shipped Container compared with Avg Monthly Sales. The Special Order / Phase Out / Obsolete checkboxes "
+            "still control whether those statuses are included."
+        )
 
     def handle_order_analysis_header_double_click(self, logical_index):
         table = self.get_order_analysis_table()
@@ -12098,6 +12284,7 @@ class MainWindow(QMainWindow):
             table.clearSelection()
         self.current_order_analysis_supplier = None
         self.current_order_analysis_filter_value = None
+        self.current_order_analysis_critical_only = False
         self._order_analysis_all_rows = []
 
     def export_order_analysis_to_excel(self):
@@ -12110,10 +12297,16 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Export Order Analysis", "There is no order analysis data to export.")
             return
 
-        mode_label = "Product Group" if self.get_order_analysis_mode() == "group" else "Supplier"
-        selected_name = (self.current_order_analysis_filter_value or self.current_order_analysis_supplier or "").strip()
+        is_critical_export = bool(getattr(self, "current_order_analysis_critical_only", False))
+        if is_critical_export:
+            mode_label = "Scope"
+            selected_name = "All suppliers"
+        else:
+            mode_label = "Product Group" if self.get_order_analysis_mode() == "group" else "Supplier"
+            selected_name = (self.current_order_analysis_filter_value or self.current_order_analysis_supplier or "").strip()
         safe_supplier = re.sub(r"[^A-Za-z0-9._-]+", "_", selected_name or "order_analysis").strip("_") or "order_analysis"
-        default_filename = f"{safe_supplier}_order_analysis.xlsx"
+        export_view = "critical" if is_critical_export else "order_analysis"
+        default_filename = f"{safe_supplier}_{export_view}.xlsx"
         home_dir = str(Path.home() / default_filename)
         export_path, _ = QFileDialog.getSaveFileName(
             self,
@@ -12152,6 +12345,7 @@ class MainWindow(QMainWindow):
 
         meta_rows = [
             (mode_label, selected_name or ""),
+            ("View", "Critical only" if bool(getattr(self, "current_order_analysis_critical_only", False)) else "Suggested / At Risk"),
             ("Period From", period_from.strftime("%d/%m/%Y") if period_from is not None else ""),
             ("Period To", period_to.strftime("%d/%m/%Y") if period_to is not None else ""),
             ("Months in Period", months_in_period if months_in_period else ""),
@@ -12232,6 +12426,7 @@ class MainWindow(QMainWindow):
             ("Shipped Container", "Inbound quantity already shipped and due within the calculation horizon."),
             ("Suggested Order", "Max(0, lead-time demand - (SOH + hard inbound by horizon)), then rounded to carton/pallet rules."),
             ("At Risk", "Max(0, demand until the earliest inbound or cutoff - supply available before that cutoff), then rounded to carton/pallet rules."),
+            ("Critical view", "Scans all suppliers/items, ignoring the Supplier / Group box. Sales for the selected period must be greater than 0, and either At Risk > 0 or SOH + On Order Form + On Next Container + Shipped Container is less than Avg Monthly Sales."),
             ("Lead-time demand", "Avg Monthly Sales multiplied by lead days divided by 30.4375."),
             ("Hard inbound", "Inbound quantities included in calculations up to the horizon date."),
             ("Rounding", "Order quantities are rounded using the item carton size and pallet size rules."),
@@ -13855,6 +14050,16 @@ class MainWindow(QMainWindow):
             if obj is freight_box or obj is freight_viewport:
                 flag_key = self.customer_flag_from_y_position(obj, event)
                 return self.toggle_customer_flag_for_current_customer(flag_key)
+            if obj is getattr(self.ui, "trendingOrder_label", None):
+                self.toggle_item_trend_comparison_window()
+                return True
+            if obj in (
+                getattr(self.ui, "customerTrendTitle_label", None),
+                getattr(self.ui, "customerTrendMode_label", None),
+                getattr(self.ui, "customerTrendValue_box", None),
+            ):
+                self.toggle_customer_trend_mode()
+                return True
             for object_name in self.item_summary_editable_fields:
                 if obj is getattr(self.ui, object_name, None):
                     self.edit_item_summary_field(object_name)
@@ -15045,7 +15250,7 @@ class MainWindow(QMainWindow):
             edit.setFocus()
 
     def make_order_table_item(self, text, editable=False, align=None, background=None, foreground=None, bold=False):
-        item = QTableWidgetItem("" if text is None else str(text))
+        item = SortableTableWidgetItem("" if text is None else str(text))
         flags = Qt.ItemIsSelectable | Qt.ItemIsEnabled
         if editable:
             flags |= Qt.ItemIsEditable
@@ -15991,6 +16196,21 @@ $mail.Display()
         numeric = self.parse_float(value)
         return f"{numeric:,.2f}"
 
+    def sort_text_value(self, value):
+        return str(value or "").strip().casefold()
+
+    def sort_number_value(self, value):
+        return self.parse_float(value)
+
+    def sort_date_value(self, value):
+        parsed = self.parse_date_value(value)
+        return parsed.toordinal() if parsed is not None else -1
+
+    def set_item_sort_value(self, item, value):
+        if item is not None:
+            item.setData(TABLE_SORT_ROLE, value)
+        return item
+
     def safe_text(self, value):
         if value is None:
             return ""
@@ -16478,50 +16698,174 @@ $mail.Display()
             "rounded": at_risk_rounded,
         }
 
-    def calculate_trending_adjustment(self, months, monthly_qty_map, lead_days, carton_size=0, pallet_size=0, today=None):
+    def shift_month_start(self, month_start, month_offset):
+        base = self.first_of_month(month_start)
+        month_index = (base.year * 12) + (base.month - 1) + int(month_offset)
+        year = month_index // 12
+        month = (month_index % 12) + 1
+        return date(year, month, 1)
+
+    def completed_year_windows(self, today=None):
         today = today or self.current_business_date()
         current_month_start = date(today.year, today.month, 1)
-        completed_months = [m for m in months if m < current_month_start]
-        if len(completed_months) < 2:
+        current_start = self.shift_month_start(current_month_start, -12)
+        current_end = current_month_start - timedelta(days=1)
+        previous_start = self.shift_month_start(current_month_start, -24)
+        previous_end = current_start - timedelta(days=1)
+        return current_start, current_end, previous_start, previous_end
+
+    def is_significant_variance(self, delta, previous_total, recent_total=0.0):
+        delta = self.parse_float(delta)
+        previous_total = self.parse_float(previous_total)
+        recent_total = self.parse_float(recent_total)
+        minimum_meaningful_units = 10.0
+        if abs(delta) < minimum_meaningful_units:
+            return False
+        if abs(previous_total) < 1e-9:
+            return abs(recent_total) >= minimum_meaningful_units
+        return abs(delta) >= max(minimum_meaningful_units, abs(previous_total) * 0.25)
+
+    def calculate_period_variance(self, months, monthly_qty_map, comparison_months=3, today=None):
+        today = today or self.current_business_date()
+        current_month_start = date(today.year, today.month, 1)
+        target_count = max(1, int(comparison_months or 3))
+        completed_months = sorted(m for m in (months or []) if m < current_month_start)
+        window_count = min(target_count, len(completed_months) // 2)
+        if window_count < 1:
             return {
+                "comparison_months": target_count,
                 "recent_count": len(completed_months),
                 "previous_count": 0,
+                "recent_total": 0.0,
+                "previous_total": 0.0,
                 "recent_avg": 0.0,
                 "previous_avg": 0.0,
-                "raw": 0.0,
-                "rounded": 0.0,
+                "delta": 0.0,
+                "percent_change": None,
+                "significant": False,
+                "recent_months": completed_months,
+                "previous_months": [],
             }
 
-        total_completed = len(completed_months)
-        if total_completed >= 4:
-            recent_count = 3
+        recent_months = completed_months[-window_count:]
+        previous_months = completed_months[-(window_count * 2):-window_count]
+        recent_total = sum(self.parse_float(monthly_qty_map.get(m, 0.0)) for m in recent_months)
+        previous_total = sum(self.parse_float(monthly_qty_map.get(m, 0.0)) for m in previous_months)
+        recent_avg = recent_total / len(recent_months) if recent_months else 0.0
+        previous_avg = previous_total / len(previous_months) if previous_months else 0.0
+        delta = recent_total - previous_total
+        percent_change = None if abs(previous_total) < 1e-9 else (delta / previous_total) * 100.0
+        significant = self.is_significant_variance(delta, previous_total, recent_total)
+        return {
+            "comparison_months": target_count,
+            "recent_count": len(recent_months),
+            "previous_count": len(previous_months),
+            "recent_total": recent_total,
+            "previous_total": previous_total,
+            "recent_avg": recent_avg,
+            "previous_avg": previous_avg,
+            "delta": delta,
+            "percent_change": percent_change,
+            "significant": significant,
+            "recent_months": recent_months,
+            "previous_months": previous_months,
+        }
+
+    def calculate_yoy_variance_from_totals(self, current_total, previous_total, current_start=None, current_end=None, previous_start=None, previous_end=None):
+        current_total = self.parse_float(current_total)
+        previous_total = self.parse_float(previous_total)
+        delta = current_total - previous_total
+        percent_change = None if abs(previous_total) < 1e-9 else (delta / previous_total) * 100.0
+        return {
+            "current_total": current_total,
+            "previous_total": previous_total,
+            "delta": delta,
+            "percent_change": percent_change,
+            "significant": self.is_significant_variance(delta, previous_total, current_total),
+            "current_start": current_start,
+            "current_end": current_end,
+            "previous_start": previous_start,
+            "previous_end": previous_end,
+        }
+
+    def format_percent_change(self, percent_change):
+        if percent_change is None:
+            return "new"
+        prefix = "+" if percent_change > 0 else ""
+        return f"{prefix}{percent_change:.1f}%"
+
+    def trend_value_stylesheet(self, significant, delta):
+        if not significant:
+            return ""
+        is_light = bool(getattr(self.ui, "radioLight", None) and self.ui.radioLight.isChecked())
+        delta = self.parse_float(delta)
+        if delta < 0:
+            if is_light:
+                bg, fg, border = "#ffe2e2", "#7f1d1d", "#e05a5a"
+            else:
+                bg, fg, border = "#5a1f1f", "#ffe2e2", "#e05a5a"
         else:
-            recent_count = max(1, total_completed - 1)
-        previous_count = min(3, total_completed - recent_count)
+            if is_light:
+                bg, fg, border = "#d9f2df", "#0f3b1d", "#38a169"
+            else:
+                bg, fg, border = "#164d2b", "#d9f2df", "#38a169"
+        return (
+            f"background-color: {bg}; "
+            f"color: {fg}; "
+            f"border: 2px solid {border}; "
+            f"border-radius: 6px; "
+            f"padding: 3px 6px; "
+            f"font-weight: 900;"
+        )
 
-        recent_months = completed_months[-recent_count:]
-        previous_months = completed_months[-(recent_count + previous_count):-recent_count] if previous_count > 0 else []
+    def apply_trend_value_style(self, object_name, significant=False, delta=0.0, tooltip=""):
+        widget = getattr(self.ui, object_name, None)
+        if widget is None:
+            return
+        try:
+            widget.setStyleSheet(self.trend_value_stylesheet(significant, delta))
+            widget.setToolTip(tooltip or "")
+        except Exception:
+            pass
 
-        if not previous_months:
+    def trend_comparison_label(self, comparison_months):
+        months_count = max(1, int(comparison_months or 3))
+        return f"Last {months_count} / Prev {months_count}"
+
+    def trend_box_title(self, comparison_months):
+        months_count = max(1, int(comparison_months or 3))
+        return f"{months_count}/{months_count} Trend"
+
+    def calculate_trending_adjustment(self, months, monthly_qty_map, lead_days, carton_size=0, pallet_size=0, today=None, comparison_months=3):
+        variance = self.calculate_period_variance(months, monthly_qty_map, comparison_months=comparison_months, today=today)
+        if variance.get("previous_count", 0) <= 0:
             return {
-                "recent_count": len(recent_months),
+                "comparison_months": variance.get("comparison_months", comparison_months),
+                "recent_count": variance.get("recent_count", 0),
                 "previous_count": 0,
                 "recent_avg": 0.0,
                 "previous_avg": 0.0,
+                "recent_total": 0.0,
+                "previous_total": 0.0,
+                "percent_change": None,
+                "significant": False,
                 "raw": 0.0,
                 "rounded": 0.0,
             }
 
-        recent_avg = sum(self.parse_float(monthly_qty_map.get(m, 0.0)) for m in recent_months) / len(recent_months)
-        previous_avg = sum(self.parse_float(monthly_qty_map.get(m, 0.0)) for m in previous_months) / len(previous_months)
-        monthly_delta = recent_avg - previous_avg
+        monthly_delta = self.parse_float(variance.get("recent_avg", 0.0)) - self.parse_float(variance.get("previous_avg", 0.0))
         trend_raw = monthly_delta * (lead_days / 30.4375)
         trend_rounded = self.round_order_quantity(trend_raw, carton_size, pallet_size)
         return {
-            "recent_count": len(recent_months),
-            "previous_count": len(previous_months),
-            "recent_avg": recent_avg,
-            "previous_avg": previous_avg,
+            "comparison_months": variance.get("comparison_months", comparison_months),
+            "recent_count": variance.get("recent_count", 0),
+            "previous_count": variance.get("previous_count", 0),
+            "recent_avg": variance.get("recent_avg", 0.0),
+            "previous_avg": variance.get("previous_avg", 0.0),
+            "recent_total": variance.get("recent_total", 0.0),
+            "previous_total": variance.get("previous_total", 0.0),
+            "percent_change": variance.get("percent_change"),
+            "significant": variance.get("significant", False),
             "raw": trend_raw,
             "rounded": trend_rounded,
         }
@@ -16681,7 +17025,7 @@ $mail.Display()
             "suggestedMin_box", "stockOnHand_box", "stockCommited_box", "stockOnOrder_box",
             "stockAvailable_box", "onOrderForm_box", "onNextContainer_box", "shippedContainer_box",
             "nextContainerETA_box", "shippedContainerETA_box", "suggestedOrder_box", "atRisk_box",
-            "seasonalOrder_box", "trendingOrder_box", "adjustedOrder_box",
+            "seasonalOrder_box", "trendingOrder_box", "adjustedOrder_box", "yearOnYear_box",
         ]
         for label_name in label_names:
             self.set_label_text(label_name, "")
@@ -16690,6 +17034,8 @@ $mail.Display()
             "shippedContainer_box", "shippedContainerETA_box",
         ):
             self.set_widget_warning_state(widget_name, False, "")
+        for widget_name in ("trendingOrder_box", "yearOnYear_box"):
+            self.apply_trend_value_style(widget_name, False, 0.0, "")
         self.populate_customer_purchase_table([])
 
     def set_numeric_box(self, object_name, value):
@@ -17052,8 +17398,16 @@ $mail.Display()
 
     def redraw_charts(self):
         if self.current_customer_pivot and self.current_customer_months:
-            totals = [sum(data["months"].get(m, 0.0) for data in self.current_customer_pivot.values()) for m in self.current_customer_months]
-            self.draw_monthly_line_chart(self.customer_chart_view, self.current_customer_months, totals, "Monthly Units")
+            selected_item = (getattr(self, "current_customer_selected_item_number", None) or "").strip()
+            if selected_item and selected_item in self.current_customer_pivot:
+                item_data = self.current_customer_pivot[selected_item]
+                totals = [item_data["months"].get(m, 0.0) for m in self.current_customer_months]
+                series_name = selected_item
+            else:
+                totals = [sum(data["months"].get(m, 0.0) for data in self.current_customer_pivot.values()) for m in self.current_customer_months]
+                series_name = "Monthly Units"
+            self.draw_monthly_line_chart(self.customer_chart_view, self.current_customer_months, totals, series_name)
+            self.update_customer_trend_panel()
         current_item = self.find_item_number(getattr(self.ui, "enterItem", None).text().strip()) if hasattr(self.ui, "enterItem") else None
         if current_item:
             self.load_item_summary()
@@ -17103,6 +17457,154 @@ $mail.Display()
                 intro.setText(f"Showing sales demand for {customer_name}{suffix}.")
             except Exception:
                 pass
+
+    def current_customer_trend_mode(self):
+        modes = getattr(self, "customer_trend_modes", ("3v3", "6v6", "yoy"))
+        index = int(getattr(self, "customer_trend_mode_index", 0) or 0)
+        if not modes:
+            return "3v3"
+        return modes[index % len(modes)]
+
+    def customer_trend_mode_label_text(self, mode=None):
+        mode = mode or self.current_customer_trend_mode()
+        if mode == "6v6":
+            return self.trend_box_title(6)
+        if mode == "yoy":
+            return "Year on Year"
+        return self.trend_box_title(3)
+
+    def toggle_customer_trend_mode(self):
+        modes = getattr(self, "customer_trend_modes", ("3v3", "6v6", "yoy"))
+        self.customer_trend_mode_index = (int(getattr(self, "customer_trend_mode_index", 0) or 0) + 1) % len(modes)
+        self.update_customer_trend_panel()
+
+    def toggle_item_trend_comparison_window(self):
+        self.item_trend_comparison_months = 6 if int(getattr(self, "item_trend_comparison_months", 3) or 3) == 3 else 3
+        label = getattr(self.ui, "trendingOrder_label", None)
+        if label is not None:
+            try:
+                label.setText(self.trend_box_title(self.item_trend_comparison_months))
+                label.setToolTip(
+                    f"Double-click to switch between 3/3 Trend and 6/6 Trend. Current mode: {self.trend_comparison_label(self.item_trend_comparison_months)}."
+                )
+            except Exception:
+                pass
+        current_item = self.find_item_number(getattr(self.ui, "enterItem", None).text().strip()) if hasattr(self.ui, "enterItem") else None
+        if current_item:
+            self.load_item_summary()
+
+    def customer_current_trend_qty_map(self):
+        if not self.current_customer_pivot or not self.current_customer_months:
+            return {}
+        selected_item = (getattr(self, "current_customer_selected_item_number", None) or "").strip()
+        if selected_item and selected_item in self.current_customer_pivot:
+            return dict(self.current_customer_pivot[selected_item].get("months", {}))
+        return {
+            month: sum(data.get("months", {}).get(month, 0.0) for data in self.current_customer_pivot.values())
+            for month in self.current_customer_months
+        }
+
+    def fetch_customer_sales_total(self, matched_customers, start_date, end_date, item_number=None):
+        if not matched_customers:
+            return 0.0
+        in_clause, in_params = self.sql_in_clause(matched_customers)
+        where_parts = ["DATE(sale_date) BETWEEN ? AND ?", f"customer_name IN {in_clause}"]
+        params = [start_date.isoformat(), end_date.isoformat(), *in_params]
+        item_number = (item_number or "").strip()
+        if item_number:
+            item_clause, item_params = self.build_sales_item_filter_clause([item_number])
+            where_parts.append(item_clause)
+            params.extend(item_params)
+        row = self.row_to_dict(self.db_one(
+            f"""
+            SELECT SUM(COALESCE(quantity, 0)) AS total_qty
+            FROM sales
+            WHERE {' AND '.join(where_parts)}
+            """,
+            params,
+        ))
+        return self.parse_float(row.get("total_qty", 0.0))
+
+    def calculate_customer_yoy_variance(self, item_number=None):
+        current_start, current_end, previous_start, previous_end = self.completed_year_windows()
+        customer_name = (getattr(self, "current_customer_name", None) or "").strip()
+        if not customer_name:
+            return self.calculate_yoy_variance_from_totals(0, 0, current_start, current_end, previous_start, previous_end)
+        matched_customers = getattr(self, "current_customer_matched_customers", None) or self.find_matching_customers(
+            customer_name, bool(getattr(self, "current_customer_combine_accounts", False))
+        )
+        current_total = self.fetch_customer_sales_total(matched_customers, current_start, current_end, item_number=item_number)
+        previous_total = self.fetch_customer_sales_total(matched_customers, previous_start, previous_end, item_number=item_number)
+        return self.calculate_yoy_variance_from_totals(current_total, previous_total, current_start, current_end, previous_start, previous_end)
+
+    def calculate_item_yoy_variance(self, item_numbers):
+        current_start, current_end, previous_start, previous_end = self.completed_year_windows()
+        current_total = sum(self.fetch_item_monthly_qty(item_numbers, current_start, current_end).values())
+        previous_total = sum(self.fetch_item_monthly_qty(item_numbers, previous_start, previous_end).values())
+        return self.calculate_yoy_variance_from_totals(current_total, previous_total, current_start, current_end, previous_start, previous_end)
+
+    def date_range_label(self, start_date, end_date):
+        if not start_date or not end_date:
+            return ""
+        return f"{start_date.strftime('%b %Y')} - {end_date.strftime('%b %Y')}"
+
+    def update_customer_trend_panel(self):
+        mode = self.current_customer_trend_mode()
+        mode_label = getattr(self.ui, "customerTrendMode_label", None)
+        value_box = getattr(self.ui, "customerTrendValue_box", None)
+        title_label = getattr(self.ui, "customerTrendTitle_label", None)
+        if title_label is not None:
+            title_label.setText("Trend")
+        if mode_label is not None:
+            mode_label.setText(self.customer_trend_mode_label_text(mode))
+        if value_box is None:
+            return
+
+        selected_item = (getattr(self, "current_customer_selected_item_number", None) or "").strip()
+        target_text = f"item {selected_item}" if selected_item else "all items"
+
+        if not self.current_customer_pivot or not self.current_customer_months:
+            value_box.setText("No data")
+            self.apply_trend_value_style("customerTrendValue_box", False, 0.0, "Search a customer to calculate the trend.")
+            return
+
+        if mode == "yoy":
+            result = self.calculate_customer_yoy_variance(selected_item or None)
+            value_box.setText(self.format_signed_value(result.get("delta", 0.0)))
+            tooltip = (
+                f"Year on year variance for {target_text}.\n"
+                f"Current 12 completed months ({self.date_range_label(result.get('current_start'), result.get('current_end'))}): "
+                f"{self.format_value(result.get('current_total', 0.0))}.\n"
+                f"Previous 12 completed months ({self.date_range_label(result.get('previous_start'), result.get('previous_end'))}): "
+                f"{self.format_value(result.get('previous_total', 0.0))}.\n"
+                f"Change: {self.format_signed_value(result.get('delta', 0.0))} ({self.format_percent_change(result.get('percent_change'))})."
+            )
+            self.apply_trend_value_style(
+                "customerTrendValue_box",
+                result.get("significant", False),
+                result.get("delta", 0.0),
+                tooltip,
+            )
+            return
+
+        comparison_months = 6 if mode == "6v6" else 3
+        monthly_qty_map = self.customer_current_trend_qty_map()
+        result = self.calculate_period_variance(self.current_customer_months, monthly_qty_map, comparison_months=comparison_months)
+        value_box.setText(self.format_signed_value(result.get("delta", 0.0)))
+        tooltip = (
+            f"Trend variance for {target_text}.\n"
+            f"Recent {result.get('recent_count', 0)} month total: {self.format_value(result.get('recent_total', 0.0))}.\n"
+            f"Previous {result.get('previous_count', 0)} month total: {self.format_value(result.get('previous_total', 0.0))}.\n"
+            f"Change: {self.format_signed_value(result.get('delta', 0.0))} ({self.format_percent_change(result.get('percent_change'))})."
+        )
+        if result.get("previous_count", 0) <= 0:
+            tooltip = "Not enough completed months in the selected range to compare trend windows."
+        self.apply_trend_value_style(
+            "customerTrendValue_box",
+            result.get("significant", False),
+            result.get("delta", 0.0),
+            tooltip,
+        )
 
     def search_customer_sales(self):
         typed_customer = self.ui.customerEdit.text() if hasattr(self.ui, "customerEdit") else ""
@@ -17194,6 +17696,8 @@ $mail.Display()
         self.current_customer_months = months
         self.current_customer_pivot = pivot
         self.current_customer_name = valid_customer
+        self.current_customer_matched_customers = matched_customers
+        self.current_customer_selected_item_number = None
         self.current_customer_combine_accounts = combine_accounts
         self.update_customer_summary_cards(
             valid_customer,
@@ -17213,6 +17717,7 @@ $mail.Display()
             [monthly_totals[m] for m in months],
             "Monthly Units",
         )
+        self.update_customer_trend_panel()
 
     def populate_customer_info(self, customer_name):
         table = getattr(self.ui, "customer_Info", None)
@@ -17687,17 +18192,36 @@ $mail.Display()
 
         for row_index, item_number in enumerate(item_numbers):
             item_data = pivot[item_number]
-            table.setItem(row_index, 0, QTableWidgetItem(item_number))
-            table.setItem(row_index, 1, QTableWidgetItem(item_data.get("description", "")))
-            table.setItem(row_index, 2, QTableWidgetItem(self.format_short_date(item_data.get("last_sale_date"))))
+
+            item_number_cell = SortableTableWidgetItem(item_number)
+            item_number_cell.setData(TABLE_SORT_ROLE, self.sort_text_value(item_number))
+            table.setItem(row_index, 0, item_number_cell)
+
+            description_text = item_data.get("description", "")
+            description_cell = SortableTableWidgetItem(description_text)
+            description_cell.setData(TABLE_SORT_ROLE, self.sort_text_value(description_text))
+            table.setItem(row_index, 1, description_cell)
+
+            last_sale_date = item_data.get("last_sale_date")
+            last_sale_cell = SortableTableWidgetItem(self.format_short_date(last_sale_date))
+            last_sale_cell.setData(TABLE_SORT_ROLE, self.sort_date_value(last_sale_date))
+            table.setItem(row_index, 2, last_sale_cell)
+
             last_price = item_data.get("last_price")
-            table.setItem(row_index, 3, QTableWidgetItem(self.format_price(last_price) if last_price is not None else ""))
-            table.setItem(row_index, 4, QTableWidgetItem(self.format_value(item_data.get("total_qty", 0.0))))
+            price_cell = SortableTableWidgetItem(self.format_price(last_price) if last_price is not None else "")
+            price_cell.setData(TABLE_SORT_ROLE, self.sort_number_value(last_price))
+            table.setItem(row_index, 3, price_cell)
+
+            total_qty = self.parse_float(item_data.get("total_qty", 0.0))
+            total_cell = SortableTableWidgetItem(self.format_value(total_qty))
+            total_cell.setData(TABLE_SORT_ROLE, total_qty)
+            table.setItem(row_index, 4, total_cell)
 
             for month_index, month_start in enumerate(months, start=5):
-                qty = item_data["months"].get(month_start, 0.0)
-                month_item = QTableWidgetItem(self.format_value(qty))
+                qty = self.parse_float(item_data["months"].get(month_start, 0.0))
+                month_item = SortableTableWidgetItem(self.format_value(qty))
                 month_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                month_item.setData(TABLE_SORT_ROLE, qty)
                 month_item.setData(Qt.UserRole, {
                     "item_number": item_number,
                     "month_start": month_start.isoformat(),
@@ -17748,8 +18272,10 @@ $mail.Display()
         if not item_data:
             return
 
+        self.current_customer_selected_item_number = item_number
         totals = [item_data["months"].get(month, 0.0) for month in self.current_customer_months]
         self.draw_monthly_line_chart(self.customer_chart_view, self.current_customer_months, totals, item_number)
+        self.update_customer_trend_panel()
 
     def handle_customer_table_double_click(self, row, column):
         table = getattr(self.ui, "salesTable", None)
@@ -17973,8 +18499,19 @@ $mail.Display()
                 self.format_price(extended_value),
                 self.format_price(freight_value) if freight_value else "",
             ]
+            sort_values = [
+                self.sort_date_value(line.get("sale_date")),
+                self.sort_text_value(customer_text),
+                self.sort_text_value(invoice_text),
+                self.sort_text_value(description_text),
+                qty_value,
+                price_value,
+                extended_value,
+                freight_value,
+            ]
             for col_index, value in enumerate(values):
-                item = QTableWidgetItem(value)
+                item = SortableTableWidgetItem(value)
+                item.setData(TABLE_SORT_ROLE, sort_values[col_index])
                 if col_index == 2:
                     item.setData(Qt.UserRole, invoice_text)
                     if invoice_text:
@@ -18111,8 +18648,19 @@ $mail.Display()
                 self.format_price(extended_value),
                 self.format_price(freight_value) if freight_value else "",
             ]
+            sort_values = [
+                self.sort_date_value(line.get("sale_date")),
+                self.sort_text_value(line.get("customer_name")),
+                self.sort_text_value(line.get("item_number")),
+                self.sort_text_value(line.get("description")),
+                qty_value,
+                price_value,
+                extended_value,
+                freight_value,
+            ]
             for col_index, value in enumerate(values):
-                item = QTableWidgetItem(value)
+                item = SortableTableWidgetItem(value)
+                item.setData(TABLE_SORT_ROLE, sort_values[col_index])
                 if col_index in (4, 5, 6, 7):
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 table.setItem(row_index, col_index, item)
@@ -18349,8 +18897,14 @@ $mail.Display()
             avg_monthly_qty, on_hand, inbound_context, lead_days, carton_size, pallet_size
         )
         trend_result = self.calculate_trending_adjustment(
-            months, monthly_qty, lead_days, carton_size, pallet_size
+            months,
+            monthly_qty,
+            lead_days,
+            carton_size,
+            pallet_size,
+            comparison_months=getattr(self, "item_trend_comparison_months", 3),
         )
+        year_on_year_result = self.calculate_item_yoy_variance(sales_item_numbers)
         arrival_date = inbound_context.get("horizon_date")
         seasonal_result = self.calculate_seasonal_adjustment(
             sales_item_numbers, avg_monthly_qty, arrival_date, lead_days, carton_size, pallet_size
@@ -18388,13 +18942,29 @@ $mail.Display()
 
         self.set_numeric_box("suggestedOrder_box", suggested_result["rounded"])
         self.set_numeric_box("atRisk_box", at_risk_result["rounded"])
+        self.set_label_text("trendingOrder_label", self.trend_box_title(trend_result.get("comparison_months", getattr(self, "item_trend_comparison_months", 3))))
         self.set_signed_box("trendingOrder_box", trend_result["rounded"])
         self.set_signed_box("seasonalOrder_box", seasonal_result["rounded"])
         self.set_numeric_box("adjustedOrder_box", adjusted_order)
+        self.set_signed_box("yearOnYear_box", year_on_year_result["delta"])
 
         trend_tooltip = (
-            f"Trend compares {trend_result['recent_count']} recent completed month(s) "
-            f"vs {trend_result['previous_count']} previous month(s)."
+            f"{self.trend_box_title(trend_result.get('comparison_months', 3))}: {self.trend_comparison_label(trend_result.get('comparison_months', 3))}. "
+            f"Compares {trend_result['recent_count']} recent completed month(s) "
+            f"vs {trend_result['previous_count']} previous month(s). "
+            f"Recent total {self.format_value(trend_result.get('recent_total', 0.0))}; "
+            f"previous total {self.format_value(trend_result.get('previous_total', 0.0))}; "
+            f"change {self.format_percent_change(trend_result.get('percent_change'))}. "
+            "Double-click the trend label to switch between 3/3 Trend and 6/6 Trend."
+        )
+        yoy_tooltip = (
+            f"Year on year variance for the current item. "
+            f"Current 12 completed months ({self.date_range_label(year_on_year_result.get('current_start'), year_on_year_result.get('current_end'))}): "
+            f"{self.format_value(year_on_year_result.get('current_total', 0.0))}. "
+            f"Previous 12 completed months ({self.date_range_label(year_on_year_result.get('previous_start'), year_on_year_result.get('previous_end'))}): "
+            f"{self.format_value(year_on_year_result.get('previous_total', 0.0))}. "
+            f"Change: {self.format_signed_value(year_on_year_result.get('delta', 0.0))} "
+            f"({self.format_percent_change(year_on_year_result.get('percent_change'))})."
         )
         seasonal_tooltip = (
             (
@@ -18410,7 +18980,21 @@ $mail.Display()
             if arrival_date else
             "Seasonal adjustment unavailable."
         )
-        self.set_widget_warning_state("trendingOrder_box", False, trend_tooltip)
+        self.apply_trend_value_style(
+            "trendingOrder_box",
+            trend_result.get("significant", False),
+            trend_result.get("raw", 0.0),
+            trend_tooltip,
+        )
+        self.apply_trend_value_style(
+            "yearOnYear_box",
+            year_on_year_result.get("significant", False),
+            year_on_year_result.get("delta", 0.0),
+            yoy_tooltip,
+        )
+        year_on_year_label = getattr(self.ui, "yearOnYear_label", None)
+        if year_on_year_label is not None:
+            year_on_year_label.setToolTip(yoy_tooltip)
         self.set_widget_warning_state("seasonalOrder_box", False, seasonal_tooltip)
         self.set_widget_warning_state(
             "adjustedOrder_box",
@@ -18568,10 +19152,21 @@ $mail.Display()
                 values.append(self.format_value(self.parse_float(month_map.get(month, 0.0))))
             values.append(self.format_value(self.parse_float(row.get("total_qty", 0.0))))
 
+            sort_values = [
+                self.sort_text_value(row.get("customer_name", "")),
+                self.sort_date_value(last_sale_date),
+                self.sort_number_value(row.get("last_price")),
+            ]
+            for month in months:
+                sort_values.append(self.sort_number_value(month_map.get(month, 0.0)))
+            sort_values.append(self.sort_number_value(row.get("total_qty", 0.0)))
+
             model_row = []
             for i, value in enumerate(values):
-                item = QStandardItem(str(value))
+                item = SortableStandardItem(str(value))
                 item.setEditable(False)
+                if i < len(sort_values):
+                    item.setData(sort_values[i], TABLE_SORT_ROLE)
                 if i > 0:
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 model_row.append(item)
@@ -18635,7 +19230,39 @@ $mail.Display()
         QApplication.processEvents()
 
 
-    def load_order_analysis(self, show_warning=True):
+    def load_order_analysis_critical(self):
+        self.load_order_analysis(show_warning=True, critical_only=True)
+
+    def order_analysis_critical_status(self, row_data):
+        sales_for_period = self.parse_float(row_data.get("sales_for_period", 0))
+        if sales_for_period <= 0:
+            return False, "Not critical: no sales in the selected period."
+
+        avg_monthly_sales = self.parse_float(row_data.get("avg_monthly_sales", 0))
+        at_risk = self.parse_float(row_data.get("at_risk", 0))
+        stock_cover_qty = (
+            self.parse_float(row_data.get("soh", 0))
+            + self.parse_float(row_data.get("on_order_form", 0))
+            + self.parse_float(row_data.get("on_next_container", 0))
+            + self.parse_float(row_data.get("shipped_container", 0))
+        )
+
+        reasons = []
+        if at_risk > 0:
+            reasons.append(f"At Risk is {self.format_value(at_risk)}")
+        if avg_monthly_sales > 0 and stock_cover_qty < avg_monthly_sales:
+            reasons.append(
+                f"stock cover {self.format_value(stock_cover_qty)} is below one month of demand "
+                f"({self.format_value(avg_monthly_sales)})"
+            )
+
+        if not reasons:
+            return False, (
+                "Not critical: has recent demand, but At Risk is 0 and stock cover is at least one month."
+            )
+        return True, "Critical: " + "; ".join(reasons) + "."
+
+    def load_order_analysis(self, show_warning=True, critical_only=False):
         selector_edit = self.get_order_analysis_supplier_edit()
         table = self.get_order_analysis_table()
         if selector_edit is None or table is None:
@@ -18643,28 +19270,6 @@ $mail.Display()
 
         mode = self.get_order_analysis_mode()
         typed_value = selector_edit.text().strip()
-        if mode == "group":
-            selected_value = self.find_product_group_name(typed_value)
-            mode_label = "Product Group"
-            invalid_message = "Please enter a valid product group name or a unique product group prefix."
-            filter_expr = self.build_items_group_expression(alias=False)
-            filter_match_clause, filter_columns = self.build_items_group_match_clause()
-        else:
-            selected_value = self.find_supplier_name(typed_value)
-            mode_label = "Supplier"
-            invalid_message = "Please enter a valid supplier name or a unique supplier prefix."
-            filter_expr = self.build_items_supplier_expression(alias=False)
-            filter_match_clause, filter_columns = self.build_items_supplier_match_clause()
-
-        if not selected_value:
-            if show_warning:
-                QMessageBox.warning(self, f"Invalid {mode_label.lower()}", invalid_message)
-            return
-
-        selector_edit.setText(selected_value)
-        self.current_order_analysis_supplier = selected_value
-        self.current_order_analysis_filter_value = selected_value
-        self.current_order_analysis_mode = mode
 
         start_date = self.month_start_from_picker(self.get_order_analysis_start_picker())
         end_date = self.month_end_from_picker(self.get_order_analysis_end_picker())
@@ -18673,38 +19278,88 @@ $mail.Display()
                 QMessageBox.warning(self, "Invalid date range", "Start month cannot be after end month.")
             return
 
-        if not filter_expr or not filter_match_clause:
-            table.setRowCount(0)
-            if show_warning:
-                QMessageBox.warning(
-                    self,
-                    "Order Analysis",
-                    f"Could not find an item-data column for {mode_label.lower()} filtering.",
-                )
-            return
+        if critical_only:
+            # Critical view is intentionally global: it ignores the Supplier / Group box
+            # and scans every item so urgent purchasing problems are not hidden by a filter.
+            selected_value = "All suppliers"
+            mode_label = "Supplier"
+            self.current_order_analysis_supplier = selected_value
+            self.current_order_analysis_filter_value = selected_value
+            self.current_order_analysis_mode = "supplier"
+            self.current_order_analysis_critical_only = True
 
-        item_rows = self.db_all(
-            f"""
-            SELECT
-                TRIM(item_number) AS item_number,
-                COALESCE(NULLIF(TRIM(item_name), ''), NULLIF(TRIM(description), ''), '') AS item_name,
-                COALESCE({filter_expr}, '') AS filter_value,
-                COALESCE(carton, 0) AS carton,
-                COALESCE(pallet, 0) AS pallet,
-                COALESCE(NULLIF(TRIM(planning_status), ''), 'ACTIVE') AS planning_status
-            FROM items
-            WHERE TRIM(COALESCE(item_number, '')) <> ''
-              AND ({filter_match_clause})
-            ORDER BY item_number COLLATE NOCASE
-            """,
-            tuple([selected_value] * len(filter_columns)),
-        )
+            filter_expr = self.build_items_supplier_expression(alias=False) or "''"
+            item_rows = self.db_all(
+                f"""
+                SELECT
+                    TRIM(item_number) AS item_number,
+                    COALESCE(NULLIF(TRIM(item_name), ''), NULLIF(TRIM(description), ''), '') AS item_name,
+                    COALESCE({filter_expr}, '') AS filter_value,
+                    COALESCE(carton, 0) AS carton,
+                    COALESCE(pallet, 0) AS pallet,
+                    COALESCE(NULLIF(TRIM(planning_status), ''), 'ACTIVE') AS planning_status
+                FROM items
+                WHERE TRIM(COALESCE(item_number, '')) <> ''
+                ORDER BY item_number COLLATE NOCASE
+                """
+            )
+        else:
+            if mode == "group":
+                selected_value = self.find_product_group_name(typed_value)
+                mode_label = "Product Group"
+                invalid_message = "Please enter a valid product group name or a unique product group prefix."
+                filter_expr = self.build_items_group_expression(alias=False)
+                filter_match_clause, filter_columns = self.build_items_group_match_clause()
+            else:
+                selected_value = self.find_supplier_name(typed_value)
+                mode_label = "Supplier"
+                invalid_message = "Please enter a valid supplier name or a unique supplier prefix."
+                filter_expr = self.build_items_supplier_expression(alias=False)
+                filter_match_clause, filter_columns = self.build_items_supplier_match_clause()
+
+            if not selected_value:
+                if show_warning:
+                    QMessageBox.warning(self, f"Invalid {mode_label.lower()}", invalid_message)
+                return
+
+            selector_edit.setText(selected_value)
+            self.current_order_analysis_supplier = selected_value
+            self.current_order_analysis_filter_value = selected_value
+            self.current_order_analysis_mode = mode
+            self.current_order_analysis_critical_only = False
+
+            if not filter_expr or not filter_match_clause:
+                table.setRowCount(0)
+                if show_warning:
+                    QMessageBox.warning(
+                        self,
+                        "Order Analysis",
+                        f"Could not find an item-data column for {mode_label.lower()} filtering.",
+                    )
+                return
+
+            item_rows = self.db_all(
+                f"""
+                SELECT
+                    TRIM(item_number) AS item_number,
+                    COALESCE(NULLIF(TRIM(item_name), ''), NULLIF(TRIM(description), ''), '') AS item_name,
+                    COALESCE({filter_expr}, '') AS filter_value,
+                    COALESCE(carton, 0) AS carton,
+                    COALESCE(pallet, 0) AS pallet,
+                    COALESCE(NULLIF(TRIM(planning_status), ''), 'ACTIVE') AS planning_status
+                FROM items
+                WHERE TRIM(COALESCE(item_number, '')) <> ''
+                  AND ({filter_match_clause})
+                ORDER BY item_number COLLATE NOCASE
+                """,
+                tuple([selected_value] * len(filter_columns)),
+            )
 
         months = self.month_list_between(start_date, end_date)
         months_count = max(1, len(months))
         lead_days = self.get_lead_time_days()
         rows_to_show = []
-        progress_target = f"{mode_label}: {selected_value}"
+        progress_target = "Critical: All suppliers" if critical_only else f"{mode_label}: {selected_value}"
         progress = self.create_order_analysis_progress_dialog(len(item_rows), progress_target)
 
         try:
@@ -18739,37 +19394,67 @@ $mail.Display()
 
                 suggested_qty = self.parse_float(suggested_result["rounded"])
                 at_risk_qty = self.parse_float(at_risk_result["rounded"])
-                if suggested_qty > 0 or at_risk_qty > 0:
-                    rows_to_show.append({
-                        "item_number": item_number,
-                        "item_name": (item_row["item_name"] or "").strip(),
-                        "planning_status": self.normalise_planning_status(item_row.get("planning_status")),
-                        "sales_for_period": total_qty,
-                        "avg_monthly_sales": avg_monthly_qty,
-                        "soh": on_hand,
-                        "stock_on_order": stock_on_order,
-                        "on_order_form": self.parse_float(inbound_context.get("order_form", {}).get("qty", 0)),
-                        "on_next_container": self.parse_float(inbound_context.get("next_container", {}).get("qty", 0)),
-                        "shipped_container": self.parse_float(inbound_context.get("shipped", {}).get("qty", 0)),
-                        "suggested_order": suggested_qty,
-                        "at_risk": at_risk_qty,
-                    })
+                filter_value = (item_row["filter_value"] or "").strip()
+                row_data = {
+                    "item_number": item_number,
+                    "item_name": (item_row["item_name"] or "").strip(),
+                    "filter_value": filter_value,
+                    "planning_status": self.normalise_planning_status(item_row.get("planning_status")),
+                    "sales_for_period": total_qty,
+                    "avg_monthly_sales": avg_monthly_qty,
+                    "soh": on_hand,
+                    "stock_on_order": stock_on_order,
+                    "on_order_form": self.parse_float(inbound_context.get("order_form", {}).get("qty", 0)),
+                    "on_next_container": self.parse_float(inbound_context.get("next_container", {}).get("qty", 0)),
+                    "shipped_container": self.parse_float(inbound_context.get("shipped", {}).get("qty", 0)),
+                    "suggested_order": suggested_qty,
+                    "at_risk": at_risk_qty,
+                }
+                is_critical, critical_reason = self.order_analysis_critical_status(row_data)
+                if critical_only and filter_value:
+                    critical_reason = f"Supplier: {filter_value}. {critical_reason}"
+                row_data["critical"] = is_critical
+                row_data["critical_reason"] = critical_reason
+
+                if critical_only:
+                    if is_critical:
+                        rows_to_show.append(row_data)
+                elif suggested_qty > 0 or at_risk_qty > 0:
+                    rows_to_show.append(row_data)
 
                 self.update_order_analysis_progress(progress, index, len(item_rows), progress_target)
         finally:
             self.update_order_analysis_progress(progress, len(item_rows), len(item_rows), progress_target)
             progress.close()
 
-        rows_to_show.sort(
-            key=lambda row: (
-                -self.parse_float(row["suggested_order"]),
-                -self.parse_float(row["at_risk"]),
-                row["item_number"].lower(),
+        if critical_only:
+            rows_to_show.sort(
+                key=lambda row: (
+                    -self.parse_float(row.get("at_risk", 0)),
+                    -self.parse_float(row.get("suggested_order", 0)),
+                    self.parse_float(row.get("soh", 0)),
+                    (row.get("item_number", "") or "").lower(),
+                )
             )
-        )
+        else:
+            rows_to_show.sort(
+                key=lambda row: (
+                    -self.parse_float(row["suggested_order"]),
+                    -self.parse_float(row["at_risk"]),
+                    row["item_number"].lower(),
+                )
+            )
 
         self._order_analysis_all_rows = rows_to_show
         self.apply_order_analysis_filters()
+
+        visible_rows = table.rowCount() if table is not None else 0
+        if critical_only and visible_rows == 0 and show_warning:
+            QMessageBox.information(
+                self,
+                "Critical Order Analysis",
+                "No critical items matched the selected date range and status filters.",
+            )
 
     def populate_order_analysis_table(self, rows):
         table = self.get_order_analysis_table()
@@ -18821,15 +19506,20 @@ $mail.Display()
                 self.parse_float(row_data.get("suggested_order", 0)),
                 self.parse_float(row_data.get("at_risk", 0)),
             ]
+            critical_reason = str(row_data.get("critical_reason", "") or "").strip()
             for col, value in enumerate(values):
                 item = SortableTableWidgetItem(str(value))
                 item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
                 item.setData(Qt.UserRole, raw_sort_values[col])
+                if critical_reason:
+                    item.setToolTip(critical_reason)
                 if col in numeric_columns:
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 table.setItem(row, col, item)
 
             self.apply_order_analysis_row_style(row, planning_status)
+            if bool(row_data.get("critical", False)):
+                self.apply_order_analysis_critical_row_style(row, critical_reason)
 
         table.resizeRowsToContents()
         if self.order_analysis_sort_column is not None and table.rowCount() > 0:
@@ -18852,6 +19542,29 @@ $mail.Display()
                 continue
             item.setBackground(QBrush(bg))
             item.setForeground(QBrush(fg))
+
+    def apply_order_analysis_critical_row_style(self, row, reason=""):
+        table = self.get_order_analysis_table()
+        if table is None or row < 0:
+            return
+        is_light = bool(getattr(self.ui, "radioLight", None) and self.ui.radioLight.isChecked())
+        if is_light:
+            bg = QColor("#ffe2e2")
+            fg = QColor("#7f1d1d")
+        else:
+            bg = QColor("#5a1f1f")
+            fg = QColor("#ffeaea")
+        tooltip = reason or self.order_analysis_critical_tooltip()
+        for col in range(table.columnCount()):
+            item = table.item(row, col)
+            if item is None:
+                continue
+            item.setBackground(QBrush(bg))
+            item.setForeground(QBrush(fg))
+            font = item.font()
+            font.setBold(True)
+            item.setFont(font)
+            item.setToolTip(tooltip)
 
     def show_order_analysis_context_menu(self, pos):
         table = self.get_order_analysis_table()
@@ -19216,11 +19929,25 @@ $mail.Display()
                 self.format_value(row.get("purchase_dates_count", 0)),
                 row.get("status", ""),
             ]
+            sort_values = [
+                self.sort_text_value(row.get("customer_name", "")),
+                self.sort_text_value(row.get("item_number", "")),
+                self.sort_text_value(row.get("item_name", "")),
+                self.sort_text_value(row.get("pack_label", "")),
+                -1 if row.get("avg_weeks") is None else self.sort_number_value(row.get("avg_weeks")),
+                self.sort_number_value(row.get("weeks_since_last")),
+                self.sort_date_value(row.get("last_purchase_date")),
+                self.sort_number_value(row.get("purchase_dates_count", 0)),
+                self.sort_text_value(row.get("status", "")),
+            ]
+
             model_row = []
             brush = self.get_saba_status_brush(row.get("status"))
             for index, value in enumerate(values):
-                item = QStandardItem(str(value))
+                item = SortableStandardItem(str(value))
                 item.setEditable(False)
+                if index < len(sort_values):
+                    item.setData(sort_values[index], TABLE_SORT_ROLE)
                 if index >= 4 and index != 8:
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 if brush is not None:
