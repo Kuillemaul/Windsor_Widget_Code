@@ -1,5 +1,5 @@
 #define MyAppName "Windsor Widget"
-#define MyAppVersion "1.1.3"
+#define MyAppVersion "1.1.4"
 #define MyAppPublisher "Brad Mayze"
 #define MyAppExeName "WindsorWidget.exe"
 
@@ -11,7 +11,7 @@ AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\Windsor Widget
 DefaultGroupName=Windsor Widget
 DisableProgramGroupPage=yes
-OutputBaseFilename=WindsorWidget_Client_1_1_3
+OutputBaseFilename=WindsorWidget_Client_1_1_4
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern

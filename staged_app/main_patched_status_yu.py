@@ -107,7 +107,7 @@ from yu_order_workflow import YUOrderEntryDialog, load_yu_review_module
 TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
 TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
 TABLE_FORMAT_SETTINGS_PREFIX = "table_format"
-APP_VERSION = "1.1.3"
+APP_VERSION = "1.1.4"
 APP_DESIGNER = "Bradley Mayze"
 UPDATE_REPO_OWNER = "Kuillemaul"
 UPDATE_REPO_NAME = "Windsor_Widget_Code"
@@ -4522,6 +4522,7 @@ class Ui_MainWindow(object):
                 "Click an item row to redraw the monthly sales chart for that item.",
                 "Double-click an item number to open that item in Item Summary.",
                 "Use <b>Open Customer File</b> to open the linked customer spreadsheet where available.",
+                "Use <b>Cover Orders</b> to review customer cover orders and double-click an order to see its lines.",
             ],
             [
                 "The Item Number and Description columns stay visible while scrolling sideways.",
@@ -4639,6 +4640,7 @@ class Ui_MainWindow(object):
                 "Choose the import section that matches the file you are updating.",
                 "Check the instructions tab on the right before importing.",
                 "For sales imports, use MYOB AccountRight Import/Export Assistant data.",
+                "Use <b>Update Cover Orders</b> for cover order exports with Invoice No., Co./Last Name, Item Number, Quantity, Date, and Journal Memo.",
                 "Make sure required columns are present before upload.",
                 "After import, return to Customer Summary, Item Summary, or Order Analysis to review the new data.",
             ],
@@ -4795,17 +4797,18 @@ class Ui_MainWindow(object):
 
         self.customerDetails_frame, details_layout = self._panel(self.customerSummaryMain_frame, "customerDetails_frame")
         self.customerDetails_frame.setProperty("role", "sideCard")
-        self.customerDetails_frame.setMinimumWidth(330)
-        self.customerDetails_frame.setMaximumWidth(420)
-        self.customerSummaryMain_layout.addWidget(self.customerDetails_frame, 1)
+        self.customerDetails_frame.setMinimumWidth(280)
+        self.customerDetails_frame.setMaximumWidth(340)
+        self.customerDetails_frame.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        self.customerSummaryMain_layout.addWidget(self.customerDetails_frame, 0)
 
         customer_details_title = QLabel("Customer details", self.customerDetails_frame)
         customer_details_title.setObjectName("customerDetails_title")
         customer_details_title.setProperty("role", "sectionTitle")
         details_layout.addWidget(customer_details_title)
         self.customer_Info = self._table_view(self.customerDetails_frame, "customer_Info")
-        self.customer_Info.setMinimumHeight(150)
-        self.customer_Info.setMaximumHeight(220)
+        self.customer_Info.setMinimumHeight(90)
+        self.customer_Info.setMaximumHeight(118)
         details_layout.addWidget(self.customer_Info)
 
         flags_title = QLabel("Account flags", self.customerDetails_frame)
@@ -4814,14 +4817,19 @@ class Ui_MainWindow(object):
         details_layout.addWidget(flags_title)
         self.chargeFreight_textBrowser = QTextBrowser(self.customerDetails_frame)
         self.chargeFreight_textBrowser.setObjectName("chargeFreight_textBrowser")
-        self.chargeFreight_textBrowser.setMinimumHeight(118)
-        self.chargeFreight_textBrowser.setMaximumHeight(150)
+        self.chargeFreight_textBrowser.setMinimumHeight(96)
+        self.chargeFreight_textBrowser.setMaximumHeight(116)
         self.chargeFreight_textBrowser.setOpenExternalLinks(False)
         details_layout.addWidget(self.chargeFreight_textBrowser)
 
+        self.customerCoverOrders_pushButton = QPushButton("Cover Orders", self.customerDetails_frame)
+        self.customerCoverOrders_pushButton.setObjectName("customerCoverOrders_pushButton")
+        self.customerCoverOrders_pushButton.setToolTip("Show all cover orders for the current customer.")
+        details_layout.addWidget(self.customerCoverOrders_pushButton)
+
         self.customerSummaryHelp_textBrowser = QTextBrowser(self.customerDetails_frame)
         self.customerSummaryHelp_textBrowser.setObjectName("customerSummaryHelp_textBrowser")
-        self.customerSummaryHelp_textBrowser.setMaximumHeight(170)
+        self.customerSummaryHelp_textBrowser.setMaximumHeight(140)
         self.customerSummaryHelp_textBrowser.setPlainText(
             "Tips:\n"
             "- Click a row to redraw the chart for that item.\n"
@@ -5881,6 +5889,9 @@ class Ui_MainWindow(object):
         self.updatOrders_pushButton_3 = getattr(self, "updatOrders_pushButton_3", QPushButton("Import Orders", self.frame_47))
         self.updatOrders_pushButton_3.setObjectName("updatOrders_pushButton_3")
         self.lastUpdateOrders_textBrowser_3 = self._text_box(self.frame_47, "lastUpdateOrders_textBrowser_3", "Orders not updated this session")
+        self.updateCoverOrders_pushButton = QPushButton("Update Cover Orders", self.frame_47)
+        self.updateCoverOrders_pushButton.setObjectName("updateCoverOrders_pushButton")
+        self.lastUpdateCoverOrders_textBrowser = self._text_box(self.frame_47, "lastUpdateCoverOrders_textBrowser", "Cover orders not updated this session")
         self.updateDataCreateYUOrder_pushButton = QPushButton("Create YU Order", self.frame_47)
         self.updateDataCreateYUOrder_pushButton.setObjectName("updateDataCreateYUOrder_pushButton")
         for widget in (
@@ -5890,6 +5901,8 @@ class Ui_MainWindow(object):
             self.lastUPdateStock_textBrowser_2,
             self.updatOrders_pushButton_3,
             self.lastUpdateOrders_textBrowser_3,
+            self.updateCoverOrders_pushButton,
+            self.lastUpdateCoverOrders_textBrowser,
             self.updateDataCreateYUOrder_pushButton,
         ):
             import_layout.addWidget(widget)
@@ -5901,10 +5914,18 @@ class Ui_MainWindow(object):
         self.salesImportInstructions_textEdit.setObjectName("salesImportInstructions_textEdit")
         self.salesImportInstructions_textEdit.setReadOnly(True)
         self.updateDataInstructions_tabs.addTab(self.salesImportInstructions_textEdit, "Sales")
-        for title in ("Stock", "Orders", "Customers", "Items"):
+        for title in ("Stock", "Orders", "Cover Orders", "Customers", "Items"):
             placeholder = QTextEdit(self.updateDataInstructions_tabs)
             placeholder.setReadOnly(True)
-            placeholder.setPlainText(f"{title} import instructions will be added here.")
+            if title == "Cover Orders":
+                placeholder.setPlainText(
+                    "COVER ORDERS IMPORT\n\n"
+                    "Use a CSV or Excel file exported with these headings:\n"
+                    "Invoice No., Co./Last Name, Item Number, Quantity, Date, Journal Memo\n\n"
+                    "The import replaces the existing cover order table."
+                )
+            else:
+                placeholder.setPlainText(f"{title} import instructions will be added here.")
             self.updateDataInstructions_tabs.addTab(placeholder, title)
         update_row.addWidget(self.updateDataInstructions_tabs, 1)
 
@@ -5981,6 +6002,7 @@ class MainWindow(QMainWindow):
         self.current_customer_file_path = None
         self.current_customer_matched_customers = []
         self.current_customer_selected_item_number = None
+        self.current_customer_cover_orders = []
         self.current_item_number = None
         self.item_trend_comparison_months = 3
         self.customer_trend_modes = ("3v3", "6v6", "yoy")
@@ -6102,6 +6124,7 @@ class MainWindow(QMainWindow):
         self.ensure_supplier_master_table()
         self.ensure_sales_optional_columns()
         self.ensure_customer_flag_columns()
+        self.ensure_cover_orders_table()
         self.ensure_shipment_tables()
         self.ensure_item_planning_status_column()
         self.load_reference_lists()
@@ -7788,6 +7811,9 @@ class MainWindow(QMainWindow):
             self.lead_time_picker.valueChanged.connect(self.rerun_item_if_ready)
         if hasattr(self.ui, "loadFile"):
             self.ui.loadFile.clicked.connect(self.open_customer_file)
+        cover_orders_button = getattr(self.ui, "customerCoverOrders_pushButton", None)
+        if cover_orders_button is not None:
+            cover_orders_button.clicked.connect(self.show_current_customer_cover_orders)
         customer_purchase_table = getattr(self.ui, "customerPurchase_table", None)
         if customer_purchase_table is not None:
             customer_purchase_table.doubleClicked.connect(self.handle_customer_purchase_double_click)
@@ -7863,6 +7889,10 @@ class MainWindow(QMainWindow):
         update_stock_button = getattr(self.ui, "updateStock_pushButton", None)
         if update_stock_button is not None:
             update_stock_button.clicked.connect(self.import_stock_from_dialog)
+
+        update_cover_orders_button = getattr(self.ui, "updateCoverOrders_pushButton", None)
+        if update_cover_orders_button is not None:
+            update_cover_orders_button.clicked.connect(self.import_cover_orders_from_dialog)
 
         self.setup_item_summary_editing()
 
@@ -9879,6 +9909,89 @@ class MainWindow(QMainWindow):
         if changed:
             self.db_conn.commit()
 
+    def ensure_cover_orders_table(self):
+        if self.db_conn is None:
+            return
+
+        cur = self.db_conn.cursor()
+        if self.db_engine == "sqlserver":
+            cur.execute(
+                """
+                IF OBJECT_ID('dbo.cover_orders', 'U') IS NULL
+                BEGIN
+                    CREATE TABLE dbo.cover_orders (
+                        id INT IDENTITY(1,1) PRIMARY KEY,
+                        invoice_no NVARCHAR(80) NULL,
+                        customer_name NVARCHAR(255) NULL,
+                        item_number NVARCHAR(80) NULL,
+                        quantity FLOAT NULL,
+                        cover_date DATE NULL,
+                        journal_memo NVARCHAR(MAX) NULL
+                    )
+                END
+                """
+            )
+        else:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cover_orders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    invoice_no TEXT,
+                    customer_name TEXT,
+                    item_number TEXT,
+                    quantity REAL,
+                    cover_date TEXT,
+                    journal_memo TEXT
+                )
+                """
+            )
+
+        desired_columns = [
+            ("invoice_no", "NVARCHAR(80) NULL", "TEXT"),
+            ("customer_name", "NVARCHAR(255) NULL", "TEXT"),
+            ("item_number", "NVARCHAR(80) NULL", "TEXT"),
+            ("quantity", "FLOAT NULL", "REAL"),
+            ("cover_date", "DATE NULL", "TEXT"),
+            ("journal_memo", "NVARCHAR(MAX) NULL", "TEXT"),
+        ]
+        existing_columns = {str(name).lower(): name for name in self.get_table_columns("cover_orders")}
+        changed = False
+        for column_name, sqlserver_type, sqlite_type in desired_columns:
+            if column_name.lower() in existing_columns:
+                continue
+            if self.db_engine == "sqlserver":
+                cur.execute(f"ALTER TABLE cover_orders ADD {self.db_identifier(column_name)} {sqlserver_type}")
+            else:
+                cur.execute(f"ALTER TABLE cover_orders ADD COLUMN {column_name} {sqlite_type}")
+            changed = True
+
+        if self.db_engine == "sqlserver":
+            cur.execute(
+                """
+                IF NOT EXISTS (
+                    SELECT 1 FROM sys.indexes
+                    WHERE name = 'idx_cover_orders_customer_date'
+                      AND object_id = OBJECT_ID('dbo.cover_orders')
+                )
+                CREATE INDEX idx_cover_orders_customer_date ON dbo.cover_orders(customer_name, cover_date)
+                """
+            )
+            cur.execute(
+                """
+                IF NOT EXISTS (
+                    SELECT 1 FROM sys.indexes
+                    WHERE name = 'idx_cover_orders_invoice'
+                      AND object_id = OBJECT_ID('dbo.cover_orders')
+                )
+                CREATE INDEX idx_cover_orders_invoice ON dbo.cover_orders(invoice_no)
+                """
+            )
+        else:
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_cover_orders_customer_date ON cover_orders(customer_name, cover_date)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_cover_orders_invoice ON cover_orders(invoice_no)")
+
+        self.db_conn.commit()
+
     def ensure_stock_table(self):
         if self.db_engine == "sqlserver":
             return
@@ -10886,11 +10999,20 @@ class MainWindow(QMainWindow):
         info_table = getattr(self.ui, "customer_Info", None)
         if info_table is not None:
             try:
-                info_table.setMinimumWidth(300)
-                info_table.setMinimumHeight(150)
-                info_table.setMaximumHeight(220)
-                info_table.verticalHeader().setDefaultSectionSize(24)
+                info_table.setMinimumWidth(250)
+                info_table.setMinimumHeight(88)
+                info_table.setMaximumHeight(118)
+                info_table.verticalHeader().setDefaultSectionSize(22)
                 info_table.setWordWrap(False)
+            except Exception:
+                pass
+
+        details_frame = getattr(self.ui, "customerDetails_frame", None)
+        if details_frame is not None:
+            try:
+                details_frame.setMinimumWidth(280)
+                details_frame.setMaximumWidth(340)
+                details_frame.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
             except Exception:
                 pass
 
@@ -10926,8 +11048,8 @@ class MainWindow(QMainWindow):
         freight_box = getattr(self.ui, "chargeFreight_textBrowser", None)
         if freight_box is not None:
             try:
-                freight_box.setMinimumSize(300, 118)
-                freight_box.setMaximumHeight(150)
+                freight_box.setMinimumSize(250, 96)
+                freight_box.setMaximumHeight(116)
                 freight_box.document().setDocumentMargin(0)
                 freight_box.setAlignment(Qt.AlignCenter)
                 freight_box.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -11315,6 +11437,21 @@ class MainWindow(QMainWindow):
             "Date,Co./Last Name,Item Number,Description,Quantity,Price,Freight Amount,Invoice No.\n"
         )
 
+    def cover_orders_import_instruction_text(self):
+        return (
+            "COVER ORDERS IMPORT\n\n"
+            "Use this for the cover order export. The import replaces the existing cover order data.\n\n"
+            "Required columns:\n"
+            "- Invoice No.\n"
+            "- Co./Last Name\n"
+            "- Item Number\n"
+            "- Quantity\n"
+            "- Date\n"
+            "- Journal Memo\n\n"
+            "Example header:\n"
+            "Invoice No.,Co./Last Name,Item Number,Quantity,Date,Journal Memo\n"
+        )
+
     def placeholder_import_instruction_text(self, import_name):
         return (
             f"{import_name.upper()} IMPORT\n\n"
@@ -11335,6 +11472,22 @@ class MainWindow(QMainWindow):
                 sales_widget = getattr(self.ui, "salesImportInstructions_textEdit", None)
                 if sales_widget is not None:
                     sales_widget.setPlainText(self.sales_import_instruction_text())
+            except Exception:
+                pass
+            try:
+                found_cover_tab = False
+                for idx in range(existing_tabs.count()):
+                    if existing_tabs.tabText(idx).strip().casefold() == "cover orders":
+                        widget = existing_tabs.widget(idx)
+                        if hasattr(widget, "setPlainText"):
+                            widget.setPlainText(self.cover_orders_import_instruction_text())
+                        found_cover_tab = True
+                        break
+                if not found_cover_tab:
+                    cover_text = QTextEdit(existing_tabs)
+                    cover_text.setReadOnly(True)
+                    cover_text.setPlainText(self.cover_orders_import_instruction_text())
+                    existing_tabs.addTab(cover_text, "Cover Orders")
             except Exception:
                 pass
             return
@@ -11366,10 +11519,14 @@ class MainWindow(QMainWindow):
         setattr(self.ui, "salesImportInstructions_textEdit", sales_text)
         tabs.addTab(sales_text, "Sales")
 
-        for tab_name in ("Stock", "Orders", "Customers", "Items"):
+        for tab_name in ("Stock", "Orders", "Cover Orders", "Customers", "Items"):
             text_box = QTextEdit(tabs)
             text_box.setReadOnly(True)
-            text_box.setPlainText(self.placeholder_import_instruction_text(tab_name))
+            text_box.setPlainText(
+                self.cover_orders_import_instruction_text()
+                if tab_name == "Cover Orders"
+                else self.placeholder_import_instruction_text(tab_name)
+            )
             tabs.addTab(text_box, tab_name)
 
         layout.addWidget(tabs, 1)
@@ -11392,6 +11549,12 @@ class MainWindow(QMainWindow):
             stock_status.setReadOnly(True)
             stock_status.setOpenLinks(False)
             stock_status.setPlainText(self.get_meta_value("stock_last_import_display", "No stock import yet."))
+
+        cover_orders_status = getattr(self.ui, "lastUpdateCoverOrders_textBrowser", None)
+        if cover_orders_status is not None:
+            cover_orders_status.setReadOnly(True)
+            cover_orders_status.setOpenLinks(False)
+            cover_orders_status.setPlainText(self.get_meta_value("cover_orders_last_import_display", "No cover orders import yet."))
 
         freight_box = getattr(self.ui, "chargeFreight_textBrowser", None)
         if freight_box is not None:
@@ -14791,6 +14954,150 @@ class MainWindow(QMainWindow):
         extended = quantity_value * price_value
         return (sale_date, customer_name, item_number, description, month_key, quantity_value, price_value, extended, invoice_no, freight_amount)
 
+    def import_cover_orders_from_dialog(self):
+        filters = "Cover order files (*.csv *.xlsx *.xlsm);;CSV files (*.csv);;Excel files (*.xlsx *.xlsm);;All files (*.*)"
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choose cover orders import file",
+            str(self.base_dir),
+            filters,
+        )
+        if not file_path:
+            return
+
+        try:
+            imported_count = self.import_cover_orders_file(file_path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Cover orders import failed", f"Could not import cover orders file.\n\n{exc}")
+            return
+
+        display_text = (
+            f"Last import: {datetime.now().strftime('%d/%m/%Y %H:%M')}\n"
+            f"File: {Path(file_path).name}\n"
+            f"Rows imported: {imported_count:,}"
+        )
+        self.set_meta_value("cover_orders_last_import_display", display_text)
+        browser = getattr(self.ui, "lastUpdateCoverOrders_textBrowser", None)
+        if browser is not None:
+            browser.setPlainText(display_text)
+
+        self.rerun_search_if_ready()
+        QMessageBox.information(self, "Cover orders imported", f"Imported {imported_count:,} rows into the cover orders table.")
+
+    def import_cover_orders_file(self, file_path):
+        self.ensure_cover_orders_table()
+        rows = self.read_cover_order_import_rows(file_path)
+        cur = self.db_conn.cursor()
+        cur.execute("DELETE FROM cover_orders")
+        if rows:
+            cur.executemany(
+                """
+                INSERT INTO cover_orders (
+                    invoice_no, customer_name, item_number, quantity, cover_date, journal_memo
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+        self.db_conn.commit()
+        return len(rows)
+
+    def read_cover_order_import_rows(self, file_path):
+        path = Path(file_path)
+        suffix = path.suffix.lower()
+        if suffix == ".csv":
+            return self.read_cover_order_rows_from_csv(path)
+        if suffix in {".xlsx", ".xlsm"}:
+            return self.read_cover_order_rows_from_excel(path)
+        raise ValueError("Unsupported file type. Choose a CSV or Excel file.")
+
+    def get_required_cover_order_columns(self, headers):
+        normalized = {self.normalize_header(h): h for h in headers}
+        aliases = {
+            "invoice_no": ["invoiceno", "invoice", "invno", "invoicenumber", "orderno", "order"],
+            "customer_name": ["colastname", "customer", "customername", "companylastname", "lastname"],
+            "item_number": ["itemnumber", "item", "itemno"],
+            "quantity": ["quantity", "qty"],
+            "cover_date": ["date", "coverdate", "orderdate", "saledate"],
+            "journal_memo": ["journalmemo", "memo", "notes", "description"],
+        }
+        resolved = {}
+        missing = []
+        for field_name, options in aliases.items():
+            matched = next((normalized[key] for key in options if key in normalized), None)
+            if matched is None:
+                missing.append(field_name)
+            else:
+                resolved[field_name] = matched
+        if missing:
+            missing_text = ", ".join(missing)
+            raise ValueError(
+                f"Missing required column(s): {missing_text}. Expected columns like Invoice No., Co./Last Name, Item Number, Quantity, Date, Journal Memo."
+            )
+        return resolved
+
+    def read_cover_order_rows_from_csv(self, path):
+        import csv
+
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if not reader.fieldnames:
+                raise ValueError("The selected cover orders file has no header row.")
+            column_map = self.get_required_cover_order_columns(reader.fieldnames)
+            rows = []
+            for line_number, row in enumerate(reader, start=2):
+                normalized = self.build_cover_order_import_tuple(row, column_map, line_number)
+                if normalized is not None:
+                    rows.append(normalized)
+        if not rows:
+            raise ValueError("The selected file did not contain any valid cover order rows.")
+        return rows
+
+    def read_cover_order_rows_from_excel(self, path):
+        if load_workbook is None:
+            raise ValueError("Excel import is not available because openpyxl is not installed.")
+
+        workbook = load_workbook(filename=str(path), read_only=True, data_only=True)
+        try:
+            sheet = workbook.active
+            raw_headers = next(sheet.iter_rows(min_row=1, max_row=1, values_only=True), None)
+            if not raw_headers:
+                raise ValueError("The selected cover orders file has no header row.")
+            headers = ["" if h is None else str(h) for h in raw_headers]
+            column_map = self.get_required_cover_order_columns(headers)
+            rows = []
+            for line_number, values in enumerate(sheet.iter_rows(min_row=2, values_only=True), start=2):
+                row_dict = {headers[idx]: values[idx] if idx < len(values) else "" for idx in range(len(headers))}
+                normalized = self.build_cover_order_import_tuple(row_dict, column_map, line_number)
+                if normalized is not None:
+                    rows.append(normalized)
+        finally:
+            workbook.close()
+
+        if not rows:
+            raise ValueError("The selected file did not contain any valid cover order rows.")
+        return rows
+
+    def build_cover_order_import_tuple(self, row, column_map, line_number):
+        invoice_no = str(row.get(column_map["invoice_no"], "") or "").strip()
+        customer_name = str(row.get(column_map["customer_name"], "") or "").strip()
+        item_number = str(row.get(column_map["item_number"], "") or "").strip()
+        quantity_value = self.parse_float(row.get(column_map["quantity"], 0))
+        cover_date = self.normalize_sales_import_date(row.get(column_map["cover_date"], ""))
+        journal_memo = str(row.get(column_map["journal_memo"], "") or "").strip()
+
+        if not invoice_no and not customer_name and not item_number and quantity_value == 0 and not cover_date and not journal_memo:
+            return None
+        if not invoice_no:
+            raise ValueError(f"Line {line_number}: invoice/order number is blank.")
+        if not customer_name:
+            raise ValueError(f"Line {line_number}: customer name is blank.")
+        if not item_number:
+            raise ValueError(f"Line {line_number}: item number is blank.")
+        if not cover_date:
+            raise ValueError(f"Line {line_number}: date is blank or invalid.")
+
+        return (invoice_no, customer_name, item_number, quantity_value, cover_date, journal_memo)
+
     def import_stock_from_dialog(self):
         filters = "Stock files (*.xlsx *.xlsm *.csv *.txt);;Excel files (*.xlsx *.xlsm);;CSV files (*.csv *.txt);;All files (*.*)"
         file_path, _ = QFileDialog.getOpenFileName(
@@ -17670,6 +17977,14 @@ $mail.Display()
                 "last_sale_date": self.parse_date_value(row["sale_date"]),
             }
 
+        cover_order_totals = self.fetch_customer_cover_order_totals(
+            matched_customers,
+            start_date,
+            end_date,
+        )
+        cover_item_name_map = self.fetch_item_name_map(cover_order_totals.keys())
+        item_name_map.update({key: value for key, value in cover_item_name_map.items() if value})
+
         for row in rows:
             item_number = (row["item_number"] or "").strip()
             if not item_number:
@@ -17687,11 +18002,25 @@ $mail.Display()
                     "last_price": latest_sale_info_by_item.get(item_number, {}).get("last_price"),
                     "last_sale_date": latest_sale_info_by_item.get(item_number, {}).get("last_sale_date"),
                     "total_qty": 0.0,
+                    "cover_order_qty": self.parse_float(cover_order_totals.get(item_number, 0.0)),
                 }
 
             pivot[item_number]["months"][month_start] += qty
             pivot[item_number]["total_qty"] += qty
             monthly_totals[month_start] += qty
+
+        for item_number, cover_qty in cover_order_totals.items():
+            if item_number in pivot:
+                pivot[item_number]["cover_order_qty"] = self.parse_float(cover_qty)
+                continue
+            pivot[item_number] = {
+                "description": item_name_map.get(item_number.upper(), ""),
+                "months": {m: 0.0 for m in months},
+                "last_price": latest_sale_info_by_item.get(item_number, {}).get("last_price"),
+                "last_sale_date": latest_sale_info_by_item.get(item_number, {}).get("last_sale_date"),
+                "total_qty": 0.0,
+                "cover_order_qty": self.parse_float(cover_qty),
+            }
 
         self.current_customer_months = months
         self.current_customer_pivot = pivot
@@ -18168,6 +18497,318 @@ $mail.Display()
         layout.addStretch(1)
         return container
 
+    def fetch_customer_cover_order_totals(self, matched_customers, start_date=None, end_date=None):
+        if self.db_conn is None or not self.has_table("cover_orders") or not matched_customers:
+            return {}
+
+        customer_clause, customer_params = self.sql_in_clause(matched_customers)
+        date_filter = ""
+        params = list(customer_params)
+        if start_date is not None and end_date is not None:
+            date_filter = "AND DATE(cover_date) BETWEEN ? AND ?"
+            params.extend([start_date.isoformat(), end_date.isoformat()])
+
+        rows = self.db_all(
+            f"""
+            SELECT TRIM(item_number) AS item_number,
+                   SUM(COALESCE(quantity, 0)) AS total_qty
+            FROM cover_orders
+            WHERE customer_name IN {customer_clause}
+              AND TRIM(COALESCE(item_number, '')) <> ''
+              {date_filter}
+            GROUP BY TRIM(item_number)
+            ORDER BY item_number COLLATE NOCASE
+            """,
+            params,
+        )
+        totals = {}
+        for row in rows:
+            item_number = (row["item_number"] or "").strip()
+            if item_number:
+                totals[item_number] = self.parse_float(row["total_qty"])
+        return totals
+
+    def fetch_customer_cover_orders(self, customer_name=None, combine_accounts=False, item_number=None):
+        if self.db_conn is None or not self.has_table("cover_orders"):
+            return []
+
+        customer_name = customer_name or self.current_customer_name
+        matched_customers = self.find_matching_customers(customer_name, combine_accounts) if customer_name else []
+        if not matched_customers:
+            return []
+
+        customer_clause, params = self.sql_in_clause(matched_customers)
+        item_filter = ""
+        if item_number:
+            item_filter = "AND UPPER(TRIM(item_number)) = UPPER(TRIM(?))"
+            params.append(item_number)
+
+        rows = self.db_all(
+            f"""
+            SELECT invoice_no,
+                   customer_name,
+                   item_number,
+                   quantity,
+                   DATE(cover_date) AS cover_date,
+                   journal_memo
+            FROM cover_orders
+            WHERE customer_name IN {customer_clause}
+              {item_filter}
+            ORDER BY DATE(cover_date) DESC, invoice_no COLLATE NOCASE, item_number COLLATE NOCASE
+            """,
+            params,
+        )
+        return [self.row_to_dict(row) for row in rows]
+
+    def fetch_cover_order_lines_by_invoice(self, invoice_no):
+        invoice_no = str(invoice_no or "").strip()
+        if not invoice_no or self.db_conn is None or not self.has_table("cover_orders"):
+            return []
+        rows = self.db_all(
+            """
+            SELECT invoice_no,
+                   customer_name,
+                   item_number,
+                   quantity,
+                   DATE(cover_date) AS cover_date,
+                   journal_memo
+            FROM cover_orders
+            WHERE UPPER(TRIM(invoice_no)) = UPPER(TRIM(?))
+            ORDER BY customer_name COLLATE NOCASE, item_number COLLATE NOCASE
+            """,
+            (invoice_no,),
+        )
+        return [self.row_to_dict(row) for row in rows]
+
+    def cover_order_group_rows(self, rows):
+        grouped = {}
+        for row in rows or []:
+            invoice_no = str(row.get("invoice_no") or "").strip()
+            if not invoice_no:
+                continue
+            entry = grouped.setdefault(invoice_no, {
+                "invoice_no": invoice_no,
+                "cover_date": row.get("cover_date"),
+                "customer_names": set(),
+                "total_qty": 0.0,
+                "line_count": 0,
+                "memo": "",
+            })
+            customer_name = str(row.get("customer_name") or "").strip()
+            if customer_name:
+                entry["customer_names"].add(customer_name)
+            parsed_existing = self.parse_date_value(entry.get("cover_date"))
+            parsed_new = self.parse_date_value(row.get("cover_date"))
+            if parsed_new is not None and (parsed_existing is None or parsed_new > parsed_existing):
+                entry["cover_date"] = row.get("cover_date")
+            entry["total_qty"] += self.parse_float(row.get("quantity", 0))
+            entry["line_count"] += 1
+            memo = str(row.get("journal_memo") or "").strip()
+            if memo and not entry["memo"]:
+                entry["memo"] = memo
+
+        result = list(grouped.values())
+        result.sort(key=lambda item: (self.sort_date_value(item.get("cover_date")), self.sort_text_value(item.get("invoice_no"))), reverse=True)
+        return result
+
+    def show_current_customer_cover_orders(self, checked=False, item_number=None):
+        customer_name = self.current_customer_name
+        if not customer_name:
+            typed_customer = self.ui.customerEdit.text() if hasattr(self.ui, "customerEdit") else ""
+            customer_name = self.find_customer_name(typed_customer)
+        if not customer_name:
+            QMessageBox.information(self, "Cover Orders", "Search or choose a customer first.")
+            return
+
+        combine_accounts = bool(getattr(self, "current_customer_combine_accounts", False))
+        rows = self.fetch_customer_cover_orders(customer_name, combine_accounts=combine_accounts, item_number=item_number)
+        if not rows:
+            suffix = f" for item {item_number}" if item_number else ""
+            QMessageBox.information(self, "Cover Orders", f"No cover orders found for {customer_name}{suffix}.")
+            return
+        self.show_cover_orders_dialog(customer_name, rows, item_number=item_number, combine_accounts=combine_accounts)
+
+    def show_cover_orders_dialog(self, customer_name, rows, item_number=None, combine_accounts=False):
+        dialog = QDialog(self)
+        item_suffix = f" - {item_number}" if item_number else ""
+        dialog.setWindowTitle(f"Cover Orders - {customer_name}{item_suffix}")
+        dialog.resize(980, 620)
+        layout = QVBoxLayout(dialog)
+
+        summary_text = (
+            f"Customer: {customer_name}"
+            + (" (combined state accounts)" if combine_accounts else "")
+            + (f"\nItem: {item_number}" if item_number else "")
+            + "\nDouble-click an order number to show the contents."
+        )
+        summary = QLabel(summary_text)
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+
+        table = QTableWidget(dialog)
+        table.setColumnCount(6)
+        table.setHorizontalHeaderLabels(["Order / Invoice No", "Date", "Customer", "Lines", "Total Qty", "Memo"])
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
+        table.cellDoubleClicked.connect(lambda r, c, tbl=table: self.handle_cover_orders_table_double_click(tbl, r, c))
+        install_table_font_context_menu(
+            self,
+            table,
+            self.settings,
+            "cover_orders_dialogs",
+            settings_token="cover_orders_dialogs/customer_orders",
+        )
+        layout.addWidget(table, 1)
+
+        grouped_rows = self.cover_order_group_rows(rows)
+        table.setRowCount(len(grouped_rows))
+        total_qty = 0.0
+        for row_index, row in enumerate(grouped_rows):
+            invoice_no = row.get("invoice_no", "")
+            customer_names = ", ".join(sorted(row.get("customer_names", []), key=str.casefold))
+            qty_value = self.parse_float(row.get("total_qty", 0))
+            total_qty += qty_value
+            values = [
+                invoice_no,
+                self.format_short_date(row.get("cover_date")),
+                customer_names,
+                self.format_value(row.get("line_count", 0)),
+                self.format_value(qty_value),
+                row.get("memo", ""),
+            ]
+            sort_values = [
+                self.sort_text_value(invoice_no),
+                self.sort_date_value(row.get("cover_date")),
+                self.sort_text_value(customer_names),
+                self.parse_float(row.get("line_count", 0)),
+                qty_value,
+                self.sort_text_value(row.get("memo", "")),
+            ]
+            for col_index, value in enumerate(values):
+                item = SortableTableWidgetItem(value)
+                item.setData(TABLE_SORT_ROLE, sort_values[col_index])
+                if col_index == 0:
+                    item.setData(Qt.UserRole, invoice_no)
+                    item.setToolTip("Double-click to show this cover order's item lines.")
+                if col_index in (3, 4):
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                table.setItem(row_index, col_index, item)
+
+        header = table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.Stretch)
+        table.resizeRowsToContents()
+
+        footer = QLabel(f"Orders: {len(grouped_rows):,}    Lines: {len(rows):,}    Qty Total: {self.format_value(total_qty)}")
+        footer.setWordWrap(True)
+        layout.addWidget(footer)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        close_button = QPushButton("Close", dialog)
+        close_button.clicked.connect(dialog.accept)
+        button_row.addWidget(close_button)
+        layout.addLayout(button_row)
+
+        dialog.exec()
+
+    def handle_cover_orders_table_double_click(self, table, row, column):
+        if table is None or row < 0:
+            return
+        item = table.item(row, 0)
+        invoice_no = (item.data(Qt.UserRole) if item is not None else "") or (item.text() if item is not None else "")
+        invoice_no = str(invoice_no or "").strip()
+        if not invoice_no:
+            return
+        self.show_cover_order_detail_dialog(invoice_no)
+
+    def show_cover_order_detail_dialog(self, invoice_no):
+        rows = self.fetch_cover_order_lines_by_invoice(invoice_no)
+        if not rows:
+            QMessageBox.information(self, "Cover Order", f"No lines were found for cover order {invoice_no}.")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Cover Order {invoice_no}")
+        dialog.resize(980, 620)
+        layout = QVBoxLayout(dialog)
+        summary = QLabel(f"Cover order / invoice: {invoice_no}")
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+
+        table = QTableWidget(dialog)
+        table.setColumnCount(6)
+        table.setHorizontalHeaderLabels(["Date", "Customer", "Item Number", "Qty", "Journal Memo", "Invoice No"])
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
+        install_table_font_context_menu(
+            self,
+            table,
+            self.settings,
+            "cover_orders_dialogs",
+            settings_token="cover_orders_dialogs/order_detail",
+        )
+        layout.addWidget(table, 1)
+
+        table.setRowCount(len(rows))
+        total_qty = 0.0
+        for row_index, row in enumerate(rows):
+            qty_value = self.parse_float(row.get("quantity", 0))
+            total_qty += qty_value
+            values = [
+                self.format_short_date(row.get("cover_date")),
+                str(row.get("customer_name") or "").strip(),
+                str(row.get("item_number") or "").strip(),
+                self.format_value(qty_value),
+                str(row.get("journal_memo") or "").strip(),
+                str(row.get("invoice_no") or "").strip(),
+            ]
+            sort_values = [
+                self.sort_date_value(row.get("cover_date")),
+                self.sort_text_value(row.get("customer_name")),
+                self.sort_text_value(row.get("item_number")),
+                qty_value,
+                self.sort_text_value(row.get("journal_memo")),
+                self.sort_text_value(row.get("invoice_no")),
+            ]
+            for col_index, value in enumerate(values):
+                item = SortableTableWidgetItem(value)
+                item.setData(TABLE_SORT_ROLE, sort_values[col_index])
+                if col_index == 3:
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                table.setItem(row_index, col_index, item)
+
+        header = table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.Stretch)
+        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        table.resizeRowsToContents()
+
+        footer = QLabel(f"Lines: {len(rows):,}    Qty Total: {self.format_value(total_qty)}")
+        footer.setWordWrap(True)
+        layout.addWidget(footer)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        close_button = QPushButton("Close", dialog)
+        close_button.clicked.connect(dialog.accept)
+        button_row.addWidget(close_button)
+        layout.addLayout(button_row)
+        dialog.exec()
+
     def populate_monthly_item_table(self, pivot, months, customer_name, combine_accounts):
         table = getattr(self.ui, "salesTable", None)
         if table is None:
@@ -18183,7 +18824,8 @@ $mail.Display()
         )
 
         item_numbers = sorted(pivot.keys(), key=str.lower)
-        headers = ["Item Number", "Description", "Last Sale Date", "Last Price", "Total Units"] + [m.strftime("%b %Y") for m in months]
+        month_first_column = 6
+        headers = ["Item Number", "Description", "Last Sale Date", "Last Price", "Total Units", "Cover Orders"] + [m.strftime("%b %Y") for m in months]
 
         table.clear()
         table.setRowCount(len(item_numbers))
@@ -18217,7 +18859,18 @@ $mail.Display()
             total_cell.setData(TABLE_SORT_ROLE, total_qty)
             table.setItem(row_index, 4, total_cell)
 
-            for month_index, month_start in enumerate(months, start=5):
+            cover_qty = self.parse_float(item_data.get("cover_order_qty", 0.0))
+            cover_cell = SortableTableWidgetItem(self.format_value(cover_qty) if cover_qty else "")
+            cover_cell.setData(TABLE_SORT_ROLE, cover_qty)
+            cover_cell.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            if cover_qty:
+                cover_cell.setToolTip("Cover order quantity for this customer/item in the selected date range.")
+                font = cover_cell.font()
+                font.setBold(True)
+                cover_cell.setFont(font)
+            table.setItem(row_index, 5, cover_cell)
+
+            for month_index, month_start in enumerate(months, start=month_first_column):
                 qty = self.parse_float(item_data["months"].get(month_start, 0.0))
                 month_item = SortableTableWidgetItem(self.format_value(qty))
                 month_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -18229,7 +18882,7 @@ $mail.Display()
                 })
                 table.setItem(row_index, month_index, month_item)
 
-            for numeric_col in (3, 4):
+            for numeric_col in (3, 4, 5):
                 num_item = table.item(row_index, numeric_col)
                 if num_item is not None:
                     num_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -18250,6 +18903,8 @@ $mail.Display()
             table.setColumnWidth(3, max(table.columnWidth(3), 100))
         if table.columnCount() > 4:
             table.setColumnWidth(4, max(table.columnWidth(4), 100))
+        if table.columnCount() > 5:
+            table.setColumnWidth(5, max(table.columnWidth(5), 110))
         table.resizeRowsToContents()
         if self.sales_table_frozen_helper is not None:
             self.sales_table_frozen_helper.rebind()
@@ -18294,7 +18949,14 @@ $mail.Display()
             self.open_item_summary_from_customer(item_number)
             return
 
-        if column >= 5:
+        if column == 5:
+            item_number_item = table.item(row, 0)
+            item_number = (item_number_item.text() if item_number_item is not None else "").strip()
+            if item_number:
+                self.show_current_customer_cover_orders(item_number=item_number)
+            return
+
+        if column >= 6:
             self.show_customer_month_invoice_lines(row, column)
             return
 
@@ -18405,7 +19067,8 @@ $mail.Display()
         table = getattr(self.ui, "salesTable", None)
         if table is None or not self.current_customer_months:
             return
-        if column < 5 or (column - 5) >= len(self.current_customer_months):
+        month_first_column = 6
+        if column < month_first_column or (column - month_first_column) >= len(self.current_customer_months):
             return
 
         item_number_item = table.item(row, 0)
@@ -18415,7 +19078,7 @@ $mail.Display()
         if not item_number:
             return
 
-        month_start = self.current_customer_months[column - 5]
+        month_start = self.current_customer_months[column - month_first_column]
         combine_accounts = bool(getattr(self, "current_customer_combine_accounts", False))
         detail_rows = self.fetch_customer_month_invoice_lines(
             self.current_customer_name,
