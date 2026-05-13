@@ -60,7 +60,7 @@ if ($OdbcInstallerPath) {
 
     Write-Host ''
     Write-Host 'Client installer build complete.' -ForegroundColor Green
-    Write-Host "Installer: $root\output\WindsorWidget_Client_1_0_0.exe"
+    Write-Host "Installer: $root\output\WindsorWidget_Client_1_1_3.exe"
     Write-Host "App icon: $root\assets\windsor_icon.ico"
 }
 finally {
