@@ -107,8 +107,12 @@ from yu_order_workflow import YUOrderEntryDialog, load_yu_review_module
 TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
 TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
 TABLE_FORMAT_SETTINGS_PREFIX = "table_format"
-APP_VERSION = "1.1.4"
+APP_VERSION = "1.2.1"
 APP_DESIGNER = "Bradley Mayze"
+# After the one-time no-space item-number migration, sales/order/stock tables
+# store canonical item numbers.  Keep runtime item-number resolution for entry/import,
+# but do not run REPLACE/LTRIM functions across the sales table during Item Summary queries.
+CANONICAL_ITEM_STORAGE = True
 UPDATE_REPO_OWNER = "Kuillemaul"
 UPDATE_REPO_NAME = "Windsor_Widget_Code"
 UPDATE_RELEASES_API_URL = f"https://api.github.com/repos/{UPDATE_REPO_OWNER}/{UPDATE_REPO_NAME}/releases/latest"
@@ -8162,6 +8166,241 @@ class MainWindow(QMainWindow):
         dark_colors.setdefault("check_border", dark_colors.get("border", "#5A5F69"))
         return dark_colors
 
+    # ------------------------------------------------------------------
+    # Item number resolver
+    # ------------------------------------------------------------------
+    def item_clean_key(self, value):
+        """Canonical comparison key for non-FASTENERS item numbers.
+
+        The MYOB clean-up project only removes spaces.  For normal items the
+        Widget treats ABC 123 and ABC123 as the same item.  FASTENERS are the
+        exception and are handled by exact item number only.
+        """
+        return re.sub(r"[\s\u00A0]+", "", str(value or "").strip()).upper()
+
+    def item_exact_key(self, value):
+        return re.sub(r"\s+", " ", str(value or "").replace("\u00A0", " ").strip()).upper()
+
+    def item_clean_sql_expr(self, expression="item_number"):
+        return (
+            "UPPER(REPLACE(REPLACE(REPLACE("
+            f"LTRIM(RTRIM(COALESCE({expression}, ''))), "
+            "' ', ''), CHAR(9), ''), CHAR(160), ''))"
+        )
+
+    def item_exact_sql_expr(self, expression="item_number"):
+        return f"UPPER(LTRIM(RTRIM(COALESCE({expression}, ''))))"
+
+    def row_is_fasteners_item(self, row):
+        if not row:
+            return False
+        row_dict = self.row_to_dict(row) if not isinstance(row, dict) else row
+        for key, value in row_dict.items():
+            key_norm = self.normalize_header(key)
+            if key_norm in {"customlist1", "itemgroup", "group", "groupname"}:
+                if "FASTENERS" in str(value or "").upper():
+                    return True
+        return False
+
+    def items_fasteners_exclusion_sql(self, table_alias=""):
+        columns = self.get_items_group_column_names() if self.has_table("items") else []
+        if not columns:
+            return ""
+        prefix = f"{table_alias}." if table_alias else ""
+        tests = [
+            f"UPPER(LTRIM(RTRIM(COALESCE({prefix}{self.db_identifier(column)}, '')))) LIKE '%FASTENERS%'"
+            for column in columns
+        ]
+        return " AND NOT (" + " OR ".join(tests) + ")"
+
+    def fetch_item_rows_by_clean_key(self, clean_key):
+        clean_key = self.item_clean_key(clean_key)
+        if not clean_key or self.db_conn is None or not self.has_table("items"):
+            return []
+        exclusion = self.items_fasteners_exclusion_sql()
+        return [
+            self.row_to_dict(row)
+            for row in self.db_all(
+                f"""
+                SELECT *
+                FROM items
+                WHERE {self.item_clean_sql_expr('item_number')} = ?
+                  {exclusion}
+                ORDER BY item_number COLLATE NOCASE
+                """,
+                (clean_key,),
+            )
+        ]
+
+    def fetch_item_row_by_exact_number(self, item_number):
+        item_number = str(item_number or "").strip()
+        if not item_number or self.db_conn is None or not self.has_table("items"):
+            return {}
+        return self.row_to_dict(
+            self.db_one(
+                f"""
+                SELECT *
+                FROM items
+                WHERE {self.item_exact_sql_expr('item_number')} = {self.item_exact_sql_expr('?')}
+                LIMIT 1
+                """,
+                (item_number,),
+            )
+        )
+
+    def approved_canonical_for_clean_key(self, clean_key):
+        clean_key = self.item_clean_key(clean_key)
+        if not clean_key or self.db_conn is None or not self.has_table("item_merge_approvals"):
+            return ""
+        row = self.row_to_dict(
+            self.db_one(
+                """
+                SELECT canonical_item_number
+                FROM item_merge_approvals
+                WHERE clean_item_number = ?
+                  AND COALESCE(approved, 1) = 1
+                LIMIT 1
+                """,
+                (clean_key,),
+            )
+        )
+        canonical = str(row.get("canonical_item_number") or "").strip()
+        return canonical or ""
+
+    def resolve_item_number(self, typed_text, allow_prefix=False, require_known=True):
+        """Resolve any typed/imported item number to the Widget canonical number.
+
+        Normal items are canonicalised by removing whitespace.  FASTENERS items
+        are exact-only: spaces are preserved and no automatic clean-key matching
+        is applied.
+        """
+        typed = str(typed_text or "").strip()
+        if not typed:
+            return None
+
+        exact_row = self.fetch_item_row_by_exact_number(typed)
+        if exact_row:
+            exact_item = str(exact_row.get("item_number") or typed).strip()
+            if self.row_is_fasteners_item(exact_row):
+                return exact_item
+            return self.item_clean_key(exact_item)
+
+        clean_key = self.item_clean_key(typed)
+        if clean_key:
+            rows = self.fetch_item_rows_by_clean_key(clean_key)
+            if len(rows) == 1:
+                return clean_key
+            if len(rows) > 1:
+                approved = self.approved_canonical_for_clean_key(clean_key)
+                if approved:
+                    return approved
+                return None
+
+        if allow_prefix:
+            typed_upper = typed.upper()
+            prefix_matches = [
+                item_no for item_no in getattr(self, "item_numbers", []) or []
+                if str(item_no or "").upper().startswith(typed_upper)
+            ]
+            if len(prefix_matches) == 1:
+                prefix_item = str(prefix_matches[0] or "").strip()
+                prefix_row = self.fetch_item_row_by_exact_number(prefix_item)
+                if prefix_row and self.row_is_fasteners_item(prefix_row):
+                    return prefix_item
+                return self.item_clean_key(prefix_item)
+
+        if require_known:
+            return None
+        return clean_key or typed
+
+    def canonicalize_import_item_number(self, item_number):
+        """Canonicalise imported MYOB numbers without rejecting brand-new items."""
+        item_number = str(item_number or "").strip()
+        if not item_number:
+            return ""
+        return self.resolve_item_number(item_number, allow_prefix=False, require_known=False) or item_number
+
+    def is_fasteners_item_number(self, item_number):
+        row = self.fetch_item_row_by_exact_number(item_number)
+        return self.row_is_fasteners_item(row)
+
+    def item_numbers_match(self, candidate, target):
+        candidate = str(candidate or "").strip()
+        target = str(target or "").strip()
+        if not candidate or not target:
+            return False
+        if self.is_fasteners_item_number(candidate) or self.is_fasteners_item_number(target):
+            return self.item_exact_key(candidate) == self.item_exact_key(target)
+        return self.item_clean_key(candidate) == self.item_clean_key(target)
+
+    def build_item_number_filter_clause(self, item_numbers, column_expr="item_number"):
+        item_list = item_numbers if isinstance(item_numbers, (list, tuple, set)) else [item_numbers]
+        exact_keys = []
+        clean_keys = []
+        for raw_item in item_list:
+            raw_item = str(raw_item or "").strip()
+            if not raw_item:
+                continue
+            resolved = self.resolve_item_number(raw_item, allow_prefix=False, require_known=False) or raw_item
+            if self.is_fasteners_item_number(resolved):
+                key = self.item_exact_key(resolved)
+                if key and key not in exact_keys:
+                    exact_keys.append(key)
+            else:
+                key = self.item_clean_key(resolved)
+                if key and key not in clean_keys:
+                    clean_keys.append(key)
+
+        clauses = []
+        params = []
+        if exact_keys:
+            clause, clause_params = self.sql_in_clause(exact_keys)
+            clauses.append(f"{self.item_exact_sql_expr(column_expr)} IN {clause}")
+            params.extend(clause_params)
+        if clean_keys:
+            clause, clause_params = self.sql_in_clause(clean_keys)
+            clauses.append(f"{self.item_clean_sql_expr(column_expr)} IN {clause}")
+            params.extend(clause_params)
+        if not clauses:
+            return "1 = 0", []
+        return "(" + " OR ".join(clauses) + ")", params
+
+    def build_exact_canonical_item_filter_clause(self, item_numbers, column_expr="item_number"):
+        """Fast item filter for tables already migrated to canonical item numbers.
+
+        This deliberately avoids wrapping the database column in REPLACE/TRIM/UPPER.
+        SQL Server can then use indexes such as IX_sales_item_number_sale_date.
+        Use this only for tables migrated to the no-space naming convention.
+        """
+        item_list = item_numbers if isinstance(item_numbers, (list, tuple, set)) else [item_numbers]
+        values = []
+        for raw_item in item_list:
+            raw_item = str(raw_item or "").strip()
+            if not raw_item:
+                continue
+            resolved = self.resolve_item_number(raw_item, allow_prefix=False, require_known=False) or raw_item
+            if self.is_fasteners_item_number(resolved):
+                value = resolved.strip()
+            else:
+                value = self.item_clean_key(resolved)
+            if value and value not in values:
+                values.append(value)
+        if not values:
+            return "1 = 0", []
+        clause, params = self.sql_in_clause(values)
+        return f"{column_expr} IN {clause}", params
+
+    def get_stock_row_for_item(self, item_number):
+        if self.db_conn is None or not item_number or not self.has_table("stock"):
+            return {}
+        where_clause, params = self.build_exact_canonical_item_filter_clause([item_number], "item_number")
+        return self.row_to_dict(
+            self.db_one(
+                f"SELECT * FROM stock WHERE {where_clause} LIMIT 1",
+                params,
+            )
+        )
+
     def get_item_planning_status(self, item_number=None, item_row=None):
         if isinstance(item_row, dict):
             for key in ("planning_status", "Planning Status"):
@@ -8170,12 +8409,7 @@ class MainWindow(QMainWindow):
         item_number = (item_number or "").strip()
         if not item_number or self.db_conn is None:
             return PLANNING_STATUS_ACTIVE
-        row = self.row_to_dict(
-            self.db_one(
-                "SELECT planning_status FROM items WHERE UPPER(TRIM(item_number)) = UPPER(TRIM(?)) LIMIT 1",
-                (item_number,),
-            )
-        )
+        row = self.get_item_master_row(item_number)
         return self.normalise_planning_status((row or {}).get("planning_status"))
 
     def set_item_planning_status(self, item_number, status):
@@ -8183,10 +8417,12 @@ class MainWindow(QMainWindow):
         if not item_number or self.db_conn is None:
             return False
         status = self.normalise_planning_status(status)
+        item_number = self.resolve_item_number(item_number, allow_prefix=False, require_known=False) or item_number
+        where_clause, params = self.build_item_number_filter_clause([item_number], "item_number")
         cur = self.db_conn.cursor()
         cur.execute(
-            "UPDATE items SET planning_status = ? WHERE UPPER(TRIM(item_number)) = UPPER(TRIM(?))",
-            (status, item_number),
+            f"UPDATE items SET planning_status = ? WHERE {where_clause}",
+            [status, *params],
         )
         self.db_conn.commit()
         return True
@@ -8215,7 +8451,7 @@ class MainWindow(QMainWindow):
         normalised_status = self.normalise_planning_status(status)
         changed = False
         for row in getattr(self, "_order_analysis_all_rows", []) or []:
-            if (row.get("item_number", "") or "").strip().upper() != item_number.upper():
+            if not self.item_numbers_match(row.get("item_number", ""), item_number):
                 continue
             row["planning_status"] = normalised_status
             changed = True
@@ -9213,26 +9449,27 @@ class MainWindow(QMainWindow):
         item_number = str(item_number or "").strip()
         if not item_number:
             return False
+        where_clause, params = self.build_item_number_filter_clause([item_number], "item_number")
         if self.db_engine == "sqlserver":
             row = self.db_one(
-                """
+                f"""
                 SELECT TOP 1 1 AS found
                 FROM container_lines
-                WHERE UPPER(TRIM(item_number)) = UPPER(TRIM(?))
+                WHERE {where_clause}
                   AND UPPER(TRIM(COALESCE(order_number, ''))) = UPPER(TRIM(?))
                 """,
-                (item_number, order_number),
+                [*params, order_number],
             )
         else:
             row = self.db_one(
-                """
+                f"""
                 SELECT 1 AS found
                 FROM container_lines
-                WHERE UPPER(TRIM(item_number)) = UPPER(TRIM(?))
+                WHERE {where_clause}
                   AND UPPER(TRIM(COALESCE(order_number, ''))) = UPPER(TRIM(?))
                 LIMIT 1
                 """,
-                (item_number, order_number),
+                [*params, order_number],
             )
         return row is not None
 
@@ -9306,7 +9543,7 @@ class MainWindow(QMainWindow):
             existing_item = table.item(row, self.on_order_item_column)
             if (
                 existing_order is not None and (existing_order.text() or "").strip() == order_number
-                and existing_item is not None and (existing_item.text() or "").strip() == item_number
+                and existing_item is not None and self.item_numbers_match((existing_item.text() or "").strip(), item_number)
             ):
                 qty_item = table.item(row, self.on_order_qty_column)
                 current_qty = self.parse_float(qty_item.data(Qt.UserRole) if qty_item is not None else 0)
@@ -9396,7 +9633,7 @@ class MainWindow(QMainWindow):
             existing_item = table.item(row, self.on_order_item_column)
             if (
                 existing_order is not None and (existing_order.text() or "").strip() == order_number
-                and existing_item is not None and (existing_item.text() or "").strip() == item_number
+                and existing_item is not None and self.item_numbers_match((existing_item.text() or "").strip(), item_number)
             ):
                 qty_item = table.item(row, self.on_order_qty_column)
                 current_qty = self.parse_float(qty_item.data(Qt.UserRole) if qty_item is not None else 0)
@@ -9471,6 +9708,7 @@ class MainWindow(QMainWindow):
         status_text = status_item.text().strip().upper() if status_item is not None and status_item.text() else ""
         if not item_number:
             return None
+        item_number = self.canonicalize_import_item_number(item_number)
         return {
             "order_number": order_number,
             "item_number": item_number,
@@ -10569,12 +10807,16 @@ class MainWindow(QMainWindow):
             item_number = (item_row.get("item_number") or "").strip()
             if not item_number:
                 continue
-            item_meta[item_number] = {
+            meta = {
                 "item_name": (item_row.get("item_name") or "").strip(),
                 "carton": self.parse_float(item_row.get("carton", 0)),
                 "pallet": self.parse_float(item_row.get("pallet", 0)),
                 "planning_status": self.normalise_planning_status(item_row.get("planning_status")),
             }
+            item_meta[item_number] = meta
+            canonical_item = self.resolve_item_number(item_number, allow_prefix=False, require_known=False) or item_number
+            item_meta[canonical_item] = meta
+            item_meta[self.item_clean_key(item_number)] = meta
 
         sales_rows = self.db_all(
             """
@@ -10585,12 +10827,13 @@ class MainWindow(QMainWindow):
                 COUNT(*) AS line_count
             FROM sales
             WHERE TRIM(COALESCE(item_number, '')) <> ''
-              AND DATE(sale_date) BETWEEN ? AND ?
+              AND sale_date BETWEEN ? AND ?
             GROUP BY TRIM(item_number)
             """,
             (start_date.isoformat(), end_date.isoformat()),
         )
 
+        self._item_monthly_qty_cache = {}
         months = self.month_list_between(start_date, end_date)
         months_count = max(1, len(months))
         lead_days = self.get_lead_time_days()
@@ -10624,12 +10867,7 @@ class MainWindow(QMainWindow):
         rows_to_show = []
         for item_number, sales_data in grouped.items():
             item_info = item_meta.get(item_number, {})
-            stock_row = self.row_to_dict(
-                self.db_one(
-                    "SELECT * FROM stock WHERE UPPER(TRIM(item_number)) = UPPER(TRIM(?)) LIMIT 1",
-                    (item_number,),
-                )
-            )
+            stock_row = self.get_stock_row_for_item(item_number)
             on_hand = self.parse_float(self.get_first(stock_row, "on_hand", "On Hand", default=0))
             stock_on_order = self.parse_float(self.get_first(stock_row, "on_order", "On Order", default=0))
             inbound_context = self.get_item_inbound_context(item_number, lead_days)
@@ -10803,10 +11041,12 @@ class MainWindow(QMainWindow):
         column_name = self.get_items_supplier_column_name()
         if not column_name:
             return False
+        item_number = self.resolve_item_number(item_number, allow_prefix=False, require_known=False) or item_number
+        where_clause, params = self.build_item_number_filter_clause([item_number], "item_number")
         cur = self.db_conn.cursor()
         cur.execute(
-            f"UPDATE items SET [{column_name}] = ? WHERE UPPER(TRIM(item_number)) = UPPER(TRIM(?))",
-            (supplier_name, item_number),
+            f"UPDATE items SET [{column_name}] = ? WHERE {where_clause}",
+            [supplier_name, *params],
         )
         self.db_conn.commit()
         return True
@@ -11775,7 +12015,7 @@ class MainWindow(QMainWindow):
                 continue
             if (
                 (existing.get("order_number", "") or "").strip() == order_number
-                and (existing.get("item_number", "") or "").strip() == item_number
+                and self.item_numbers_match((existing.get("item_number", "") or "").strip(), item_number)
             ):
                 qty_item = table.item(row, self.on_order_qty_column)
                 current_qty = self.parse_float(qty_item.data(Qt.UserRole) if qty_item is not None else 0)
@@ -12195,6 +12435,7 @@ class MainWindow(QMainWindow):
         priority_text = priority_item.text().strip().upper() if priority_item is not None and priority_item.text() else ""
         if not item_number:
             return None
+        item_number = self.canonicalize_import_item_number(item_number)
         return {
             "item_number": item_number,
             "description": description,
@@ -13419,10 +13660,12 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Invalid carton qty", "Carton qty must be greater than 0.")
             return None
 
+        item_number = self.resolve_item_number(item_number, allow_prefix=False, require_known=False) or item_number
+        where_clause, params = self.build_item_number_filter_clause([item_number], "item_number")
         cur = self.db_conn.cursor()
         cur.execute(
-            f"UPDATE items SET [{column_name}] = ? WHERE UPPER(TRIM(item_number)) = UPPER(TRIM(?))",
-            (new_value, item_number),
+            f"UPDATE items SET [{column_name}] = ? WHERE {where_clause}",
+            [new_value, *params],
         )
         self.db_conn.commit()
 
@@ -14256,7 +14499,7 @@ class MainWindow(QMainWindow):
 
         for row in range(table.rowCount()):
             existing_item = table.item(row, 0)
-            if existing_item is None or (existing_item.text() or "").strip() != item_number:
+            if existing_item is None or not self.item_numbers_match((existing_item.text() or "").strip(), item_number):
                 continue
 
             qty_item = table.item(row, self.order_qty_column)
@@ -14364,10 +14607,11 @@ class MainWindow(QMainWindow):
         if not accepted:
             return
 
+        where_clause, params = self.build_item_number_filter_clause([self.current_item_number], "item_number")
         cur = self.db_conn.cursor()
         cur.execute(
-            f"UPDATE items SET [{field_meta['column']}] = ? WHERE UPPER(TRIM(item_number)) = UPPER(TRIM(?))",
-            (float(new_value), self.current_item_number),
+            f"UPDATE items SET [{field_meta['column']}] = ? WHERE {where_clause}",
+            [float(new_value), *params],
         )
         self.db_conn.commit()
 
@@ -14448,12 +14692,29 @@ class MainWindow(QMainWindow):
         return False
 
     def get_item_master_row(self, item_number):
-        return self.row_to_dict(
-            self.db_one(
-                "SELECT * FROM items WHERE UPPER(TRIM(item_number)) = UPPER(TRIM(?)) LIMIT 1",
-                (item_number,),
-            )
-        )
+        item_number = str(item_number or "").strip()
+        if not item_number or self.db_conn is None or not self.has_table("items"):
+            return {}
+
+        exact_row = self.fetch_item_row_by_exact_number(item_number)
+        if exact_row:
+            return exact_row
+
+        clean_key = self.item_clean_key(item_number)
+        rows = self.fetch_item_rows_by_clean_key(clean_key)
+        if len(rows) == 1:
+            return rows[0]
+
+        approved = self.approved_canonical_for_clean_key(clean_key)
+        if approved:
+            approved_exact = self.fetch_item_row_by_exact_number(approved)
+            if approved_exact:
+                return approved_exact
+            approved_rows = self.fetch_item_rows_by_clean_key(approved)
+            if len(approved_rows) == 1:
+                return approved_rows[0]
+
+        return {}
 
     def import_orders_from_dialog(self):
         filters = "Orders files (*.csv *.xlsx *.xlsm);;CSV files (*.csv);;Excel files (*.xlsx *.xlsm);;All files (*.*)"
@@ -14624,7 +14885,8 @@ class MainWindow(QMainWindow):
         return rows
 
     def build_order_import_tuple(self, row, column_map, line_number):
-        item_number = str(row.get(column_map["item_number"], "") or "").strip()
+        raw_item_number = str(row.get(column_map["item_number"], "") or "").strip()
+        item_number = raw_item_number
         quantity_value = self.parse_float(row.get(column_map["quantity"], 0))
         purchase_no = str(row.get(column_map["purchase_no"], "") or "").strip()
         shipping_date = self.normalize_order_import_date(row.get(column_map["order_date"], ""))
@@ -14638,6 +14900,7 @@ class MainWindow(QMainWindow):
         if quantity_value <= 0:
             raise ValueError(f"Line {line_number}: quantity must be greater than 0.")
 
+        item_number = self.canonicalize_import_item_number(item_number)
         return (item_number, quantity_value, purchase_no, shipping_date)
 
     def import_sales_from_dialog(self):
@@ -14827,7 +15090,7 @@ class MainWindow(QMainWindow):
         return (
             self.normalize_sales_import_date(sale_date),
             str(customer_name or "").strip().upper(),
-            str(item_number or "").strip().upper(),
+            self.item_clean_key(item_number),
             round(self.parse_float(quantity), 6),
             round(self.parse_float(price), 6),
             str(invoice_no or "").strip().upper(),
@@ -14839,24 +15102,16 @@ class MainWindow(QMainWindow):
             return {}
 
         result = {}
-        cur = self.db_conn.cursor()
-        chunk_size = 900
-        for start in range(0, len(normalized_items), chunk_size):
-            chunk = normalized_items[start:start + chunk_size]
-            placeholders = ",".join("?" for _ in chunk)
-            cur.execute(
-                f"""
-                SELECT TRIM(item_number) AS item_number,
-                       COALESCE(NULLIF(TRIM(item_name), ''), NULLIF(TRIM(description), ''), '') AS item_name
-                FROM items
-                WHERE UPPER(TRIM(item_number)) IN ({placeholders})
-                """,
-                [item.upper() for item in chunk],
-            )
-            for row in cur.fetchall():
-                item_key = (row[0] or "").strip().upper()
-                if item_key and item_key not in result:
-                    result[item_key] = (row[1] or "").strip()
+        for raw_item in normalized_items:
+            canonical = self.canonicalize_import_item_number(raw_item)
+            item_row = self.get_item_master_row(canonical or raw_item)
+            item_name = self.get_first(item_row, "item_name", "Item Name", "description", "Description")
+            if not item_name:
+                continue
+            for key in {raw_item, canonical, self.item_clean_key(raw_item), self.item_clean_key(canonical)}:
+                key = str(key or "").strip().upper()
+                if key and key not in result:
+                    result[key] = str(item_name or "").strip()
         return result
 
     def read_sales_rows_from_csv(self, path):
@@ -14930,7 +15185,8 @@ class MainWindow(QMainWindow):
     def build_sales_import_tuple(self, row, column_map, line_number, item_map):
         sale_date = self.normalize_sales_import_date(row.get(column_map["sale_date"], ""))
         customer_name = str(row.get(column_map["customer_name"], "") or "").strip()
-        item_number = str(row.get(column_map["item_number"], "") or "").strip()
+        raw_item_number = str(row.get(column_map["item_number"], "") or "").strip()
+        item_number = raw_item_number
         quantity_value = self.parse_float(row.get(column_map["quantity"], 0))
         price_value = self.parse_float(row.get(column_map["price"], 0))
         invoice_no = str(row.get(column_map["invoice_no"], "") or "").strip()
@@ -14940,6 +15196,7 @@ class MainWindow(QMainWindow):
             return None
         if not item_number:
             return None
+        item_number = self.canonicalize_import_item_number(raw_item_number)
         if not customer_name:
             raise ValueError(f"Line {line_number}: customer name is blank.")
         if not sale_date:
@@ -14947,7 +15204,11 @@ class MainWindow(QMainWindow):
         if not invoice_no:
             raise ValueError(f"Line {line_number}: invoice number is blank.")
 
-        description = item_map.get(item_number.upper(), "")
+        description = item_map.get(str(raw_item_number or "").strip().upper(), "")
+        if not description:
+            description = item_map.get(str(item_number or "").strip().upper(), "")
+        if not description:
+            description = item_map.get(self.item_clean_key(item_number), "")
         if not description:
             description = item_number
         month_key = self.sales_month_key_from_date(sale_date)
@@ -15080,7 +15341,8 @@ class MainWindow(QMainWindow):
     def build_cover_order_import_tuple(self, row, column_map, line_number):
         invoice_no = str(row.get(column_map["invoice_no"], "") or "").strip()
         customer_name = str(row.get(column_map["customer_name"], "") or "").strip()
-        item_number = str(row.get(column_map["item_number"], "") or "").strip()
+        raw_item_number = str(row.get(column_map["item_number"], "") or "").strip()
+        item_number = raw_item_number
         quantity_value = self.parse_float(row.get(column_map["quantity"], 0))
         cover_date = self.normalize_sales_import_date(row.get(column_map["cover_date"], ""))
         journal_memo = str(row.get(column_map["journal_memo"], "") or "").strip()
@@ -15096,6 +15358,7 @@ class MainWindow(QMainWindow):
         if not cover_date:
             raise ValueError(f"Line {line_number}: date is blank or invalid.")
 
+        item_number = self.canonicalize_import_item_number(raw_item_number)
         return (invoice_no, customer_name, item_number, quantity_value, cover_date, journal_memo)
 
     def import_stock_from_dialog(self):
@@ -15188,7 +15451,8 @@ class MainWindow(QMainWindow):
         return resolved
 
     def build_stock_import_tuple(self, row, column_map, line_number):
-        item_number = str(row.get(column_map["item_number"], "") or "").strip()
+        raw_item_number = str(row.get(column_map["item_number"], "") or "").strip()
+        item_number = raw_item_number
         item_name = str(row.get(column_map.get("item_name", ""), "") or "").strip() if column_map.get("item_name") else ""
         on_hand = self.parse_float(row.get(column_map["on_hand"], 0))
         committed = self.parse_float(row.get(column_map["committed"], 0))
@@ -15201,6 +15465,7 @@ class MainWindow(QMainWindow):
             return None
         if item_number.startswith("\\"):
             return None
+        item_number = self.canonicalize_import_item_number(raw_item_number)
 
         return {
             "item_number": item_number,
@@ -15281,7 +15546,7 @@ class MainWindow(QMainWindow):
         on_order_column = item_columns.get("on_order")
         available_column = item_columns.get("available")
 
-        normalized_items = sorted({str(row.get("item_number", "") or "").strip().upper() for row in stock_rows if str(row.get("item_number", "") or "").strip()})
+        normalized_items = sorted({self.item_exact_key(row.get("item_number", "")) for row in stock_rows if str(row.get("item_number", "") or "").strip()})
         existing_items = {}
         if normalized_items:
             chunk_size = 900
@@ -15289,20 +15554,20 @@ class MainWindow(QMainWindow):
                 chunk = normalized_items[start:start + chunk_size]
                 placeholders = ",".join("?" for _ in chunk)
                 rows = self.db_all(
-                    f"SELECT * FROM items WHERE UPPER(TRIM([{item_number_column}])) IN ({placeholders})",
+                    f"SELECT * FROM items WHERE {self.item_exact_sql_expr(f'[{item_number_column}]')} IN ({placeholders})",
                     chunk,
                 )
                 for existing_row in rows:
-                    existing_items[str(existing_row[item_number_column] or "").strip().upper()] = self.row_to_dict(existing_row)
+                    existing_items[self.item_exact_key(existing_row[item_number_column])] = self.row_to_dict(existing_row)
 
         cur = self.db_conn.cursor()
         for stock_row in stock_rows:
             item_number = str(stock_row.get("item_number", "") or "").strip()
             if not item_number:
                 continue
-            item_key = item_number.upper()
+            item_key = self.item_exact_key(item_number)
             item_name = str(stock_row.get("item_name", "") or "").strip()
-            existing_row = existing_items.get(item_key)
+            existing_row = existing_items.get(item_key) or self.get_item_master_row(item_number)
 
             if existing_row is None:
                 insert_columns = [item_number_column]
@@ -15337,6 +15602,10 @@ class MainWindow(QMainWindow):
 
             update_assignments = []
             update_values = []
+            existing_item_number = str(existing_row.get(item_number_column, "") or "").strip()
+            if existing_item_number and existing_item_number != item_number and not self.row_is_fasteners_item(existing_row):
+                update_assignments.append(f"[{item_number_column}] = ?")
+                update_values.append(item_number)
             if item_name:
                 if item_name_column and not str(existing_row.get(item_name_column, "") or "").strip():
                     update_assignments.append(f"[{item_name_column}] = ?")
@@ -15346,9 +15615,10 @@ class MainWindow(QMainWindow):
                     update_values.append(item_name)
 
             if update_assignments:
+                where_clause, where_params = self.build_item_number_filter_clause([item_number], f"[{item_number_column}]")
                 cur.execute(
-                    f"UPDATE items SET {', '.join(update_assignments)} WHERE UPPER(TRIM([{item_number_column}])) = UPPER(TRIM(?))",
-                    [*update_values, item_number],
+                    f"UPDATE items SET {', '.join(update_assignments)} WHERE {where_clause}",
+                    [*update_values, *where_params],
                 )
 
 
@@ -15778,12 +16048,12 @@ class MainWindow(QMainWindow):
             return 0.0
 
         total = 0.0
-        target = item_number.strip().upper()
+        target = item_number.strip()
         for row in range(table.rowCount()):
             item_cell = table.item(row, 0)
             qty_cell = table.item(row, self.order_qty_column)
-            item_text = item_cell.text().strip().upper() if item_cell is not None and item_cell.text() else ""
-            if item_text != target:
+            item_text = item_cell.text().strip() if item_cell is not None and item_cell.text() else ""
+            if not self.item_numbers_match(item_text, target):
                 continue
             qty_value = qty_cell.data(Qt.UserRole) if qty_cell is not None else None
             if qty_value in (None, "") and qty_cell is not None:
@@ -15797,12 +16067,12 @@ class MainWindow(QMainWindow):
             return 0.0
 
         total = 0.0
-        target = item_number.strip().upper()
+        target = item_number.strip()
         for row in range(table.rowCount()):
             item_cell = table.item(row, self.on_order_item_column)
             qty_cell = table.item(row, self.on_order_qty_column)
-            item_text = item_cell.text().strip().upper() if item_cell is not None and item_cell.text() else ""
-            if item_text != target:
+            item_text = item_cell.text().strip() if item_cell is not None and item_cell.text() else ""
+            if not self.item_numbers_match(item_text, target):
                 continue
             qty_value = qty_cell.data(Qt.UserRole) if qty_cell is not None else None
             if qty_value in (None, "") and qty_cell is not None:
@@ -15811,7 +16081,7 @@ class MainWindow(QMainWindow):
         return total
 
     def get_open_container_summary(self, item_number):
-        target = (item_number or "").strip().upper()
+        target = (item_number or "").strip()
         if not target:
             return {"qty": 0.0, "eta_text": "", "container_ref": ""}
 
@@ -15825,8 +16095,8 @@ class MainWindow(QMainWindow):
                     continue
                 item_cell = table.item(row, self.container_columns["item"])
                 qty_cell = table.item(row, self.container_columns["qty"])
-                item_text = item_cell.text().strip().upper() if item_cell is not None and item_cell.text() else ""
-                if item_text != target:
+                item_text = item_cell.text().strip() if item_cell is not None and item_cell.text() else ""
+                if not self.item_numbers_match(item_text, target):
                     continue
                 qty_value = qty_cell.data(Qt.UserRole) if qty_cell is not None else None
                 if qty_value in (None, "") and qty_cell is not None:
@@ -15835,8 +16105,8 @@ class MainWindow(QMainWindow):
 
         current_item_widget = getattr(self.ui, "itemNumberContainer_line", None)
         current_qty_widget = getattr(self.ui, "qtyContainder_line", None)
-        current_item = current_item_widget.text().strip().upper() if current_item_widget is not None else ""
-        if current_item == target:
+        current_item = current_item_widget.text().strip() if current_item_widget is not None else ""
+        if self.item_numbers_match(current_item, target):
             total += self.parse_float(current_qty_widget.text() if current_qty_widget is not None else 0)
 
         eta_text = ""
@@ -15854,8 +16124,9 @@ class MainWindow(QMainWindow):
         if not target or self.db_conn is None or not self.has_table("container_lines") or not self.has_table("containers"):
             return {"qty": 0.0, "eta_text": "", "container_ref": ""}
 
+        where_clause, params = self.build_exact_canonical_item_filter_clause([target], "cl.item_number")
         rows = self.db_all(
-            """
+            f"""
             SELECT
                 cl.container_ref,
                 SUM(COALESCE(cl.qty, 0)) AS total_qty,
@@ -15863,10 +16134,10 @@ class MainWindow(QMainWindow):
                 MIN(NULLIF(TRIM(c.updated_on), '')) AS updated_on
             FROM container_lines cl
             LEFT JOIN containers c ON UPPER(TRIM(c.container_ref)) = UPPER(TRIM(cl.container_ref))
-            WHERE UPPER(TRIM(cl.item_number)) = UPPER(TRIM(?))
+            WHERE {where_clause}
             GROUP BY cl.container_ref
             """,
-            (target,),
+            params,
         )
 
         best = None
@@ -15928,15 +16199,16 @@ class MainWindow(QMainWindow):
         return str(summary.get("eta_text", "") or "")
 
     def get_orders_table_item_summary(self, item_number):
+        where_clause, params = self.build_exact_canonical_item_filter_clause([item_number], "item_number")
         row = self.db_one(
-            """
+            f"""
             SELECT
                 SUM(COALESCE(quantity, 0)) AS total_qty,
                 MIN(NULLIF(TRIM(order_date), '')) AS first_order_date
             FROM orders
-            WHERE UPPER(TRIM(item_number)) = UPPER(TRIM(?))
+            WHERE {where_clause}
             """,
-            (item_number,),
+            params,
         )
         row_dict = self.row_to_dict(row)
         total_qty = self.parse_float(row_dict.get("total_qty", 0)) if row_dict else 0.0
@@ -15958,6 +16230,90 @@ class MainWindow(QMainWindow):
                     if not order_date_text:
                         order_date_text = raw_date
         return total_qty, order_date_text
+
+    def get_orders_table_item_shipment_summaries(self, item_number):
+        """Return shipped/on-water order quantities grouped by arrival date.
+
+        Item Summary only has two visible inbound slots for physical shipments:
+        Shipped and Next Container.  When two containers are already on the
+        water, the earliest dated orders table entry appears in Shipped and the
+        next distinct arrival date appears in Next Container.
+        """
+        if self.db_conn is None or not item_number or not self.has_table("orders"):
+            return []
+
+        where_clause, params = self.build_exact_canonical_item_filter_clause([item_number], "item_number")
+        rows = self.db_all(
+            f"""
+            SELECT
+                item_number,
+                quantity,
+                purchase_no,
+                order_date
+            FROM orders
+            WHERE {where_clause}
+            """,
+            params,
+        )
+
+        grouped = {}
+        undated_index = 0
+        for row in rows:
+            row_dict = self.row_to_dict(row)
+            qty = self.parse_float(row_dict.get("quantity", 0))
+            if qty <= 0:
+                continue
+
+            raw_date = "" if row_dict.get("order_date") is None else str(row_dict.get("order_date")).strip()
+            parsed_date = self.parse_date_value(raw_date)
+            purchase_no = "" if row_dict.get("purchase_no") is None else str(row_dict.get("purchase_no")).strip()
+
+            if parsed_date is not None:
+                group_key = ("date", parsed_date.isoformat())
+                sort_date = parsed_date
+                display_date = parsed_date.strftime("%d/%m/%Y")
+            else:
+                undated_index += 1
+                group_key = ("undated", raw_date or f"undated-{undated_index}")
+                sort_date = date.max
+                display_date = raw_date
+
+            bucket = grouped.setdefault(
+                group_key,
+                {
+                    "qty": 0.0,
+                    "arrival_date": parsed_date,
+                    "display_date": display_date,
+                    "eta_text": display_date,
+                    "sort_date": sort_date,
+                    "purchase_numbers": [],
+                    "raw_dates": [],
+                },
+            )
+            bucket["qty"] += qty
+            if purchase_no and purchase_no not in bucket["purchase_numbers"]:
+                bucket["purchase_numbers"].append(purchase_no)
+            if raw_date and raw_date not in bucket["raw_dates"]:
+                bucket["raw_dates"].append(raw_date)
+
+        shipments = list(grouped.values())
+        shipments.sort(
+            key=lambda entry: (
+                entry.get("sort_date") or date.max,
+                str(entry.get("display_date") or ""),
+                ", ".join(entry.get("purchase_numbers") or []),
+            )
+        )
+
+        for index, entry in enumerate(shipments, start=1):
+            purchase_text = ", ".join(entry.get("purchase_numbers") or [])
+            entry["container_ref"] = purchase_text
+            entry["shipment_index"] = index
+            if purchase_text:
+                entry["tooltip"] = f"Shipped/on-water order {purchase_text}: ETA {entry.get('display_date') or 'unknown'}. Counted as inbound."
+            else:
+                entry["tooltip"] = f"Shipped/on-water order: ETA {entry.get('display_date') or 'unknown'}. Counted as inbound."
+        return shipments
 
     def refresh_item_summary_context_boxes(self, inbound_context=None):
         if not self.current_item_number:
@@ -16434,15 +16790,24 @@ $mail.Display()
 
 
     def normalize_item_code(self, value):
-        return re.sub(r"\s+", "", str(value or "")).upper()
+        return self.item_clean_key(value)
 
     def find_item_number_by_normalized(self, normalized_code):
         target = self.normalize_item_code(normalized_code)
         if not target:
             return None
+        rows = self.fetch_item_rows_by_clean_key(target)
+        if len(rows) == 1:
+            return target
+        approved = self.approved_canonical_for_clean_key(target)
+        if approved:
+            return approved
         for item_no in self.item_numbers:
             if self.normalize_item_code(item_no) == target:
-                return item_no
+                row = self.fetch_item_row_by_exact_number(item_no)
+                if row and self.row_is_fasteners_item(row):
+                    return item_no
+                return target
         return None
 
     def get_thread_sales_item_numbers(self, item_number):
@@ -16480,13 +16845,9 @@ $mail.Display()
         return unique
 
     def build_sales_item_filter_clause(self, item_numbers):
-        normalized_codes = []
-        for code in item_numbers:
-            key = self.normalize_item_code(code)
-            if key:
-                normalized_codes.append(key)
-        clause, params = self.sql_in_clause(normalized_codes)
-        return f"UPPER(REPLACE(TRIM(item_number), ' ', '')) IN {clause}", params
+        if bool(globals().get("CANONICAL_ITEM_STORAGE", False)):
+            return self.build_exact_canonical_item_filter_clause(item_numbers, "item_number")
+        return self.build_item_number_filter_clause(item_numbers, "item_number")
 
     def format_value(self, value):
         if value is None:
@@ -16616,19 +16977,7 @@ $mail.Display()
         ]
 
     def find_item_number(self, typed_text):
-        typed = (typed_text or "").strip()
-        if not typed:
-            return None
-
-        typed_upper = typed.upper()
-        for item_no in self.item_numbers:
-            if item_no.upper() == typed_upper:
-                return item_no
-
-        prefix_matches = [item_no for item_no in self.item_numbers if item_no.upper().startswith(typed_upper)]
-        if len(prefix_matches) == 1:
-            return prefix_matches[0]
-        return None
+        return self.resolve_item_number(typed_text, allow_prefix=True, require_known=True)
 
     def find_supplier_name(self, typed_text):
         typed = (typed_text or "").strip()
@@ -16868,9 +17217,47 @@ $mail.Display()
             widget.setStyleSheet("")
         widget.setToolTip(tooltip or "")
 
+    def build_item_summary_shipped_next_stylesheet(self):
+        if bool(getattr(self.ui, "radioLight", None) and self.ui.radioLight.isChecked()):
+            return (
+                "background-color: #d9f2df; "
+                "color: #0f3b1d; "
+                "border: 3px solid #38a169; "
+                "border-radius: 6px; "
+                "padding: 3px 6px; "
+                "font-weight: 900;"
+            )
+        return (
+            "background-color: #164d2b; "
+            "color: #d9f2df; "
+            "border: 3px solid #38a169; "
+            "border-radius: 6px; "
+            "padding: 3px 6px; "
+            "font-weight: 900;"
+        )
+
+    def set_widget_shipped_next_state(self, object_name, enabled=False, tooltip=""):
+        widget = getattr(self.ui, object_name, None)
+        if widget is None:
+            return
+        if enabled:
+            widget.setStyleSheet(self.build_item_summary_shipped_next_stylesheet())
+            widget.setToolTip(tooltip or "Next container is already shipped/on-water.")
+
     def fetch_item_monthly_qty(self, item_numbers, start_date, end_date):
         item_list = item_numbers if isinstance(item_numbers, (list, tuple, set)) else [item_numbers]
+        cache_key = (
+            tuple(sorted(str(item or "").strip().upper() for item in item_list if str(item or "").strip())),
+            start_date.isoformat() if isinstance(start_date, date) else str(start_date),
+            end_date.isoformat() if isinstance(end_date, date) else str(end_date),
+        )
+        cache = getattr(self, "_item_monthly_qty_cache", None)
+        if isinstance(cache, dict) and cache_key in cache:
+            return dict(cache[cache_key])
+
         where_clause, params = self.build_sales_item_filter_clause(item_list)
+        start_text = start_date.isoformat() if isinstance(start_date, date) else str(start_date)
+        end_text = end_date.isoformat() if isinstance(end_date, date) else str(end_date)
         rows = self.db_all(
             f"""
             SELECT
@@ -16878,11 +17265,11 @@ $mail.Display()
                 SUM(COALESCE(quantity, 0)) AS total_qty
             FROM sales
             WHERE {where_clause}
-              AND DATE(sale_date) BETWEEN ? AND ?
+              AND sale_date BETWEEN ? AND ?
             GROUP BY COALESCE(NULLIF(TRIM(month_key), ''), STRFTIME('%Y-%m', DATE(sale_date)))
             ORDER BY month_key
             """,
-            [*params, start_date.isoformat(), end_date.isoformat()],
+            [*params, start_text, end_text],
         )
 
         month_totals = {}
@@ -16891,6 +17278,8 @@ $mail.Display()
             if month_start is None:
                 continue
             month_totals[month_start] = self.parse_float(row["total_qty"])
+        if isinstance(cache, dict):
+            cache[cache_key] = dict(month_totals)
         return month_totals
 
     def get_item_inbound_context(self, item_number, lead_days=None, today=None):
@@ -16905,10 +17294,28 @@ $mail.Display()
         next_container_used_fallback = next_container_qty > 0 and next_container_eta is None
         next_container_arrival = next_container_eta or (fallback_date if next_container_qty > 0 else None)
 
-        shipped_qty, shipped_eta_text = self.get_orders_table_item_summary(item_number)
-        shipped_eta = self.parse_date_value(shipped_eta_text)
+        shipped_shipments = self.get_orders_table_item_shipment_summaries(item_number)
+        shipped_first = shipped_shipments[0] if len(shipped_shipments) >= 1 else {}
+        shipped_second = shipped_shipments[1] if len(shipped_shipments) >= 2 else {}
+
+        shipped_qty = self.parse_float(shipped_first.get("qty", 0))
+        shipped_eta_text = str(shipped_first.get("eta_text") or shipped_first.get("display_date") or "")
+        shipped_eta = self.parse_date_value(shipped_first.get("arrival_date") or shipped_eta_text)
         shipped_used_fallback = shipped_qty > 0 and shipped_eta is None
         shipped_arrival = shipped_eta or (fallback_date if shipped_qty > 0 else None)
+
+        second_shipped_qty = self.parse_float(shipped_second.get("qty", 0))
+        if second_shipped_qty > 0:
+            next_container_qty = second_shipped_qty
+            next_container_eta_text = str(shipped_second.get("eta_text") or shipped_second.get("display_date") or "")
+            next_container_eta = self.parse_date_value(shipped_second.get("arrival_date") or next_container_eta_text)
+            next_container_used_fallback = next_container_qty > 0 and next_container_eta is None
+            next_container_arrival = next_container_eta or (fallback_date if next_container_qty > 0 else None)
+            next_container_is_shipped = True
+            next_container_tooltip_override = str(shipped_second.get("tooltip") or "")
+        else:
+            next_container_is_shipped = False
+            next_container_tooltip_override = None
 
         def entry(qty, arrival_date, used_fallback, source_name, include_in_calcs, tooltip_override=None):
             tooltip = tooltip_override or ""
@@ -16939,13 +17346,28 @@ $mail.Display()
             if order_form_qty > 0 else ""
         )
 
+        next_container_entry = entry(
+            next_container_qty,
+            next_container_arrival,
+            next_container_used_fallback,
+            "Next shipped container" if next_container_is_shipped else "Next container",
+            True,
+            next_container_tooltip_override,
+        )
+        next_container_entry["is_shipped_container"] = bool(next_container_is_shipped)
+        if next_container_is_shipped:
+            next_container_entry["tooltip"] = next_container_entry.get("tooltip") or (
+                "Next container is already shipped/on-water. Counted as inbound."
+            )
+
         return {
             "today": today,
             "lead_days": lead_days,
             "horizon_date": fallback_date,
             "order_form": entry(order_form_qty, None, False, "To order / on order", False, order_form_tooltip),
-            "next_container": entry(next_container_qty, next_container_arrival, next_container_used_fallback, "Next container", True),
-            "shipped": entry(shipped_qty, shipped_arrival, shipped_used_fallback, "Shipped", True),
+            "next_container": next_container_entry,
+            "shipped": entry(shipped_qty, shipped_arrival, shipped_used_fallback, "Shipped", True, shipped_first.get("tooltip")),
+            "shipped_shipments": shipped_shipments,
         }
 
     def inbound_qty_by_date(self, inbound_context, cutoff_date):
@@ -16959,6 +17381,16 @@ $mail.Display()
             arrival_date = entry.get("arrival_date")
             if entry.get("qty", 0) > 0 and arrival_date is not None and arrival_date <= cutoff_date:
                 total += self.parse_float(entry.get("qty", 0))
+
+        # The Item Summary only displays the first two shipped/on-water arrivals.
+        # If the orders table has more dated arrivals, keep the ordering maths
+        # honest by counting the extra shipments when they fall inside the
+        # requested cutoff.
+        for shipment in (inbound_context.get("shipped_shipments") or [])[2:]:
+            qty = self.parse_float(shipment.get("qty", 0))
+            arrival_date = self.parse_date_value(shipment.get("arrival_date") or shipment.get("display_date") or shipment.get("eta_text"))
+            if qty > 0 and arrival_date is not None and arrival_date <= cutoff_date:
+                total += qty
         return total
 
     def earliest_inbound_date(self, inbound_context):
@@ -17313,6 +17745,11 @@ $mail.Display()
             shipped.get("used_fallback", False),
             shipped.get("tooltip", ""),
         )
+
+        if next_container.get("is_shipped_container", False):
+            tooltip = next_container.get("tooltip", "")
+            self.set_widget_shipped_next_state("onNextContainer_box", True, tooltip)
+            self.set_widget_shipped_next_state("nextContainerETA_box", True, tooltip)
 
     def set_label_text(self, object_name, text):
         widget = getattr(self.ui, object_name, None)
@@ -17969,7 +18406,7 @@ $mail.Display()
         item_name_map = self.fetch_item_name_map((row["item_number"] for row in rows))
         latest_sale_info_by_item = {}
         for row in last_price_rows:
-            item_number = (row["item_number"] or "").strip()
+            item_number = self.canonicalize_import_item_number((row["item_number"] or "").strip())
             if not item_number or item_number in latest_sale_info_by_item:
                 continue
             latest_sale_info_by_item[item_number] = {
@@ -17986,7 +18423,7 @@ $mail.Display()
         item_name_map.update({key: value for key, value in cover_item_name_map.items() if value})
 
         for row in rows:
-            item_number = (row["item_number"] or "").strip()
+            item_number = self.canonicalize_import_item_number((row["item_number"] or "").strip())
             if not item_number:
                 continue
             month_start = self.parse_month_key(row["month_key"])
@@ -17997,7 +18434,7 @@ $mail.Display()
 
             if item_number not in pivot:
                 pivot[item_number] = {
-                    "description": item_name_map.get(item_number.upper(), ""),
+                    "description": item_name_map.get(item_number.upper(), "") or item_name_map.get(self.item_clean_key(item_number), ""),
                     "months": {m: 0.0 for m in months},
                     "last_price": latest_sale_info_by_item.get(item_number, {}).get("last_price"),
                     "last_sale_date": latest_sale_info_by_item.get(item_number, {}).get("last_sale_date"),
@@ -18014,7 +18451,7 @@ $mail.Display()
                 pivot[item_number]["cover_order_qty"] = self.parse_float(cover_qty)
                 continue
             pivot[item_number] = {
-                "description": item_name_map.get(item_number.upper(), ""),
+                "description": item_name_map.get(item_number.upper(), "") or item_name_map.get(self.item_clean_key(item_number), ""),
                 "months": {m: 0.0 for m in months},
                 "last_price": latest_sale_info_by_item.get(item_number, {}).get("last_price"),
                 "last_sale_date": latest_sale_info_by_item.get(item_number, {}).get("last_sale_date"),
@@ -18523,9 +18960,9 @@ $mail.Display()
         )
         totals = {}
         for row in rows:
-            item_number = (row["item_number"] or "").strip()
+            item_number = self.canonicalize_import_item_number((row["item_number"] or "").strip())
             if item_number:
-                totals[item_number] = self.parse_float(row["total_qty"])
+                totals[item_number] = totals.get(item_number, 0.0) + self.parse_float(row["total_qty"])
         return totals
 
     def fetch_customer_cover_orders(self, customer_name=None, combine_accounts=False, item_number=None):
@@ -18540,8 +18977,9 @@ $mail.Display()
         customer_clause, params = self.sql_in_clause(matched_customers)
         item_filter = ""
         if item_number:
-            item_filter = "AND UPPER(TRIM(item_number)) = UPPER(TRIM(?))"
-            params.append(item_number)
+            item_clause, item_params = self.build_item_number_filter_clause([item_number], "item_number")
+            item_filter = f"AND {item_clause}"
+            params.extend(item_params)
 
         rows = self.db_all(
             f"""
@@ -19531,19 +19969,9 @@ $mail.Display()
         lead_days = self.get_lead_time_days()
         suggested_min = avg_monthly_qty * (lead_days / 30.4375) if months_count else 0.0
 
-        item_row = self.row_to_dict(
-            self.db_one(
-                "SELECT * FROM items WHERE UPPER(TRIM(item_number)) = UPPER(TRIM(?)) LIMIT 1",
-                (valid_item,),
-            )
-        )
+        item_row = self.get_item_master_row(valid_item)
         planning_status = self.get_item_planning_status(valid_item, item_row)
-        stock_row = self.row_to_dict(
-            self.db_one(
-                "SELECT * FROM stock WHERE UPPER(TRIM(item_number)) = UPPER(TRIM(?)) LIMIT 1",
-                (valid_item,),
-            )
-        )
+        stock_row = self.get_stock_row_for_item(valid_item)
 
         on_hand = self.parse_float(self.get_first(stock_row, "on_hand", "On Hand", default=0))
         committed = self.parse_float(self.get_first(stock_row, "committed", "Committed", default=0))
@@ -19696,6 +20124,8 @@ $mail.Display()
     def fetch_item_customer_summary(self, item_numbers, start_date, end_date):
         item_list = item_numbers if isinstance(item_numbers, (list, tuple, set)) else [item_numbers]
         where_clause, params = self.build_sales_item_filter_clause(item_list)
+        start_text = start_date.isoformat() if isinstance(start_date, date) else str(start_date)
+        end_text = end_date.isoformat() if isinstance(end_date, date) else str(end_date)
         months = self.month_list_between(start_date, end_date)
         month_rows = self.db_all(
             f"""
@@ -19705,26 +20135,33 @@ $mail.Display()
                 SUM(COALESCE(quantity, 0)) AS total_qty
             FROM sales
             WHERE {where_clause}
-              AND DATE(sale_date) BETWEEN ? AND ?
+              AND sale_date BETWEEN ? AND ?
               AND TRIM(COALESCE(customer_name, '')) <> ''
             GROUP BY TRIM(customer_name), COALESCE(NULLIF(TRIM(month_key), ''), STRFTIME('%Y-%m', DATE(sale_date)))
             ORDER BY customer_name COLLATE NOCASE, month_key
             """,
-            [*params, start_date.isoformat(), end_date.isoformat()],
+            [*params, start_text, end_text],
         )
 
         latest_price_rows = self.db_all(
             f"""
-            SELECT
-                TRIM(customer_name) AS customer_name,
-                sale_date,
-                COALESCE(price, 0) AS price
-            FROM sales
-            WHERE {where_clause}
-              AND TRIM(COALESCE(customer_name, '')) <> ''
-            ORDER BY customer_name COLLATE NOCASE,
-                     DATE(sale_date) DESC,
-                     sale_date DESC
+            WITH ranked_sales AS (
+                SELECT
+                    TRIM(customer_name) AS customer_name,
+                    sale_date,
+                    COALESCE(price, 0) AS price,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY TRIM(customer_name)
+                        ORDER BY DATE(sale_date) DESC, sale_date DESC
+                    ) AS rn
+                FROM sales
+                WHERE {where_clause}
+                  AND TRIM(COALESCE(customer_name, '')) <> ''
+            )
+            SELECT customer_name, sale_date, price
+            FROM ranked_sales
+            WHERE rn = 1
+            ORDER BY customer_name COLLATE NOCASE
             """,
             params,
         )
@@ -20036,12 +20473,7 @@ $mail.Display()
                 total_qty = sum(self.parse_float(monthly_qty.get(month, 0.0)) for month in months)
                 avg_monthly_qty = total_qty / months_count if months_count else 0.0
 
-                stock_row = self.row_to_dict(
-                    self.db_one(
-                        "SELECT * FROM stock WHERE UPPER(TRIM(item_number)) = UPPER(TRIM(?)) LIMIT 1",
-                        (item_number,),
-                    )
-                )
+                stock_row = self.get_stock_row_for_item(item_number)
                 on_hand = self.parse_float(self.get_first(stock_row, "on_hand", "On Hand", default=0))
                 stock_on_order = self.parse_float(self.get_first(stock_row, "on_order", "On Order", default=0))
                 carton_size = self.parse_float(item_row["carton"])
@@ -20270,7 +20702,7 @@ $mail.Display()
         if item_number and chosen in actions:
             if self.set_item_planning_status(item_number, actions[chosen]):
                 self.update_order_analysis_status_cache(item_number, actions[chosen])
-                if self.current_item_number and self.current_item_number.strip().upper() == item_number.upper():
+                if self.current_item_number and self.item_numbers_match(self.current_item_number, item_number):
                     self.current_item_planning_status = self.normalise_planning_status(actions[chosen])
                     self.update_item_status_controls(self.current_item_planning_status)
 
@@ -20308,11 +20740,11 @@ $mail.Display()
             return
 
         stacked_widget.setCurrentWidget(order_page)
-        target = (item_number or "").strip().upper()
+        target = (item_number or "").strip()
         for row in range(order_table.rowCount()):
             item_cell = order_table.item(row, 0)
-            item_text = item_cell.text().strip().upper() if item_cell is not None and item_cell.text() else ""
-            if item_text != target:
+            item_text = item_cell.text().strip() if item_cell is not None and item_cell.text() else ""
+            if not self.item_numbers_match(item_text, target):
                 continue
             order_table.selectRow(row)
             order_table.setCurrentCell(row, 0)
@@ -20390,7 +20822,7 @@ $mail.Display()
         }
 
     def get_saba_item_rows(self):
-        normalized_item_expr = "UPPER(REPLACE(TRIM(COALESCE(item_number, '')), ' ', ''))"
+        normalized_item_expr = self.item_clean_sql_expr("item_number")
 
         # Narrow the review to the SA3392 family and explicitly include JC as another pack type.
         where_parts = [
@@ -20438,7 +20870,7 @@ $mail.Display()
             item_number = (row["item_number"] or "").strip()
             if not item_number:
                 continue
-            normalized_item_number = re.sub(r"\s+", "", item_number.upper())
+            normalized_item_number = self.item_clean_key(item_number)
             item_map[normalized_item_number] = {
                 "item_number": item_number,
                 "item_name": (row["item_name"] or item_number).strip(),
@@ -20457,7 +20889,7 @@ $mail.Display()
             FROM sales
             WHERE TRIM(COALESCE(customer_name, '')) <> ''
               AND TRIM(COALESCE(item_number, '')) <> ''
-              AND UPPER(REPLACE(TRIM(item_number), ' ', '')) IN {item_clause}
+              AND {self.item_clean_sql_expr('item_number')} IN {item_clause}
               AND sale_date IS NOT NULL
         """
         params = list(item_params)
@@ -20474,7 +20906,7 @@ $mail.Display()
             sale_date = self.parse_date_value(row["sale_date"])
             if not customer_name or not item_number or sale_date is None:
                 continue
-            normalized_item_number = re.sub(r"\s+", "", item_number.upper())
+            normalized_item_number = self.item_clean_key(item_number)
             key = (customer_name, normalized_item_number)
             grouped_dates.setdefault(key, set()).add(sale_date)
 

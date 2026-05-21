@@ -441,6 +441,24 @@ class ExistingDBAdapter:
             return values[0] if values else None
 
 
+
+
+# ------------------------------------------------------------
+# Item-number resolver helpers
+# ------------------------------------------------------------
+def clean_item_key(value: str) -> str:
+    """Return the space-insensitive item key used for non-FASTENERS lookups."""
+    return re.sub(r"[\s\u00A0]+", "", str(value or "").strip()).upper()
+
+
+def clean_item_sql_expr(expression: str) -> str:
+    """SQL Server expression matching clean_item_key()."""
+    return (
+        "UPPER(REPLACE(REPLACE(REPLACE("
+        f"LTRIM(RTRIM(ISNULL({expression}, ''))), "
+        "' ', ''), CHAR(9), ''), CHAR(160), ''))"
+    )
+
 # ------------------------------------------------------------
 # Order CSV + resolution + export
 # ------------------------------------------------------------
@@ -1826,6 +1844,43 @@ class YUOrderReviewWindow(QMainWindow):
             self.order_filter_combo.addItem(order_no)
         self.order_filter_combo.blockSignals(False)
 
+
+    # ---------------- Item-number resolving
+    def item_is_fasteners(self, item_number: str) -> bool:
+        """FASTENERS must be exact-match only; they are not space-normalised."""
+        item_number = str(item_number or "").strip()
+        if not item_number:
+            return False
+        try:
+            row = self.db.one(
+                """
+                SELECT TOP 1 item_number, [Custom List 1] AS custom_list_1
+                FROM dbo.items
+                WHERE LTRIM(RTRIM(item_number)) = LTRIM(RTRIM(?))
+                """,
+                (item_number,),
+            )
+        except Exception:
+            row = None
+        if row is None:
+            return False
+        group = str(row.get("custom_list_1") or "").strip().upper()
+        return "FASTENERS" in group
+
+    def item_match_condition(self, column_exprs: list[str], item_number: str) -> tuple[str, tuple]:
+        """Build an item-number comparison for supplier/review tables.
+
+        FASTENERS keep exact item numbers. All other groups are matched using
+        the no-whitespace canonical key so ABC 123 and ABC123 resolve together.
+        """
+        item_number = str(item_number or "").strip()
+        if self.item_is_fasteners(item_number):
+            parts = [f"ISNULL({expr}, '') = ?" for expr in column_exprs]
+            return "(" + " OR ".join(parts) + ")", tuple(item_number for _ in column_exprs)
+        clean = clean_item_key(item_number)
+        parts = [f"{clean_item_sql_expr(expr)} = ?" for expr in column_exprs]
+        return "(" + " OR ".join(parts) + ")", tuple(clean for _ in column_exprs)
+
     def refresh_all(self):
         self.load_last_import_date()
         self.load_counts()
@@ -1844,18 +1899,18 @@ class YUOrderReviewWindow(QMainWindow):
     def resolve_item(self, item_number: str, quantity: float, date_text: str, order_number: str) -> OrderResolveResult:
         item_number = str(item_number or "").strip()
 
+        direct_condition, direct_params = self.item_match_condition(
+            ["current_item_number", "literal_item_number"], item_number
+        )
         direct_rows_raw = self.db.all(
             f"""
             SELECT DISTINCT source_row
             FROM dbo.{self.tables["supplier_lines"]}
             WHERE row_kind = 'detail'
-              AND (
-                    ISNULL(current_item_number, '') = ?
-                 OR ISNULL(literal_item_number, '') = ?
-              )
+              AND {direct_condition}
             ORDER BY source_row
             """,
-            (item_number, item_number),
+            direct_params,
         )
         direct_rows = [int(row["source_row"]) for row in direct_rows_raw]
 
@@ -1884,14 +1939,15 @@ class YUOrderReviewWindow(QMainWindow):
                 review_hits=[],
             )
 
+        final_condition, final_params = self.item_match_condition(["final_selection"], item_number)
         final_rows_raw = self.db.all(
             f"""
             SELECT DISTINCT source_row
             FROM dbo.{self.tables["match_review"]}
-            WHERE ISNULL(final_selection, '') = ?
+            WHERE {final_condition}
             ORDER BY source_row
             """,
-            (item_number,),
+            final_params,
         )
         final_rows = [int(row["source_row"]) for row in final_rows_raw]
         if len(final_rows) == 1:
@@ -1921,14 +1977,15 @@ class YUOrderReviewWindow(QMainWindow):
 
         hits: list[ReviewHit] = []
 
+        suggested_condition, suggested_params = self.item_match_condition(["suggested_match"], item_number)
         suggested_hits = self.db.all(
             f"""
             SELECT source_row, confidence_pct, review_row
             FROM dbo.{self.tables["match_review"]}
-            WHERE ISNULL(suggested_match, '') = ?
+            WHERE {suggested_condition}
             ORDER BY source_row
             """,
-            (item_number,),
+            suggested_params,
         )
         for row in suggested_hits:
             conf = row.get("confidence_pct")
@@ -1941,14 +1998,15 @@ class YUOrderReviewWindow(QMainWindow):
                 )
             )
 
+        candidate_condition, candidate_params = self.item_match_condition(["candidate_item_number"], item_number)
         candidate_hits = self.db.all(
             f"""
             SELECT source_row, confidence_pct, review_row, candidate_rank
             FROM dbo.{self.tables["match_candidates"]}
-            WHERE candidate_item_number = ?
+            WHERE {candidate_condition}
             ORDER BY source_row, candidate_rank
             """,
-            (item_number,),
+            candidate_params,
         )
         for row in candidate_hits:
             conf = row.get("confidence_pct")
@@ -2160,15 +2218,18 @@ class YUOrderReviewWindow(QMainWindow):
         rows: list[dict] = []
         supplier_cols = self.candidate_supplier_select_sql("s.")
 
+        direct_condition, direct_params = self.item_match_condition(
+            ["s.current_item_number", "s.literal_item_number"], item_number
+        )
         direct_rows = self.db.all(
             f"""
             SELECT s.source_row, {supplier_cols}
             FROM dbo.{self.tables["supplier_lines"]} s
             WHERE s.row_kind = 'detail'
-              AND (ISNULL(s.current_item_number, '') = ? OR ISNULL(s.literal_item_number, '') = ?)
+              AND {direct_condition}
             ORDER BY s.source_row
             """,
-            (item_number, item_number),
+            direct_params,
         )
         for row in direct_rows:
             rows.append({
@@ -2178,15 +2239,16 @@ class YUOrderReviewWindow(QMainWindow):
                 **self.supplier_candidate_values(row),
             })
 
+        final_condition, final_params = self.item_match_condition(["r.final_selection"], item_number)
         final_rows = self.db.all(
             f"""
             SELECT r.source_row, {supplier_cols}
             FROM dbo.{self.tables["match_review"]} r
             LEFT JOIN dbo.{self.tables["supplier_lines"]} s ON s.source_row = r.source_row
-            WHERE ISNULL(r.final_selection, '') = ?
+            WHERE {final_condition}
             ORDER BY r.source_row
             """,
-            (item_number,),
+            final_params,
         )
         for row in final_rows:
             rows.append({
@@ -2196,15 +2258,16 @@ class YUOrderReviewWindow(QMainWindow):
                 **self.supplier_candidate_values(row),
             })
 
+        suggested_condition, suggested_params = self.item_match_condition(["r.suggested_match"], item_number)
         suggested_rows = self.db.all(
             f"""
             SELECT r.source_row, r.confidence_pct, {supplier_cols}
             FROM dbo.{self.tables["match_review"]} r
             LEFT JOIN dbo.{self.tables["supplier_lines"]} s ON s.source_row = r.source_row
-            WHERE ISNULL(r.suggested_match, '') = ?
+            WHERE {suggested_condition}
             ORDER BY r.source_row
             """,
-            (item_number,),
+            suggested_params,
         )
         for row in suggested_rows:
             rows.append({
@@ -2214,15 +2277,16 @@ class YUOrderReviewWindow(QMainWindow):
                 **self.supplier_candidate_values(row),
             })
 
+        candidate_condition, candidate_params = self.item_match_condition(["c.candidate_item_number"], item_number)
         candidate_rows = self.db.all(
             f"""
             SELECT c.source_row, c.confidence_pct, c.candidate_rank, {supplier_cols}
             FROM dbo.{self.tables["match_candidates"]} c
             LEFT JOIN dbo.{self.tables["supplier_lines"]} s ON s.source_row = c.source_row
-            WHERE c.candidate_item_number = ?
+            WHERE {candidate_condition}
             ORDER BY c.source_row, c.candidate_rank
             """,
-            (item_number,),
+            candidate_params,
         )
         for row in candidate_rows:
             rows.append({
@@ -2434,6 +2498,7 @@ class YUOrderReviewWindow(QMainWindow):
         )
 
     def reset_row_status_for_item(self, item_number: str, exclude_source_row: int | None = None):
+        final_condition, final_params = self.item_match_condition(["r.final_selection"], item_number)
         rows = self.db.all(
             f"""
             SELECT r.source_row,
@@ -2447,9 +2512,9 @@ class YUOrderReviewWindow(QMainWindow):
                      ELSE 'unmatched'
                    END AS new_status
             FROM dbo.{self.tables["match_review"]} r
-            WHERE ISNULL(r.final_selection, '') = ?
+            WHERE {final_condition}
             """,
-            (item_number,),
+            final_params,
         )
         for row in rows:
             source_row = int(row["source_row"])
@@ -2465,14 +2530,15 @@ class YUOrderReviewWindow(QMainWindow):
             )
 
     def source_rows_for_final_selection(self, item_number: str) -> list[int]:
+        final_condition, final_params = self.item_match_condition(["final_selection"], item_number)
         rows = self.db.all(
             f"""
             SELECT source_row
             FROM dbo.{self.tables["match_review"]}
-            WHERE ISNULL(final_selection, '') = ?
+            WHERE {final_condition}
             ORDER BY source_row
             """,
-            (str(item_number or "").strip(),),
+            final_params,
         )
         out: list[int] = []
         for row in rows:
@@ -2599,6 +2665,7 @@ class YUOrderReviewWindow(QMainWindow):
             return
         item_number = str(detail["Item Number"])
 
+        final_condition, final_params = self.item_match_condition(["r.final_selection"], item_number)
         rows = self.db.all(
             f"""
             SELECT r.source_row,
@@ -2612,9 +2679,9 @@ class YUOrderReviewWindow(QMainWindow):
                      ELSE 'unmatched'
                    END AS new_status
             FROM dbo.{self.tables["match_review"]} r
-            WHERE ISNULL(r.final_selection, '') = ?
+            WHERE {final_condition}
             """,
-            (item_number,),
+            final_params,
         )
         if not rows:
             QMessageBox.information(self, "YU Order Review", f"There is no confirmed mapping for {item_number}.")

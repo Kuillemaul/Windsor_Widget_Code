@@ -107,8 +107,12 @@ from yu_order_workflow import YUOrderEntryDialog, load_yu_review_module
 TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
 TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
 TABLE_FORMAT_SETTINGS_PREFIX = "table_format"
-APP_VERSION = "1.1.4"
+APP_VERSION = "1.2.1"
 APP_DESIGNER = "Bradley Mayze"
+# After the one-time no-space item-number migration, sales/order/stock tables
+# store canonical item numbers.  Keep runtime item-number resolution for entry/import,
+# but do not run REPLACE/LTRIM functions across the sales table during Item Summary queries.
+CANONICAL_ITEM_STORAGE = True
 UPDATE_REPO_OWNER = "Kuillemaul"
 UPDATE_REPO_NAME = "Windsor_Widget_Code"
 UPDATE_RELEASES_API_URL = f"https://api.github.com/repos/{UPDATE_REPO_OWNER}/{UPDATE_REPO_NAME}/releases/latest"
@@ -8361,10 +8365,35 @@ class MainWindow(QMainWindow):
             return "1 = 0", []
         return "(" + " OR ".join(clauses) + ")", params
 
+    def build_exact_canonical_item_filter_clause(self, item_numbers, column_expr="item_number"):
+        """Fast item filter for tables already migrated to canonical item numbers.
+
+        This deliberately avoids wrapping the database column in REPLACE/TRIM/UPPER.
+        SQL Server can then use indexes such as IX_sales_item_number_sale_date.
+        Use this only for tables migrated to the no-space naming convention.
+        """
+        item_list = item_numbers if isinstance(item_numbers, (list, tuple, set)) else [item_numbers]
+        values = []
+        for raw_item in item_list:
+            raw_item = str(raw_item or "").strip()
+            if not raw_item:
+                continue
+            resolved = self.resolve_item_number(raw_item, allow_prefix=False, require_known=False) or raw_item
+            if self.is_fasteners_item_number(resolved):
+                value = resolved.strip()
+            else:
+                value = self.item_clean_key(resolved)
+            if value and value not in values:
+                values.append(value)
+        if not values:
+            return "1 = 0", []
+        clause, params = self.sql_in_clause(values)
+        return f"{column_expr} IN {clause}", params
+
     def get_stock_row_for_item(self, item_number):
         if self.db_conn is None or not item_number or not self.has_table("stock"):
             return {}
-        where_clause, params = self.build_item_number_filter_clause([item_number], "item_number")
+        where_clause, params = self.build_exact_canonical_item_filter_clause([item_number], "item_number")
         return self.row_to_dict(
             self.db_one(
                 f"SELECT * FROM stock WHERE {where_clause} LIMIT 1",
@@ -10798,12 +10827,13 @@ class MainWindow(QMainWindow):
                 COUNT(*) AS line_count
             FROM sales
             WHERE TRIM(COALESCE(item_number, '')) <> ''
-              AND DATE(sale_date) BETWEEN ? AND ?
+              AND sale_date BETWEEN ? AND ?
             GROUP BY TRIM(item_number)
             """,
             (start_date.isoformat(), end_date.isoformat()),
         )
 
+        self._item_monthly_qty_cache = {}
         months = self.month_list_between(start_date, end_date)
         months_count = max(1, len(months))
         lead_days = self.get_lead_time_days()
@@ -16094,7 +16124,7 @@ class MainWindow(QMainWindow):
         if not target or self.db_conn is None or not self.has_table("container_lines") or not self.has_table("containers"):
             return {"qty": 0.0, "eta_text": "", "container_ref": ""}
 
-        where_clause, params = self.build_item_number_filter_clause([target], "cl.item_number")
+        where_clause, params = self.build_exact_canonical_item_filter_clause([target], "cl.item_number")
         rows = self.db_all(
             f"""
             SELECT
@@ -16169,7 +16199,7 @@ class MainWindow(QMainWindow):
         return str(summary.get("eta_text", "") or "")
 
     def get_orders_table_item_summary(self, item_number):
-        where_clause, params = self.build_item_number_filter_clause([item_number], "item_number")
+        where_clause, params = self.build_exact_canonical_item_filter_clause([item_number], "item_number")
         row = self.db_one(
             f"""
             SELECT
@@ -16200,6 +16230,90 @@ class MainWindow(QMainWindow):
                     if not order_date_text:
                         order_date_text = raw_date
         return total_qty, order_date_text
+
+    def get_orders_table_item_shipment_summaries(self, item_number):
+        """Return shipped/on-water order quantities grouped by arrival date.
+
+        Item Summary only has two visible inbound slots for physical shipments:
+        Shipped and Next Container.  When two containers are already on the
+        water, the earliest dated orders table entry appears in Shipped and the
+        next distinct arrival date appears in Next Container.
+        """
+        if self.db_conn is None or not item_number or not self.has_table("orders"):
+            return []
+
+        where_clause, params = self.build_exact_canonical_item_filter_clause([item_number], "item_number")
+        rows = self.db_all(
+            f"""
+            SELECT
+                item_number,
+                quantity,
+                purchase_no,
+                order_date
+            FROM orders
+            WHERE {where_clause}
+            """,
+            params,
+        )
+
+        grouped = {}
+        undated_index = 0
+        for row in rows:
+            row_dict = self.row_to_dict(row)
+            qty = self.parse_float(row_dict.get("quantity", 0))
+            if qty <= 0:
+                continue
+
+            raw_date = "" if row_dict.get("order_date") is None else str(row_dict.get("order_date")).strip()
+            parsed_date = self.parse_date_value(raw_date)
+            purchase_no = "" if row_dict.get("purchase_no") is None else str(row_dict.get("purchase_no")).strip()
+
+            if parsed_date is not None:
+                group_key = ("date", parsed_date.isoformat())
+                sort_date = parsed_date
+                display_date = parsed_date.strftime("%d/%m/%Y")
+            else:
+                undated_index += 1
+                group_key = ("undated", raw_date or f"undated-{undated_index}")
+                sort_date = date.max
+                display_date = raw_date
+
+            bucket = grouped.setdefault(
+                group_key,
+                {
+                    "qty": 0.0,
+                    "arrival_date": parsed_date,
+                    "display_date": display_date,
+                    "eta_text": display_date,
+                    "sort_date": sort_date,
+                    "purchase_numbers": [],
+                    "raw_dates": [],
+                },
+            )
+            bucket["qty"] += qty
+            if purchase_no and purchase_no not in bucket["purchase_numbers"]:
+                bucket["purchase_numbers"].append(purchase_no)
+            if raw_date and raw_date not in bucket["raw_dates"]:
+                bucket["raw_dates"].append(raw_date)
+
+        shipments = list(grouped.values())
+        shipments.sort(
+            key=lambda entry: (
+                entry.get("sort_date") or date.max,
+                str(entry.get("display_date") or ""),
+                ", ".join(entry.get("purchase_numbers") or []),
+            )
+        )
+
+        for index, entry in enumerate(shipments, start=1):
+            purchase_text = ", ".join(entry.get("purchase_numbers") or [])
+            entry["container_ref"] = purchase_text
+            entry["shipment_index"] = index
+            if purchase_text:
+                entry["tooltip"] = f"Shipped/on-water order {purchase_text}: ETA {entry.get('display_date') or 'unknown'}. Counted as inbound."
+            else:
+                entry["tooltip"] = f"Shipped/on-water order: ETA {entry.get('display_date') or 'unknown'}. Counted as inbound."
+        return shipments
 
     def refresh_item_summary_context_boxes(self, inbound_context=None):
         if not self.current_item_number:
@@ -16731,6 +16845,8 @@ $mail.Display()
         return unique
 
     def build_sales_item_filter_clause(self, item_numbers):
+        if bool(globals().get("CANONICAL_ITEM_STORAGE", False)):
+            return self.build_exact_canonical_item_filter_clause(item_numbers, "item_number")
         return self.build_item_number_filter_clause(item_numbers, "item_number")
 
     def format_value(self, value):
@@ -17101,9 +17217,47 @@ $mail.Display()
             widget.setStyleSheet("")
         widget.setToolTip(tooltip or "")
 
+    def build_item_summary_shipped_next_stylesheet(self):
+        if bool(getattr(self.ui, "radioLight", None) and self.ui.radioLight.isChecked()):
+            return (
+                "background-color: #d9f2df; "
+                "color: #0f3b1d; "
+                "border: 3px solid #38a169; "
+                "border-radius: 6px; "
+                "padding: 3px 6px; "
+                "font-weight: 900;"
+            )
+        return (
+            "background-color: #164d2b; "
+            "color: #d9f2df; "
+            "border: 3px solid #38a169; "
+            "border-radius: 6px; "
+            "padding: 3px 6px; "
+            "font-weight: 900;"
+        )
+
+    def set_widget_shipped_next_state(self, object_name, enabled=False, tooltip=""):
+        widget = getattr(self.ui, object_name, None)
+        if widget is None:
+            return
+        if enabled:
+            widget.setStyleSheet(self.build_item_summary_shipped_next_stylesheet())
+            widget.setToolTip(tooltip or "Next container is already shipped/on-water.")
+
     def fetch_item_monthly_qty(self, item_numbers, start_date, end_date):
         item_list = item_numbers if isinstance(item_numbers, (list, tuple, set)) else [item_numbers]
+        cache_key = (
+            tuple(sorted(str(item or "").strip().upper() for item in item_list if str(item or "").strip())),
+            start_date.isoformat() if isinstance(start_date, date) else str(start_date),
+            end_date.isoformat() if isinstance(end_date, date) else str(end_date),
+        )
+        cache = getattr(self, "_item_monthly_qty_cache", None)
+        if isinstance(cache, dict) and cache_key in cache:
+            return dict(cache[cache_key])
+
         where_clause, params = self.build_sales_item_filter_clause(item_list)
+        start_text = start_date.isoformat() if isinstance(start_date, date) else str(start_date)
+        end_text = end_date.isoformat() if isinstance(end_date, date) else str(end_date)
         rows = self.db_all(
             f"""
             SELECT
@@ -17111,11 +17265,11 @@ $mail.Display()
                 SUM(COALESCE(quantity, 0)) AS total_qty
             FROM sales
             WHERE {where_clause}
-              AND DATE(sale_date) BETWEEN ? AND ?
+              AND sale_date BETWEEN ? AND ?
             GROUP BY COALESCE(NULLIF(TRIM(month_key), ''), STRFTIME('%Y-%m', DATE(sale_date)))
             ORDER BY month_key
             """,
-            [*params, start_date.isoformat(), end_date.isoformat()],
+            [*params, start_text, end_text],
         )
 
         month_totals = {}
@@ -17124,6 +17278,8 @@ $mail.Display()
             if month_start is None:
                 continue
             month_totals[month_start] = self.parse_float(row["total_qty"])
+        if isinstance(cache, dict):
+            cache[cache_key] = dict(month_totals)
         return month_totals
 
     def get_item_inbound_context(self, item_number, lead_days=None, today=None):
@@ -17138,10 +17294,28 @@ $mail.Display()
         next_container_used_fallback = next_container_qty > 0 and next_container_eta is None
         next_container_arrival = next_container_eta or (fallback_date if next_container_qty > 0 else None)
 
-        shipped_qty, shipped_eta_text = self.get_orders_table_item_summary(item_number)
-        shipped_eta = self.parse_date_value(shipped_eta_text)
+        shipped_shipments = self.get_orders_table_item_shipment_summaries(item_number)
+        shipped_first = shipped_shipments[0] if len(shipped_shipments) >= 1 else {}
+        shipped_second = shipped_shipments[1] if len(shipped_shipments) >= 2 else {}
+
+        shipped_qty = self.parse_float(shipped_first.get("qty", 0))
+        shipped_eta_text = str(shipped_first.get("eta_text") or shipped_first.get("display_date") or "")
+        shipped_eta = self.parse_date_value(shipped_first.get("arrival_date") or shipped_eta_text)
         shipped_used_fallback = shipped_qty > 0 and shipped_eta is None
         shipped_arrival = shipped_eta or (fallback_date if shipped_qty > 0 else None)
+
+        second_shipped_qty = self.parse_float(shipped_second.get("qty", 0))
+        if second_shipped_qty > 0:
+            next_container_qty = second_shipped_qty
+            next_container_eta_text = str(shipped_second.get("eta_text") or shipped_second.get("display_date") or "")
+            next_container_eta = self.parse_date_value(shipped_second.get("arrival_date") or next_container_eta_text)
+            next_container_used_fallback = next_container_qty > 0 and next_container_eta is None
+            next_container_arrival = next_container_eta or (fallback_date if next_container_qty > 0 else None)
+            next_container_is_shipped = True
+            next_container_tooltip_override = str(shipped_second.get("tooltip") or "")
+        else:
+            next_container_is_shipped = False
+            next_container_tooltip_override = None
 
         def entry(qty, arrival_date, used_fallback, source_name, include_in_calcs, tooltip_override=None):
             tooltip = tooltip_override or ""
@@ -17172,13 +17346,28 @@ $mail.Display()
             if order_form_qty > 0 else ""
         )
 
+        next_container_entry = entry(
+            next_container_qty,
+            next_container_arrival,
+            next_container_used_fallback,
+            "Next shipped container" if next_container_is_shipped else "Next container",
+            True,
+            next_container_tooltip_override,
+        )
+        next_container_entry["is_shipped_container"] = bool(next_container_is_shipped)
+        if next_container_is_shipped:
+            next_container_entry["tooltip"] = next_container_entry.get("tooltip") or (
+                "Next container is already shipped/on-water. Counted as inbound."
+            )
+
         return {
             "today": today,
             "lead_days": lead_days,
             "horizon_date": fallback_date,
             "order_form": entry(order_form_qty, None, False, "To order / on order", False, order_form_tooltip),
-            "next_container": entry(next_container_qty, next_container_arrival, next_container_used_fallback, "Next container", True),
-            "shipped": entry(shipped_qty, shipped_arrival, shipped_used_fallback, "Shipped", True),
+            "next_container": next_container_entry,
+            "shipped": entry(shipped_qty, shipped_arrival, shipped_used_fallback, "Shipped", True, shipped_first.get("tooltip")),
+            "shipped_shipments": shipped_shipments,
         }
 
     def inbound_qty_by_date(self, inbound_context, cutoff_date):
@@ -17192,6 +17381,16 @@ $mail.Display()
             arrival_date = entry.get("arrival_date")
             if entry.get("qty", 0) > 0 and arrival_date is not None and arrival_date <= cutoff_date:
                 total += self.parse_float(entry.get("qty", 0))
+
+        # The Item Summary only displays the first two shipped/on-water arrivals.
+        # If the orders table has more dated arrivals, keep the ordering maths
+        # honest by counting the extra shipments when they fall inside the
+        # requested cutoff.
+        for shipment in (inbound_context.get("shipped_shipments") or [])[2:]:
+            qty = self.parse_float(shipment.get("qty", 0))
+            arrival_date = self.parse_date_value(shipment.get("arrival_date") or shipment.get("display_date") or shipment.get("eta_text"))
+            if qty > 0 and arrival_date is not None and arrival_date <= cutoff_date:
+                total += qty
         return total
 
     def earliest_inbound_date(self, inbound_context):
@@ -17546,6 +17745,11 @@ $mail.Display()
             shipped.get("used_fallback", False),
             shipped.get("tooltip", ""),
         )
+
+        if next_container.get("is_shipped_container", False):
+            tooltip = next_container.get("tooltip", "")
+            self.set_widget_shipped_next_state("onNextContainer_box", True, tooltip)
+            self.set_widget_shipped_next_state("nextContainerETA_box", True, tooltip)
 
     def set_label_text(self, object_name, text):
         widget = getattr(self.ui, object_name, None)
@@ -19920,6 +20124,8 @@ $mail.Display()
     def fetch_item_customer_summary(self, item_numbers, start_date, end_date):
         item_list = item_numbers if isinstance(item_numbers, (list, tuple, set)) else [item_numbers]
         where_clause, params = self.build_sales_item_filter_clause(item_list)
+        start_text = start_date.isoformat() if isinstance(start_date, date) else str(start_date)
+        end_text = end_date.isoformat() if isinstance(end_date, date) else str(end_date)
         months = self.month_list_between(start_date, end_date)
         month_rows = self.db_all(
             f"""
@@ -19929,26 +20135,33 @@ $mail.Display()
                 SUM(COALESCE(quantity, 0)) AS total_qty
             FROM sales
             WHERE {where_clause}
-              AND DATE(sale_date) BETWEEN ? AND ?
+              AND sale_date BETWEEN ? AND ?
               AND TRIM(COALESCE(customer_name, '')) <> ''
             GROUP BY TRIM(customer_name), COALESCE(NULLIF(TRIM(month_key), ''), STRFTIME('%Y-%m', DATE(sale_date)))
             ORDER BY customer_name COLLATE NOCASE, month_key
             """,
-            [*params, start_date.isoformat(), end_date.isoformat()],
+            [*params, start_text, end_text],
         )
 
         latest_price_rows = self.db_all(
             f"""
-            SELECT
-                TRIM(customer_name) AS customer_name,
-                sale_date,
-                COALESCE(price, 0) AS price
-            FROM sales
-            WHERE {where_clause}
-              AND TRIM(COALESCE(customer_name, '')) <> ''
-            ORDER BY customer_name COLLATE NOCASE,
-                     DATE(sale_date) DESC,
-                     sale_date DESC
+            WITH ranked_sales AS (
+                SELECT
+                    TRIM(customer_name) AS customer_name,
+                    sale_date,
+                    COALESCE(price, 0) AS price,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY TRIM(customer_name)
+                        ORDER BY DATE(sale_date) DESC, sale_date DESC
+                    ) AS rn
+                FROM sales
+                WHERE {where_clause}
+                  AND TRIM(COALESCE(customer_name, '')) <> ''
+            )
+            SELECT customer_name, sale_date, price
+            FROM ranked_sales
+            WHERE rn = 1
+            ORDER BY customer_name COLLATE NOCASE
             """,
             params,
         )
