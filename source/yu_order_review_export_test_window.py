@@ -441,6 +441,24 @@ class ExistingDBAdapter:
             return values[0] if values else None
 
 
+
+
+# ------------------------------------------------------------
+# Item-number resolver helpers
+# ------------------------------------------------------------
+def clean_item_key(value: str) -> str:
+    """Return the space-insensitive item key used for non-FASTENERS lookups."""
+    return re.sub(r"[\s\u00A0]+", "", str(value or "").strip()).upper()
+
+
+def clean_item_sql_expr(expression: str) -> str:
+    """SQL Server expression matching clean_item_key()."""
+    return (
+        "UPPER(REPLACE(REPLACE(REPLACE("
+        f"LTRIM(RTRIM(ISNULL({expression}, ''))), "
+        "' ', ''), CHAR(9), ''), CHAR(160), ''))"
+    )
+
 # ------------------------------------------------------------
 # Order CSV + resolution + export
 # ------------------------------------------------------------
@@ -900,6 +918,68 @@ def save_yuchang_workbook_matches(
     return {"updated_rows": sorted(set(updated_rows)), "path": str(workbook_path)}
 
 
+def save_yuchang_workbook_item_numbers(
+    template_path: str,
+    row_items: dict[int, str | None],
+    *,
+    order_sheet_name: str = "Sheet1",
+    item_col: str = "A",
+) -> dict:
+    """Write canonical Widget item numbers back to the YU source workbook.
+
+    This updates the visible supplier/order sheet item-number column A, so a row
+    matched from an old spaced item such as "MTS36 BLACK" becomes
+    "MTS36BLACK" in the source workbook after export.
+    """
+    import xml.etree.ElementTree as ET
+
+    if not row_items:
+        return {"updated_rows": [], "path": str(template_path or "")}
+
+    workbook_path = Path(str(template_path or "").strip())
+    if not workbook_path.exists():
+        raise FileNotFoundError(f"YU workbook was not found: {workbook_path}")
+
+    _register_xlsx_namespaces()
+    updated_parts: dict[str, bytes] = {}
+
+    with zipfile.ZipFile(str(workbook_path), "r") as zin:
+        order_part = _xlsx_part_for_sheet(zin, order_sheet_name)
+        order_root = ET.fromstring(zin.read(order_part))
+        item_letter = get_column_letter(column_index_from_string(item_col))
+        updated_rows: list[int] = []
+
+        for source_row, item_number in row_items.items():
+            row_number = int(source_row)
+            if row_number <= 0:
+                continue
+            value = str(item_number or "").strip() or None
+            _set_xml_cell_text(order_root, f"{item_letter}{row_number}", value)
+            updated_rows.append(row_number)
+
+        updated_parts[order_part] = _xlsx_xml_tostring(order_root)
+
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{workbook_path.stem}_", suffix=workbook_path.suffix, dir=str(workbook_path.parent))
+        os.close(fd)
+        tmp_path = Path(tmp_name)
+        try:
+            with zipfile.ZipFile(str(tmp_path), "w", zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    data = updated_parts.get(item.filename)
+                    if data is None:
+                        data = zin.read(item.filename)
+                    zout.writestr(item, data)
+            shutil.move(str(tmp_path), str(workbook_path))
+        finally:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
+
+    return {"updated_rows": sorted(set(updated_rows)), "path": str(workbook_path)}
+
+
 def _make_compact_export_row_plan(
     kept_rows: list[int],
     row_has_item_fn,
@@ -1085,10 +1165,11 @@ def export_yuchang_po_compact_by_rows(
     output_path: str,
     order_date: str,
     order_number: str,
-    source_rows_with_qty: list[tuple[int, float | int]],
+    source_rows_with_qty: list[tuple[int, float | int] | tuple[int, float | int, str]],
     *,
     sheet_name: str = "Sheet1",
     qty_col: str = "L",
+    item_col: str = "A",
     date_cell: str = "C10",
     order_no_cell: str = "H10",
     export_min_col: str = "A",
@@ -1111,6 +1192,7 @@ def export_yuchang_po_compact_by_rows(
     src = wb[sheet_name]
 
     qty_idx = column_index_from_string(qty_col)
+    item_idx = column_index_from_string(item_col)
     export_min_idx = column_index_from_string(export_min_col)
     export_max_idx = column_index_from_string(export_max_col)
 
@@ -1121,12 +1203,21 @@ def export_yuchang_po_compact_by_rows(
     src[order_no_cell] = order_number
 
     qty_by_row: dict[int, float] = defaultdict(float)
-    for source_row, qty in source_rows_with_qty:
-        qty_by_row[int(source_row)] += float(qty)
+    item_by_row: dict[int, str] = {}
+    for entry in source_rows_with_qty:
+        source_row = int(entry[0])
+        qty = entry[1]
+        qty_by_row[source_row] += float(qty)
+        if len(entry) >= 3:
+            canonical_item = str(entry[2] or "").strip()
+            if canonical_item:
+                item_by_row[source_row] = canonical_item
 
     matched_rows: set[int] = set(qty_by_row.keys())
     for row, qty in qty_by_row.items():
         src.cell(row, qty_idx).value = qty
+    for row, canonical_item in item_by_row.items():
+        src.cell(row, item_idx).value = canonical_item
 
     def row_has_item(r: int) -> bool:
         if src.cell(r, 2).value in (None, ""):
@@ -1826,6 +1917,43 @@ class YUOrderReviewWindow(QMainWindow):
             self.order_filter_combo.addItem(order_no)
         self.order_filter_combo.blockSignals(False)
 
+
+    # ---------------- Item-number resolving
+    def item_is_fasteners(self, item_number: str) -> bool:
+        """FASTENERS must be exact-match only; they are not space-normalised."""
+        item_number = str(item_number or "").strip()
+        if not item_number:
+            return False
+        try:
+            row = self.db.one(
+                """
+                SELECT TOP 1 item_number, [Custom List 1] AS custom_list_1
+                FROM dbo.items
+                WHERE LTRIM(RTRIM(item_number)) = LTRIM(RTRIM(?))
+                """,
+                (item_number,),
+            )
+        except Exception:
+            row = None
+        if row is None:
+            return False
+        group = str(row.get("custom_list_1") or "").strip().upper()
+        return "FASTENERS" in group
+
+    def item_match_condition(self, column_exprs: list[str], item_number: str) -> tuple[str, tuple]:
+        """Build an item-number comparison for supplier/review tables.
+
+        FASTENERS keep exact item numbers. All other groups are matched using
+        the no-whitespace canonical key so ABC 123 and ABC123 resolve together.
+        """
+        item_number = str(item_number or "").strip()
+        if self.item_is_fasteners(item_number):
+            parts = [f"ISNULL({expr}, '') = ?" for expr in column_exprs]
+            return "(" + " OR ".join(parts) + ")", tuple(item_number for _ in column_exprs)
+        clean = clean_item_key(item_number)
+        parts = [f"{clean_item_sql_expr(expr)} = ?" for expr in column_exprs]
+        return "(" + " OR ".join(parts) + ")", tuple(clean for _ in column_exprs)
+
     def refresh_all(self):
         self.load_last_import_date()
         self.load_counts()
@@ -1844,18 +1972,18 @@ class YUOrderReviewWindow(QMainWindow):
     def resolve_item(self, item_number: str, quantity: float, date_text: str, order_number: str) -> OrderResolveResult:
         item_number = str(item_number or "").strip()
 
+        direct_condition, direct_params = self.item_match_condition(
+            ["current_item_number", "literal_item_number"], item_number
+        )
         direct_rows_raw = self.db.all(
             f"""
             SELECT DISTINCT source_row
             FROM dbo.{self.tables["supplier_lines"]}
             WHERE row_kind = 'detail'
-              AND (
-                    ISNULL(current_item_number, '') = ?
-                 OR ISNULL(literal_item_number, '') = ?
-              )
+              AND {direct_condition}
             ORDER BY source_row
             """,
-            (item_number, item_number),
+            direct_params,
         )
         direct_rows = [int(row["source_row"]) for row in direct_rows_raw]
 
@@ -1884,14 +2012,15 @@ class YUOrderReviewWindow(QMainWindow):
                 review_hits=[],
             )
 
+        final_condition, final_params = self.item_match_condition(["final_selection"], item_number)
         final_rows_raw = self.db.all(
             f"""
             SELECT DISTINCT source_row
             FROM dbo.{self.tables["match_review"]}
-            WHERE ISNULL(final_selection, '') = ?
+            WHERE {final_condition}
             ORDER BY source_row
             """,
-            (item_number,),
+            final_params,
         )
         final_rows = [int(row["source_row"]) for row in final_rows_raw]
         if len(final_rows) == 1:
@@ -1921,14 +2050,15 @@ class YUOrderReviewWindow(QMainWindow):
 
         hits: list[ReviewHit] = []
 
+        suggested_condition, suggested_params = self.item_match_condition(["suggested_match"], item_number)
         suggested_hits = self.db.all(
             f"""
             SELECT source_row, confidence_pct, review_row
             FROM dbo.{self.tables["match_review"]}
-            WHERE ISNULL(suggested_match, '') = ?
+            WHERE {suggested_condition}
             ORDER BY source_row
             """,
-            (item_number,),
+            suggested_params,
         )
         for row in suggested_hits:
             conf = row.get("confidence_pct")
@@ -1941,14 +2071,15 @@ class YUOrderReviewWindow(QMainWindow):
                 )
             )
 
+        candidate_condition, candidate_params = self.item_match_condition(["candidate_item_number"], item_number)
         candidate_hits = self.db.all(
             f"""
             SELECT source_row, confidence_pct, review_row, candidate_rank
             FROM dbo.{self.tables["match_candidates"]}
-            WHERE candidate_item_number = ?
+            WHERE {candidate_condition}
             ORDER BY source_row, candidate_rank
             """,
-            (item_number,),
+            candidate_params,
         )
         for row in candidate_hits:
             conf = row.get("confidence_pct")
@@ -2160,15 +2291,18 @@ class YUOrderReviewWindow(QMainWindow):
         rows: list[dict] = []
         supplier_cols = self.candidate_supplier_select_sql("s.")
 
+        direct_condition, direct_params = self.item_match_condition(
+            ["s.current_item_number", "s.literal_item_number"], item_number
+        )
         direct_rows = self.db.all(
             f"""
             SELECT s.source_row, {supplier_cols}
             FROM dbo.{self.tables["supplier_lines"]} s
             WHERE s.row_kind = 'detail'
-              AND (ISNULL(s.current_item_number, '') = ? OR ISNULL(s.literal_item_number, '') = ?)
+              AND {direct_condition}
             ORDER BY s.source_row
             """,
-            (item_number, item_number),
+            direct_params,
         )
         for row in direct_rows:
             rows.append({
@@ -2178,15 +2312,16 @@ class YUOrderReviewWindow(QMainWindow):
                 **self.supplier_candidate_values(row),
             })
 
+        final_condition, final_params = self.item_match_condition(["r.final_selection"], item_number)
         final_rows = self.db.all(
             f"""
             SELECT r.source_row, {supplier_cols}
             FROM dbo.{self.tables["match_review"]} r
             LEFT JOIN dbo.{self.tables["supplier_lines"]} s ON s.source_row = r.source_row
-            WHERE ISNULL(r.final_selection, '') = ?
+            WHERE {final_condition}
             ORDER BY r.source_row
             """,
-            (item_number,),
+            final_params,
         )
         for row in final_rows:
             rows.append({
@@ -2196,15 +2331,16 @@ class YUOrderReviewWindow(QMainWindow):
                 **self.supplier_candidate_values(row),
             })
 
+        suggested_condition, suggested_params = self.item_match_condition(["r.suggested_match"], item_number)
         suggested_rows = self.db.all(
             f"""
             SELECT r.source_row, r.confidence_pct, {supplier_cols}
             FROM dbo.{self.tables["match_review"]} r
             LEFT JOIN dbo.{self.tables["supplier_lines"]} s ON s.source_row = r.source_row
-            WHERE ISNULL(r.suggested_match, '') = ?
+            WHERE {suggested_condition}
             ORDER BY r.source_row
             """,
-            (item_number,),
+            suggested_params,
         )
         for row in suggested_rows:
             rows.append({
@@ -2214,15 +2350,16 @@ class YUOrderReviewWindow(QMainWindow):
                 **self.supplier_candidate_values(row),
             })
 
+        candidate_condition, candidate_params = self.item_match_condition(["c.candidate_item_number"], item_number)
         candidate_rows = self.db.all(
             f"""
             SELECT c.source_row, c.confidence_pct, c.candidate_rank, {supplier_cols}
             FROM dbo.{self.tables["match_candidates"]} c
             LEFT JOIN dbo.{self.tables["supplier_lines"]} s ON s.source_row = c.source_row
-            WHERE c.candidate_item_number = ?
+            WHERE {candidate_condition}
             ORDER BY c.source_row, c.candidate_rank
             """,
-            (item_number,),
+            candidate_params,
         )
         for row in candidate_rows:
             rows.append({
@@ -2434,6 +2571,7 @@ class YUOrderReviewWindow(QMainWindow):
         )
 
     def reset_row_status_for_item(self, item_number: str, exclude_source_row: int | None = None):
+        final_condition, final_params = self.item_match_condition(["r.final_selection"], item_number)
         rows = self.db.all(
             f"""
             SELECT r.source_row,
@@ -2447,9 +2585,9 @@ class YUOrderReviewWindow(QMainWindow):
                      ELSE 'unmatched'
                    END AS new_status
             FROM dbo.{self.tables["match_review"]} r
-            WHERE ISNULL(r.final_selection, '') = ?
+            WHERE {final_condition}
             """,
-            (item_number,),
+            final_params,
         )
         for row in rows:
             source_row = int(row["source_row"])
@@ -2465,14 +2603,15 @@ class YUOrderReviewWindow(QMainWindow):
             )
 
     def source_rows_for_final_selection(self, item_number: str) -> list[int]:
+        final_condition, final_params = self.item_match_condition(["final_selection"], item_number)
         rows = self.db.all(
             f"""
             SELECT source_row
             FROM dbo.{self.tables["match_review"]}
-            WHERE ISNULL(final_selection, '') = ?
+            WHERE {final_condition}
             ORDER BY source_row
             """,
-            (str(item_number or "").strip(),),
+            final_params,
         )
         out: list[int] = []
         for row in rows:
@@ -2511,6 +2650,66 @@ class YUOrderReviewWindow(QMainWindow):
                 5000,
             )
         return True
+
+    def save_workbook_item_numbers_or_warn(self, row_items: dict[int, str | None], action_title: str = "Update YU Workbook Items") -> bool:
+        if not row_items:
+            return True
+        try:
+            result = save_yuchang_workbook_item_numbers(self.template_path, row_items)
+        except PermissionError as exc:
+            QMessageBox.warning(
+                self,
+                action_title,
+                "The YU workbook item numbers could not be updated.\n\n"
+                "Close the workbook in Excel and try again.\n\n"
+                f"{exc}",
+            )
+            return False
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                action_title,
+                "The YU workbook item numbers could not be updated.\n\n"
+                f"{exc}",
+            )
+            return False
+        updated_rows = result.get("updated_rows") or []
+        if updated_rows:
+            self.statusBar().showMessage(
+                f"Updated YU workbook item number row(s): {', '.join(str(r) for r in updated_rows)}.",
+                5000,
+            )
+        return True
+
+    def update_supplier_line_items_for_rows(self, row_items: dict[int, str | None]) -> None:
+        for source_row, item_number in row_items.items():
+            value = str(item_number or "").strip()
+            if not value:
+                continue
+            try:
+                self.db.execute(
+                    f"""
+                    UPDATE dbo.{self.tables["supplier_lines"]}
+                    SET current_item_number = ?
+                    WHERE source_row = ?
+                    """,
+                    (value, int(source_row)),
+                )
+            except Exception:
+                pass
+            try:
+                self.db.execute(
+                    f"""
+                    UPDATE dbo.{self.tables["match_review"]}
+                    SET final_selection = ?
+                    WHERE source_row = ?
+                      AND (ISNULL(final_selection, '') = ''
+                           OR {clean_item_sql_expr('final_selection')} = ?)
+                    """,
+                    (value, int(source_row), clean_item_key(value)),
+                )
+            except Exception:
+                pass
 
     def sync_confirmed_matches_to_workbook(self) -> bool:
         rows = self.db.all(
@@ -2599,6 +2798,7 @@ class YUOrderReviewWindow(QMainWindow):
             return
         item_number = str(detail["Item Number"])
 
+        final_condition, final_params = self.item_match_condition(["r.final_selection"], item_number)
         rows = self.db.all(
             f"""
             SELECT r.source_row,
@@ -2612,9 +2812,9 @@ class YUOrderReviewWindow(QMainWindow):
                      ELSE 'unmatched'
                    END AS new_status
             FROM dbo.{self.tables["match_review"]} r
-            WHERE ISNULL(r.final_selection, '') = ?
+            WHERE {final_condition}
             """,
-            (item_number,),
+            final_params,
         )
         if not rows:
             QMessageBox.information(self, "YU Order Review", f"There is no confirmed mapping for {item_number}.")
@@ -2687,10 +2887,35 @@ class YUOrderReviewWindow(QMainWindow):
             )
             return
 
-        grouped: dict[tuple[str, str], list[tuple[int, float]]] = defaultdict(list)
+        row_items: dict[int, str] = {}
         for row in visible_rows:
             result: OrderResolveResult = row["resolve_result"]
-            grouped[(row["Date"], row["Order Number"])].append((int(result.source_row), float(row["QTY"])))
+            source_row = int(result.source_row)
+            canonical_item = str(row.get("Item Number") or result.item_number or "").strip()
+            if not canonical_item:
+                continue
+            existing = row_items.get(source_row)
+            if existing and clean_item_key(existing) != clean_item_key(canonical_item):
+                QMessageBox.warning(
+                    self,
+                    "YU Order Review",
+                    f"Export stopped because source row {source_row} maps to more than one item number:\n\n"
+                    f"{existing}\n{canonical_item}",
+                )
+                return
+            row_items[source_row] = canonical_item
+
+        if row_items:
+            if not self.save_workbook_item_numbers_or_warn(row_items, "Update YU Workbook Items"):
+                return
+            self.update_supplier_line_items_for_rows(row_items)
+
+        grouped: dict[tuple[str, str], list[tuple[int, float, str]]] = defaultdict(list)
+        for row in visible_rows:
+            result: OrderResolveResult = row["resolve_result"]
+            source_row = int(result.source_row)
+            canonical_item = row_items.get(source_row) or str(row.get("Item Number") or result.item_number or "").strip()
+            grouped[(row["Date"], row["Order Number"])].append((source_row, float(row["QTY"]), canonical_item))
 
         exports = []
         for (date_text, order_number), resolved_rows in sorted(grouped.items(), key=lambda x: (x[0][1], x[0][0])):

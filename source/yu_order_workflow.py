@@ -159,7 +159,7 @@ class YUOrderEntryDialog(QDialog):
 
             for row in range(self.lines_table.rowCount()):
                 existing_item = self.lines_table.item(row, 0)
-                if existing_item is not None and (existing_item.text() or "").strip() == item_number:
+                if existing_item is not None and self.items_match((existing_item.text() or "").strip(), item_number):
                     qty_item = self.lines_table.item(row, 2)
                     current_qty = float((qty_item.text() or '0').replace(',', '')) if qty_item is not None else 0.0
                     new_qty = current_qty + qty_value
@@ -223,18 +223,14 @@ class YUOrderEntryDialog(QDialog):
             return ''
         finder = getattr(self.main_window, 'find_item_number', None)
         if callable(finder):
-            resolved = finder(typed_item)
-            if resolved:
-                return resolved
-        item_numbers = getattr(self.main_window, 'item_numbers', []) or []
-        lowered = typed_item.casefold()
-        for item in item_numbers:
-            if str(item).casefold() == lowered:
-                return str(item)
-        starts = [str(item) for item in item_numbers if str(item).casefold().startswith(lowered)]
-        if len(starts) == 1:
-            return starts[0]
-        return typed_item
+            return finder(typed_item) or ''
+        return ''
+
+    def items_match(self, left: str, right: str) -> bool:
+        matcher = getattr(self.main_window, 'item_numbers_match', None)
+        if callable(matcher):
+            return bool(matcher(left, right))
+        return (left or '').strip().casefold() == (right or '').strip().casefold()
 
     def description_for_item(self, item_number: str) -> str:
         getter = getattr(self.main_window, 'get_item_master_row', None)
@@ -270,7 +266,7 @@ class YUOrderEntryDialog(QDialog):
 
         for row in range(self.lines_table.rowCount()):
             existing_item = self.lines_table.item(row, 0)
-            if existing_item is not None and (existing_item.text() or '').strip() == item_number:
+            if existing_item is not None and self.items_match((existing_item.text() or '').strip(), item_number):
                 qty_item = self.lines_table.item(row, 2)
                 current_qty = float((qty_item.text() or '0').replace(',', '')) if qty_item is not None else 0.0
                 new_qty = current_qty + qty_value
