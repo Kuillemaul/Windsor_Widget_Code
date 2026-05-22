@@ -107,7 +107,7 @@ from yu_order_workflow import YUOrderEntryDialog, load_yu_review_module
 TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
 TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
 TABLE_FORMAT_SETTINGS_PREFIX = "table_format"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 APP_DESIGNER = "Bradley Mayze"
 # After the one-time no-space item-number migration, sales/order/stock tables
 # store canonical item numbers.  Keep runtime item-number resolution for entry/import,
@@ -5999,6 +5999,7 @@ class MainWindow(QMainWindow):
 
         self.customer_names = []
         self.item_numbers = []
+        self._fasteners_exact_item_numbers = set()
         self.supplier_names = []
         self.current_customer_months = []
         self.current_customer_pivot = {}
@@ -8268,11 +8269,11 @@ class MainWindow(QMainWindow):
         return canonical or ""
 
     def resolve_item_number(self, typed_text, allow_prefix=False, require_known=True):
-        """Resolve any typed/imported item number to the Widget canonical number.
+        """Resolve typed/imported item numbers for canonical storage.
 
-        Normal items are canonicalised by removing whitespace.  FASTENERS items
-        are exact-only: spaces are preserved and no automatic clean-key matching
-        is applied.
+        After the item-number cleanup, normal items are stored without spaces.
+        Avoid recursive/clean-key SQL scans here; resolve by exact canonical
+        item number so lookup screens and imports stay fast.
         """
         typed = str(typed_text or "").strip()
         if not typed:
@@ -8280,45 +8281,49 @@ class MainWindow(QMainWindow):
 
         exact_row = self.fetch_item_row_by_exact_number(typed)
         if exact_row:
-            exact_item = str(exact_row.get("item_number") or typed).strip()
-            if self.row_is_fasteners_item(exact_row):
-                return exact_item
-            return self.item_clean_key(exact_item)
+            return str(exact_row.get("item_number") or typed).strip()
 
-        clean_key = self.item_clean_key(typed)
-        if clean_key:
-            rows = self.fetch_item_rows_by_clean_key(clean_key)
-            if len(rows) == 1:
-                return clean_key
-            if len(rows) > 1:
-                approved = self.approved_canonical_for_clean_key(clean_key)
-                if approved:
-                    return approved
-                return None
+        exact_key = self.item_exact_key(typed)
+        if exact_key in getattr(self, "_fasteners_exact_item_numbers", set()):
+            return typed if not require_known else None
+
+        canonical = self.item_clean_key(typed)
+        if not canonical:
+            return None
+
+        canonical_row = self.fetch_item_row_by_exact_number(canonical)
+        if canonical_row:
+            return str(canonical_row.get("item_number") or canonical).strip()
 
         if allow_prefix:
             typed_upper = typed.upper()
-            prefix_matches = [
-                item_no for item_no in getattr(self, "item_numbers", []) or []
-                if str(item_no or "").upper().startswith(typed_upper)
-            ]
+            canonical_upper = canonical.upper()
+            prefix_matches = []
+            for item_no in getattr(self, "item_numbers", []) or []:
+                item_text = str(item_no or "").strip()
+                if not item_text:
+                    continue
+                if item_text.upper().startswith(typed_upper) or self.item_clean_key(item_text).startswith(canonical_upper):
+                    prefix_matches.append(item_text)
             if len(prefix_matches) == 1:
-                prefix_item = str(prefix_matches[0] or "").strip()
-                prefix_row = self.fetch_item_row_by_exact_number(prefix_item)
-                if prefix_row and self.row_is_fasteners_item(prefix_row):
-                    return prefix_item
-                return self.item_clean_key(prefix_item)
+                return prefix_matches[0]
 
         if require_known:
             return None
-        return clean_key or typed
+        return canonical
 
     def canonicalize_import_item_number(self, item_number):
-        """Canonicalise imported MYOB numbers without rejecting brand-new items."""
+        """Canonicalise imported MYOB numbers without running DB clean-key lookups.
+
+        Normal imported item numbers are now stored in the no-space convention.
+        FASTENERS exact item numbers are preserved if they are known in the item master.
+        """
         item_number = str(item_number or "").strip()
         if not item_number:
             return ""
-        return self.resolve_item_number(item_number, allow_prefix=False, require_known=False) or item_number
+        if self.item_exact_key(item_number) in getattr(self, "_fasteners_exact_item_numbers", set()):
+            return item_number
+        return self.item_clean_key(item_number) or item_number
 
     def is_fasteners_item_number(self, item_number):
         row = self.fetch_item_row_by_exact_number(item_number)
@@ -8329,41 +8334,19 @@ class MainWindow(QMainWindow):
         target = str(target or "").strip()
         if not candidate or not target:
             return False
-        if self.is_fasteners_item_number(candidate) or self.is_fasteners_item_number(target):
+        if self.item_exact_key(candidate) in getattr(self, "_fasteners_exact_item_numbers", set()):
+            return self.item_exact_key(candidate) == self.item_exact_key(target)
+        if self.item_exact_key(target) in getattr(self, "_fasteners_exact_item_numbers", set()):
             return self.item_exact_key(candidate) == self.item_exact_key(target)
         return self.item_clean_key(candidate) == self.item_clean_key(target)
 
     def build_item_number_filter_clause(self, item_numbers, column_expr="item_number"):
-        item_list = item_numbers if isinstance(item_numbers, (list, tuple, set)) else [item_numbers]
-        exact_keys = []
-        clean_keys = []
-        for raw_item in item_list:
-            raw_item = str(raw_item or "").strip()
-            if not raw_item:
-                continue
-            resolved = self.resolve_item_number(raw_item, allow_prefix=False, require_known=False) or raw_item
-            if self.is_fasteners_item_number(resolved):
-                key = self.item_exact_key(resolved)
-                if key and key not in exact_keys:
-                    exact_keys.append(key)
-            else:
-                key = self.item_clean_key(resolved)
-                if key and key not in clean_keys:
-                    clean_keys.append(key)
+        """Fast canonical item filter.
 
-        clauses = []
-        params = []
-        if exact_keys:
-            clause, clause_params = self.sql_in_clause(exact_keys)
-            clauses.append(f"{self.item_exact_sql_expr(column_expr)} IN {clause}")
-            params.extend(clause_params)
-        if clean_keys:
-            clause, clause_params = self.sql_in_clause(clean_keys)
-            clauses.append(f"{self.item_clean_sql_expr(column_expr)} IN {clause}")
-            params.extend(clause_params)
-        if not clauses:
-            return "1 = 0", []
-        return "(" + " OR ".join(clauses) + ")", params
+        All imported transactional data is now stored with canonical item numbers,
+        so avoid runtime REPLACE/TRIM scans over large tables.
+        """
+        return self.build_exact_canonical_item_filter_clause(item_numbers, column_expr)
 
     def build_exact_canonical_item_filter_clause(self, item_numbers, column_expr="item_number"):
         """Fast item filter for tables already migrated to canonical item numbers.
@@ -10490,6 +10473,31 @@ class MainWindow(QMainWindow):
             """
         )
         self.item_numbers = [r["item_number"] for r in item_rows if r["item_number"]]
+
+        self._fasteners_exact_item_numbers = set()
+        try:
+            group_columns = self.get_items_group_column_names() if self.has_table("items") else []
+            if group_columns:
+                fastener_tests = [
+                    f"UPPER(LTRIM(RTRIM(COALESCE([{column}], '')))) LIKE '%FASTENERS%'"
+                    for column in group_columns
+                ]
+                fastener_rows = self.db_all(
+                    f"""
+                    SELECT DISTINCT TRIM(item_number) AS item_number
+                    FROM items
+                    WHERE item_number IS NOT NULL
+                      AND TRIM(item_number) <> ''
+                      AND ({' OR '.join(fastener_tests)})
+                    """
+                )
+                self._fasteners_exact_item_numbers = {
+                    self.item_exact_key(row["item_number"])
+                    for row in fastener_rows
+                    if row["item_number"]
+                }
+        except Exception:
+            self._fasteners_exact_item_numbers = set()
 
         supplier_names = []
         supplier_seen = set()
@@ -14700,21 +14708,57 @@ class MainWindow(QMainWindow):
         if exact_row:
             return exact_row
 
-        clean_key = self.item_clean_key(item_number)
-        rows = self.fetch_item_rows_by_clean_key(clean_key)
-        if len(rows) == 1:
-            return rows[0]
-
-        approved = self.approved_canonical_for_clean_key(clean_key)
-        if approved:
-            approved_exact = self.fetch_item_row_by_exact_number(approved)
-            if approved_exact:
-                return approved_exact
-            approved_rows = self.fetch_item_rows_by_clean_key(approved)
-            if len(approved_rows) == 1:
-                return approved_rows[0]
+        canonical_item = self.canonicalize_import_item_number(item_number)
+        if canonical_item and canonical_item != item_number:
+            return self.fetch_item_row_by_exact_number(canonical_item)
 
         return {}
+
+    def create_import_progress_dialog(self, title, file_path=None, maximum=100):
+        """Create a small modal progress bar for long import operations."""
+        label = str(title or "Importing data...").strip()
+        if file_path:
+            try:
+                label = f"{label}\n{Path(file_path).name}"
+            except Exception:
+                pass
+        dialog = QProgressDialog(label, "", 0, max(1, int(maximum or 100)), self)
+        dialog.setWindowTitle("Importing Data")
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.setCancelButton(None)
+        dialog.setValue(0)
+        dialog.show()
+        QApplication.processEvents()
+        return dialog
+
+    def update_import_progress(self, dialog, value=None, message=None, maximum=None):
+        """Best-effort progress update that keeps the UI responsive during imports."""
+        if dialog is None:
+            return
+        try:
+            if maximum is not None:
+                dialog.setMaximum(max(1, int(maximum)))
+            if message:
+                dialog.setLabelText(str(message))
+            if value is not None:
+                dialog.setValue(min(max(0, int(value)), dialog.maximum()))
+            QApplication.processEvents()
+        except Exception:
+            pass
+
+    def close_import_progress(self, dialog):
+        if dialog is None:
+            return
+        try:
+            dialog.setValue(dialog.maximum())
+            QApplication.processEvents()
+            dialog.close()
+        except Exception:
+            pass
+
 
     def import_orders_from_dialog(self):
         filters = "Orders files (*.csv *.xlsx *.xlsm);;CSV files (*.csv);;Excel files (*.xlsx *.xlsm);;All files (*.*)"
@@ -14727,9 +14771,12 @@ class MainWindow(QMainWindow):
         if not file_path:
             return
 
+        progress = self.create_import_progress_dialog("Importing orders...", file_path)
         try:
-            imported_count = self.import_orders_file(file_path)
+            imported_count = self.import_orders_file(file_path, progress=progress)
+            self.update_import_progress(progress, 95, "Refreshing order displays...")
         except Exception as exc:
+            self.close_import_progress(progress)
             QMessageBox.critical(self, "Orders import failed", f"Could not import orders file.\n\n{exc}")
             return
 
@@ -14748,16 +14795,23 @@ class MainWindow(QMainWindow):
             self.refresh_item_summary_context_boxes()
         self.rerun_order_analysis_if_ready()
 
+        self.close_import_progress(progress)
         QMessageBox.information(self, "Orders imported", f"Imported {imported_count:,} rows into the orders table.")
 
-    def import_orders_file(self, file_path):
+    def import_orders_file(self, file_path, progress=None):
+        self.update_import_progress(progress, 8, "Reading orders file...")
         rows = self.read_orders_import_rows(file_path)
+        self.update_import_progress(progress, 45, f"Preparing {len(rows):,} order rows...")
         cur = self.db_conn.cursor()
+        self.update_import_progress(progress, 60, "Clearing existing order rows...")
         cur.execute("DELETE FROM orders")
-        cur.executemany(
-            "INSERT INTO orders (item_number, quantity, purchase_no, order_date) VALUES (?, ?, ?, ?)",
-            rows,
-        )
+        if rows:
+            self.update_import_progress(progress, 75, f"Saving {len(rows):,} order rows...")
+            cur.executemany(
+                "INSERT INTO orders (item_number, quantity, purchase_no, order_date) VALUES (?, ?, ?, ?)",
+                rows,
+            )
+        self.update_import_progress(progress, 88, "Committing order import...")
         self.db_conn.commit()
         return len(rows)
 
@@ -14914,9 +14968,12 @@ class MainWindow(QMainWindow):
         if not file_path:
             return
 
+        progress = self.create_import_progress_dialog("Importing sales...", file_path)
         try:
-            imported_count = self.import_sales_file(file_path)
+            imported_count = self.import_sales_file(file_path, progress=progress)
+            self.update_import_progress(progress, 92, "Refreshing sales and item screens...")
         except Exception as exc:
+            self.close_import_progress(progress)
             QMessageBox.critical(self, "Sales import failed", f"Could not import sales file.\n\n{exc}")
             return
 
@@ -14937,13 +14994,16 @@ class MainWindow(QMainWindow):
         self.rerun_search_if_ready()
         self.rerun_item_if_ready()
 
+        self.close_import_progress(progress)
         QMessageBox.information(self, "Sales imported", f"Added {imported_count:,} new rows to the sales table.")
 
-    def import_sales_file(self, file_path):
+    def import_sales_file(self, file_path, progress=None):
+        self.update_import_progress(progress, 5, "Reading sales file...")
         rows = self.read_sales_import_rows(file_path)
         if not rows:
             return 0
 
+        self.update_import_progress(progress, 35, f"Checking {len(rows):,} sales rows for duplicates...")
         date_values = [row[0] for row in rows if row and row[0]]
         min_date = min(date_values) if date_values else "0001-01-01"
         max_date = max(date_values) if date_values else "9999-12-31"
@@ -14952,7 +15012,7 @@ class MainWindow(QMainWindow):
             """
             SELECT sale_date, customer_name, item_number, quantity, price, invoice_no
             FROM sales
-            WHERE DATE(sale_date) BETWEEN ? AND ?
+            WHERE sale_date >= ? AND sale_date <= ?
             """,
             (min_date, max_date),
         )
@@ -14967,6 +15027,7 @@ class MainWindow(QMainWindow):
                 row["invoice_no"],
             )] += 1
 
+        self.update_import_progress(progress, 55, "Preparing new sales rows...")
         incoming_counts = Counter()
         rows_to_insert = []
         for row in rows:
@@ -14979,6 +15040,7 @@ class MainWindow(QMainWindow):
 
         if rows_to_insert:
             cur = self.db_conn.cursor()
+            self.update_import_progress(progress, 75, f"Saving {len(rows_to_insert):,} sales rows...")
             cur.executemany(
                 """
                 INSERT INTO sales (
@@ -14988,7 +15050,10 @@ class MainWindow(QMainWindow):
                 """,
                 rows_to_insert,
             )
+            self.update_import_progress(progress, 88, "Committing sales import...")
             self.db_conn.commit()
+        else:
+            self.update_import_progress(progress, 88, "No new sales rows to save.")
         return len(rows_to_insert)
 
     def read_sales_import_rows(self, file_path):
@@ -15226,9 +15291,12 @@ class MainWindow(QMainWindow):
         if not file_path:
             return
 
+        progress = self.create_import_progress_dialog("Importing cover orders...", file_path)
         try:
-            imported_count = self.import_cover_orders_file(file_path)
+            imported_count = self.import_cover_orders_file(file_path, progress=progress)
+            self.update_import_progress(progress, 92, "Refreshing customer summary...")
         except Exception as exc:
+            self.close_import_progress(progress)
             QMessageBox.critical(self, "Cover orders import failed", f"Could not import cover orders file.\n\n{exc}")
             return
 
@@ -15243,14 +15311,19 @@ class MainWindow(QMainWindow):
             browser.setPlainText(display_text)
 
         self.rerun_search_if_ready()
+        self.close_import_progress(progress)
         QMessageBox.information(self, "Cover orders imported", f"Imported {imported_count:,} rows into the cover orders table.")
 
-    def import_cover_orders_file(self, file_path):
+    def import_cover_orders_file(self, file_path, progress=None):
+        self.update_import_progress(progress, 8, "Preparing cover order table...")
         self.ensure_cover_orders_table()
+        self.update_import_progress(progress, 25, "Reading cover order file...")
         rows = self.read_cover_order_import_rows(file_path)
         cur = self.db_conn.cursor()
+        self.update_import_progress(progress, 55, "Clearing existing cover order rows...")
         cur.execute("DELETE FROM cover_orders")
         if rows:
+            self.update_import_progress(progress, 75, f"Saving {len(rows):,} cover order rows...")
             cur.executemany(
                 """
                 INSERT INTO cover_orders (
@@ -15259,6 +15332,7 @@ class MainWindow(QMainWindow):
                 """,
                 rows,
             )
+        self.update_import_progress(progress, 88, "Committing cover order import...")
         self.db_conn.commit()
         return len(rows)
 
@@ -15372,9 +15446,12 @@ class MainWindow(QMainWindow):
         if not file_path:
             return
 
+        progress = self.create_import_progress_dialog("Importing stock...", file_path)
         try:
-            imported_count = self.import_stock_file(file_path)
+            imported_count = self.import_stock_file(file_path, progress=progress)
+            self.update_import_progress(progress, 92, "Refreshing stock displays...")
         except Exception as exc:
+            self.close_import_progress(progress)
             QMessageBox.critical(self, "Stock import failed", f"Could not import stock file.\n\n{exc}")
             return
 
@@ -15391,26 +15468,33 @@ class MainWindow(QMainWindow):
         self.rerun_item_if_ready()
         self.rerun_order_analysis_if_ready()
 
+        self.close_import_progress(progress)
         QMessageBox.information(self, "Stock imported", f"Imported {imported_count:,} rows into the stock table.")
 
-    def import_stock_file(self, file_path):
+    def import_stock_file(self, file_path, progress=None):
+        self.update_import_progress(progress, 8, "Reading stock file...")
         rows = self.read_stock_import_rows(file_path)
         cur = self.db_conn.cursor()
+        self.update_import_progress(progress, 45, "Clearing existing stock rows...")
         cur.execute("DELETE FROM stock")
-        cur.executemany(
-            "INSERT INTO stock (item_number, on_hand, committed, on_order, available) VALUES (?, ?, ?, ?, ?)",
-            [
-                (
-                    row.get("item_number", ""),
-                    row.get("on_hand", 0),
-                    row.get("committed", 0),
-                    row.get("on_order", 0),
-                    row.get("available", 0),
-                )
-                for row in rows
-            ],
-        )
+        if rows:
+            self.update_import_progress(progress, 65, f"Saving {len(rows):,} stock rows...")
+            cur.executemany(
+                "INSERT INTO stock (item_number, on_hand, committed, on_order, available) VALUES (?, ?, ?, ?, ?)",
+                [
+                    (
+                        row.get("item_number", ""),
+                        row.get("on_hand", 0),
+                        row.get("committed", 0),
+                        row.get("on_order", 0),
+                        row.get("available", 0),
+                    )
+                    for row in rows
+                ],
+            )
+        self.update_import_progress(progress, 80, "Syncing item master from stock...")
         self.sync_items_from_stock_rows(rows)
+        self.update_import_progress(progress, 88, "Committing stock import...")
         self.db_conn.commit()
         return len(rows)
 
@@ -16796,18 +16880,14 @@ $mail.Display()
         target = self.normalize_item_code(normalized_code)
         if not target:
             return None
-        rows = self.fetch_item_rows_by_clean_key(target)
-        if len(rows) == 1:
-            return target
-        approved = self.approved_canonical_for_clean_key(target)
-        if approved:
-            return approved
         for item_no in self.item_numbers:
-            if self.normalize_item_code(item_no) == target:
-                row = self.fetch_item_row_by_exact_number(item_no)
-                if row and self.row_is_fasteners_item(row):
-                    return item_no
-                return target
+            item_text = str(item_no or "").strip()
+            if not item_text:
+                continue
+            if self.item_clean_key(item_text) == target:
+                if self.item_exact_key(item_text) in getattr(self, "_fasteners_exact_item_numbers", set()):
+                    return item_text
+                return self.item_clean_key(item_text)
         return None
 
     def get_thread_sales_item_numbers(self, item_number):
