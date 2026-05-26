@@ -107,7 +107,7 @@ from yu_order_workflow import YUOrderEntryDialog, load_yu_review_module
 TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
 TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
 TABLE_FORMAT_SETTINGS_PREFIX = "table_format"
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.2.3"
 APP_DESIGNER = "Bradley Mayze"
 # After the one-time no-space item-number migration, sales/order/stock tables
 # store canonical item numbers.  Keep runtime item-number resolution for entry/import,
@@ -10440,9 +10440,16 @@ class MainWindow(QMainWindow):
         if self.has_table("customers"):
             customer_rows = self.db_all(
                 """
-                SELECT DISTINCT TRIM(customer_name) AS customer_name
-                FROM customers
-                WHERE customer_name IS NOT NULL AND TRIM(customer_name) <> ''
+                SELECT DISTINCT customer_name
+                FROM (
+                    SELECT TRIM(customer_name) AS customer_name
+                    FROM customers
+                    WHERE customer_name IS NOT NULL AND TRIM(customer_name) <> ''
+                    UNION
+                    SELECT TRIM(customer_name) AS customer_name
+                    FROM sales
+                    WHERE customer_name IS NOT NULL AND TRIM(customer_name) <> ''
+                ) AS customer_union
                 ORDER BY customer_name COLLATE NOCASE
                 """
             )
@@ -14957,6 +14964,188 @@ class MainWindow(QMainWindow):
         item_number = self.canonicalize_import_item_number(item_number)
         return (item_number, quantity_value, purchase_no, shipping_date)
 
+
+    def ensure_customers_table_for_sales_import(self):
+        """Ensure a minimal customers table exists so imported sales customers can be searched.
+
+        The existing customer workbook matching system stores the matched Excel file in
+        matched_file.  New customers imported from MYOB start with no matched file and
+        can be matched later from the Customer Summary screen.
+        """
+        if self.db_conn is None:
+            return False
+
+        if not self.has_table("customers"):
+            cur = self.db_conn.cursor()
+            if self.db_engine == "sqlserver":
+                cur.execute(
+                    """
+                    CREATE TABLE customers (
+                        id INT IDENTITY(1,1) PRIMARY KEY,
+                        customer_name NVARCHAR(255) NOT NULL,
+                        matched_file NVARCHAR(500) NULL,
+                        charge_freight NVARCHAR(10) NULL,
+                        card_on_file NVARCHAR(10) NULL,
+                        send_proforma NVARCHAR(10) NULL
+                    )
+                    """
+                )
+            else:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS customers (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        customer_name TEXT NOT NULL,
+                        matched_file TEXT,
+                        charge_freight TEXT,
+                        card_on_file TEXT,
+                        send_proforma TEXT
+                    )
+                    """
+                )
+            self.db_conn.commit()
+
+        return self.has_table("customers")
+
+    def customer_table_name_column(self):
+        if self.db_conn is None or not self.has_table("customers"):
+            return None
+        columns = self.get_table_columns("customers")
+        lowered = {str(column or "").strip().lower(): str(column or "").strip() for column in columns}
+        for candidate in ("customer_name", "customer name", "customer", "name"):
+            if candidate in lowered:
+                return lowered[candidate]
+        return None
+
+    def ensure_customer_import_support_columns(self):
+        if self.db_conn is None or not self.has_table("customers"):
+            return
+
+        existing_columns = {str(name or "").strip().lower(): str(name or "").strip() for name in self.get_table_columns("customers")}
+        desired_columns = [
+            ("matched_file", "NVARCHAR(500) NULL", "TEXT"),
+            ("charge_freight", "NVARCHAR(10) NULL", "TEXT"),
+            ("card_on_file", "NVARCHAR(10) NULL", "TEXT"),
+            ("send_proforma", "NVARCHAR(10) NULL", "TEXT"),
+        ]
+
+        cur = self.db_conn.cursor()
+        changed = False
+        for column_name, sqlserver_type, sqlite_type in desired_columns:
+            if column_name.lower() in existing_columns:
+                continue
+            if self.db_engine == "sqlserver":
+                cur.execute(f"ALTER TABLE customers ADD {self.db_identifier(column_name)} {sqlserver_type}")
+            else:
+                cur.execute(f"ALTER TABLE customers ADD COLUMN {column_name} {sqlite_type}")
+            changed = True
+
+        if changed:
+            self.db_conn.commit()
+
+    def customer_import_lookup_key(self, customer_name):
+        return re.sub(r"\s+", " ", str(customer_name or "").strip()).upper()
+
+    def add_missing_customers_from_sales_rows(self, sales_rows):
+        """Add customers found in the current sales import to the customers table.
+
+        This keeps Customer Summary autocomplete/list behaviour aligned with newly
+        imported MYOB sales data even before a customer Excel file has been matched.
+        """
+        if not sales_rows:
+            return 0
+        if self.db_conn is None:
+            return 0
+        if not self.ensure_customers_table_for_sales_import():
+            return 0
+
+        self.ensure_customer_import_support_columns()
+        customer_column = self.customer_table_name_column()
+        if not customer_column:
+            raise ValueError("The customers table exists but does not have a customer_name column.")
+
+        ordered_names = []
+        seen_new = set()
+        for row in sales_rows:
+            try:
+                customer_name = str(row[1] or "").strip()
+            except Exception:
+                customer_name = ""
+            key = self.customer_import_lookup_key(customer_name)
+            if not key or key in seen_new:
+                continue
+            seen_new.add(key)
+            ordered_names.append(customer_name)
+
+        if not ordered_names:
+            return 0
+
+        column_sql = self.db_identifier(customer_column)
+        existing_rows = self.db_all(
+            f"""
+            SELECT TRIM({column_sql}) AS customer_name
+            FROM customers
+            WHERE {column_sql} IS NOT NULL
+              AND TRIM({column_sql}) <> ''
+            """
+        )
+        existing_keys = {
+            self.customer_import_lookup_key(row["customer_name"])
+            for row in existing_rows
+            if row["customer_name"]
+        }
+
+        rows_to_add = [
+            (customer_name,)
+            for customer_name in ordered_names
+            if self.customer_import_lookup_key(customer_name) not in existing_keys
+        ]
+        if not rows_to_add:
+            return 0
+
+        cur = self.db_conn.cursor()
+        try:
+            cur.executemany(
+                f"INSERT INTO customers ({column_sql}) VALUES (?)",
+                rows_to_add,
+            )
+            self.db_conn.commit()
+            return len(rows_to_add)
+        except Exception:
+            try:
+                self.db_conn.rollback()
+            except Exception:
+                pass
+
+        # Fallback to single-row inserts.  This avoids a whole import failing if
+        # one row races with another user or hits an existing unique constraint.
+        added = 0
+        for (customer_name,) in rows_to_add:
+            exists = self.db_one(
+                f"""
+                SELECT {column_sql} AS customer_name
+                FROM customers
+                WHERE UPPER(TRIM({column_sql})) = UPPER(TRIM(?))
+                LIMIT 1
+                """,
+                (customer_name,),
+            )
+            if exists:
+                continue
+            try:
+                cur.execute(
+                    f"INSERT INTO customers ({column_sql}) VALUES (?)",
+                    (customer_name,),
+                )
+                added += 1
+            except Exception:
+                # Keep the import moving.  The sales row can still be imported,
+                # and load_reference_lists also unions customer names from sales.
+                continue
+        if added:
+            self.db_conn.commit()
+        return added
+
     def import_sales_from_dialog(self):
         filters = "Sales files (*.txt *.csv *.xlsx *.xlsm);;Text files (*.txt);;CSV files (*.csv);;Excel files (*.xlsx *.xlsm);;All files (*.*)"
         file_path, _ = QFileDialog.getOpenFileName(
@@ -14970,8 +15159,10 @@ class MainWindow(QMainWindow):
 
         progress = self.create_import_progress_dialog("Importing sales...", file_path)
         try:
+            self._last_sales_customers_added = 0
             imported_count = self.import_sales_file(file_path, progress=progress)
-            self.update_import_progress(progress, 92, "Refreshing sales and item screens...")
+            customers_added = int(getattr(self, "_last_sales_customers_added", 0) or 0)
+            self.update_import_progress(progress, 92, "Refreshing sales and customer lists...")
         except Exception as exc:
             self.close_import_progress(progress)
             QMessageBox.critical(self, "Sales import failed", f"Could not import sales file.\n\n{exc}")
@@ -14980,7 +15171,8 @@ class MainWindow(QMainWindow):
         display_text = (
             f"Last import: {datetime.now().strftime('%d/%m/%Y %H:%M')}\n"
             f"File: {Path(file_path).name}\n"
-            f"Rows added: {imported_count:,}"
+            f"Rows added: {imported_count:,}\n"
+            f"New customers added: {customers_added:,}"
         )
         self.set_meta_value("sales_last_import_display", display_text)
         browser = getattr(self.ui, "lastUpdateSales_textBrowser", None)
@@ -14995,13 +15187,26 @@ class MainWindow(QMainWindow):
         self.rerun_item_if_ready()
 
         self.close_import_progress(progress)
-        QMessageBox.information(self, "Sales imported", f"Added {imported_count:,} new rows to the sales table.")
+        customer_message = ""
+        if customers_added:
+            customer_message = f"\n\nAdded {customers_added:,} new customer(s) to the customer list."
+        QMessageBox.information(
+            self,
+            "Sales imported",
+            f"Added {imported_count:,} new rows to the sales table.{customer_message}",
+        )
 
     def import_sales_file(self, file_path, progress=None):
         self.update_import_progress(progress, 5, "Reading sales file...")
         rows = self.read_sales_import_rows(file_path)
         if not rows:
             return 0
+
+        self.update_import_progress(progress, 28, "Checking customer list...")
+        try:
+            self._last_sales_customers_added = self.add_missing_customers_from_sales_rows(rows)
+        except Exception as exc:
+            raise ValueError(f"Sales rows were read, but the customer list could not be updated: {exc}") from exc
 
         self.update_import_progress(progress, 35, f"Checking {len(rows):,} sales rows for duplicates...")
         date_values = [row[0] for row in rows if row and row[0]]
