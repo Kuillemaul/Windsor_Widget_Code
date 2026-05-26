@@ -9,6 +9,7 @@ import re
 import sys
 import shutil
 import tempfile
+import traceback
 import zipfile
 from collections import defaultdict
 from copy import copy, deepcopy
@@ -2720,8 +2721,29 @@ class YUOrderReviewWindow(QMainWindow):
                 break
 
     def export_visible_orders(self):
+        """Export visible YU order rows with user-facing error reporting.
+
+        Qt can otherwise swallow exceptions raised inside a clicked slot, leaving
+        the button appearing to do nothing. Keep this wrapper thin and put the
+        actual export work in _export_visible_orders_impl().
+        """
+        try:
+            self._export_visible_orders_impl()
+        except Exception as exc:
+            self.show_export_error(exc)
+
+    def _export_visible_orders_impl(self):
         if not self.template_path:
             QMessageBox.warning(self, "YU Order Review", "No workbook template path is set.")
+            return
+
+        if not Path(str(self.template_path)).exists():
+            QMessageBox.warning(
+                self,
+                "YU Order Review",
+                "The YU workbook template could not be found.\n\n"
+                f"{self.template_path}",
+            )
             return
 
         if not self.current_rows:
@@ -2754,22 +2776,72 @@ class YUOrderReviewWindow(QMainWindow):
             )
             return
 
-        grouped: dict[tuple[str, str], list[tuple[int, float]]] = defaultdict(list)
+        invalid_rows: list[str] = []
         for row in visible_rows:
             result: OrderResolveResult = row["resolve_result"]
-            grouped[(row["Date"], row["Order Number"])].append((int(result.source_row), float(row["QTY"])))
+            item_number = str(row.get("Item Number") or "").strip()
+            try:
+                source_row = int(result.source_row)
+                if source_row <= 0:
+                    raise ValueError("source row must be greater than zero")
+            except Exception:
+                invalid_rows.append(f"{item_number}: invalid source row {result.source_row!r}")
+
+            try:
+                float(row.get("QTY") or 0)
+            except Exception:
+                invalid_rows.append(f"{item_number}: invalid quantity {row.get('QTY')!r}")
+
+        if invalid_rows:
+            QMessageBox.warning(
+                self,
+                "YU Order Review",
+                "Export stopped because one or more resolved rows contain invalid export data.\n\n"
+                + "\n".join(invalid_rows[:20])
+                + ("\n\nMore rows were omitted from this message." if len(invalid_rows) > 20 else "")
+                + f"\n\nAudit written to:\n{audit_path}",
+            )
+            return
+
+        grouped: dict[tuple[str, str], list[tuple[int, float]]] = defaultdict(list)
+        grouped_items: dict[tuple[str, str], list[str]] = defaultdict(list)
+        for row in visible_rows:
+            result: OrderResolveResult = row["resolve_result"]
+            order_key = (row["Date"], row["Order Number"])
+            grouped[order_key].append((int(result.source_row), float(row["QTY"])))
+            grouped_items[order_key].append(
+                f"{row['Item Number']} row {int(result.source_row)} qty {self.format_qty(row['QTY'])}"
+            )
 
         exports = []
         for (date_text, order_number), resolved_rows in sorted(grouped.items(), key=lambda x: (x[0][1], x[0][0])):
             filename = f"yuchang_order_{order_number}.xlsx"
             output_path = str(Path(output_dir) / filename)
-            export_yuchang_po_compact_by_rows(
-                template_path=self.template_path,
-                output_path=output_path,
-                order_date=date_text,
-                order_number=order_number,
-                source_rows_with_qty=resolved_rows,
-            )
+            try:
+                export_yuchang_po_compact_by_rows(
+                    template_path=self.template_path,
+                    output_path=output_path,
+                    order_date=date_text,
+                    order_number=order_number,
+                    source_rows_with_qty=resolved_rows,
+                )
+            except PermissionError as exc:
+                raise PermissionError(
+                    "Could not write the exported YU workbook.\n\n"
+                    "Close the output workbook if it is open in Excel, then try again.\n\n"
+                    f"Order: {order_number}\n"
+                    f"Output file: {output_path}"
+                ) from exc
+            except Exception as exc:
+                item_details = "\n".join(grouped_items.get((date_text, order_number), [])[:30])
+                raise RuntimeError(
+                    "Export failed while building the YU workbook.\n\n"
+                    f"Order: {order_number}\n"
+                    f"Date: {date_text}\n"
+                    f"Output file: {output_path}\n\n"
+                    "Rows in this export:\n"
+                    f"{item_details}"
+                ) from exc
             exports.append(output_path)
 
         self.output_dir = output_dir
@@ -2781,6 +2853,31 @@ class YUOrderReviewWindow(QMainWindow):
             + "\n".join(exports)
             + f"\n\nAudit:\n{audit_path}",
         )
+
+    def show_export_error(self, exc: Exception):
+        error_path = None
+        try:
+            target_dir = Path(self.output_dir or tempfile.gettempdir())
+            target_dir.mkdir(parents=True, exist_ok=True)
+            error_path = target_dir / "yu_order_export_error.log"
+            error_path.write_text(traceback.format_exc(), encoding="utf-8")
+        except Exception:
+            error_path = None
+
+        message = (
+            "The YU export failed.\n\n"
+            f"{type(exc).__name__}: {exc}\n\n"
+            "The order was not exported. Fix the issue and try again."
+        )
+        if error_path is not None:
+            message += f"\n\nA technical error log was written to:\n{error_path}"
+
+        try:
+            self.statusBar().showMessage("YU export failed.", 8000)
+        except Exception:
+            pass
+
+        QMessageBox.critical(self, "YU Export Failed", message)
 
     def open_workbook(self):
         if not self.template_path:
