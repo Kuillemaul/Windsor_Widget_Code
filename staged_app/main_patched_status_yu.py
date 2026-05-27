@@ -107,7 +107,7 @@ from yu_order_workflow import YUOrderEntryDialog, load_yu_review_module
 TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
 TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
 TABLE_FORMAT_SETTINGS_PREFIX = "table_format"
-APP_VERSION = "1.2.3"
+APP_VERSION = "1.2.4"
 APP_DESIGNER = "Bradley Mayze"
 # After the one-time no-space item-number migration, sales/order/stock tables
 # store canonical item numbers.  Keep runtime item-number resolution for entry/import,
@@ -17147,7 +17147,7 @@ $mail.Display()
         if value is None:
             return ""
         numeric = self.parse_float(value)
-        return f"{numeric:,.2f}"
+        return f"{numeric:,.3f}"
 
     def sort_text_value(self, value):
         return str(value or "").strip().casefold()
