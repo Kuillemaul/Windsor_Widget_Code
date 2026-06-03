@@ -1,6 +1,7 @@
 import sys
 import re
 import math
+import difflib
 try:
     import pyodbc
 except Exception:
@@ -88,12 +89,15 @@ from PySide6.QtWidgets import (
     QStatusBar,
     QStackedWidget,
     QSplitter,
+    QScrollArea,
     QScrollBar,
 )
 from PySide6.QtCharts import (
     QChart,
     QChartView,
     QLineSeries,
+    QBarSet,
+    QBarSeries,
     QBarCategoryAxis,
     QValueAxis,
 )
@@ -107,7 +111,7 @@ from yu_order_workflow import YUOrderEntryDialog, load_yu_review_module
 TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
 TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
 TABLE_FORMAT_SETTINGS_PREFIX = "table_format"
-APP_VERSION = "1.2.4"
+APP_VERSION = "1.3.0"
 APP_DESIGNER = "Bradley Mayze"
 # After the one-time no-space item-number migration, sales/order/stock tables
 # store canonical item numbers.  Keep runtime item-number resolution for entry/import,
@@ -1410,6 +1414,7 @@ SHIPMENT_FIELD_MAP = [
     ("Date", "entry_date"),
     ("Shipment Type", "shipment_type"),
     ("O/No", "order_no"),
+    ("Shipment Ref", "shipment_ref"),
     ("Supplier", "supplier_name"),
     ("Container No", "container_no"),
     ("Product", "product"),
@@ -1433,6 +1438,10 @@ SHIPMENT_BUTTON_MAP = {
     "SABA": "newSaba_pushButton",
 }
 
+SHIPMENT_IMPORT_ACTION_CREATE = "__CREATE__"
+SHIPMENT_IMPORT_ACTION_SKIP = "__SKIP__"
+SHIPMENT_IMPORT_AUTO_SCORE = 85
+SHIPMENT_IMPORT_SUGGEST_SCORE = 55
 
 
 try:
@@ -1743,6 +1752,192 @@ class ShipmentDateDelegate(QStyledItemDelegate):
         model.setData(index, value, Qt.EditRole)
 
 
+class ShipmentUpdateReviewDialog(QDialog):
+    """Confirm/update matches before applying a forwarder shipment update workbook."""
+
+    MATCH_ROLE = Qt.UserRole + 910
+
+    def __init__(self, import_rows, existing_rows, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Review Shipment Update Matches")
+        self.resize(1350, 720)
+        self.import_rows = list(import_rows or [])
+        self.existing_rows = list(existing_rows or [])
+        self._match_combos = []
+        self.build_ui()
+        self.populate_table()
+
+    def build_ui(self):
+        layout = QVBoxLayout(self)
+
+        self.info_label = QLabel(
+            "Check the suggested match for each imported shipment. Change the drop-down to another row, "
+            "Create new shipment, or Skip. Nothing is updated until you press Import / Update.",
+            self,
+        )
+        self.info_label.setWordWrap(True)
+        layout.addWidget(self.info_label)
+
+        self.table = QTableWidget(self)
+        self.table.setColumnCount(10)
+        self.table.setHorizontalHeaderLabels([
+            "Action / Manual Match",
+            "Score",
+            "Shipment",
+            "Order Ref",
+            "Supplier",
+            "Type",
+            "ETA / Due",
+            "Container",
+            "Vessel",
+            "Suggested Existing Row",
+        ])
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.table, 1)
+
+        self.summary_label = QLabel("", self)
+        self.summary_label.setWordWrap(True)
+        layout.addWidget(self.summary_label)
+
+        self.button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self)
+        ok_button = self.button_box.button(QDialogButtonBox.Ok)
+        if ok_button is not None:
+            ok_button.setText("Import / Update")
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        layout.addWidget(self.button_box)
+
+    def existing_label(self, row_data):
+        if not row_data:
+            return ""
+        values = dict(row_data)
+        record_id = values.get("id", "")
+        shipment_ref = str(values.get("shipment_ref") or "").strip() or "-"
+        order_no = str(values.get("order_no") or "").strip() or "-"
+        shipment_type = str(values.get("shipment_type") or "").strip() or "-"
+        supplier_name = str(values.get("supplier_name") or "").strip() or "-"
+        container_no = str(values.get("container_no") or "").strip() or "-"
+        due_date = str(values.get("due_date") or "").strip() or "-"
+        return f"ID {record_id} | {shipment_type} | Order {order_no} | Ship {shipment_ref} | {supplier_name} | Cont {container_no} | Due {due_date}"
+
+    def populate_table(self):
+        self._match_combos = []
+        self.table.setRowCount(len(self.import_rows))
+
+        create_count = 0
+        match_count = 0
+        skip_count = 0
+        low_confidence_count = 0
+
+        for row_index, import_row in enumerate(self.import_rows):
+            score = int(import_row.get("match_score") or 0)
+            best_match_id = import_row.get("match_id")
+            best_match = import_row.get("match_row")
+
+            combo = QComboBox(self.table)
+            combo.addItem("Create new shipment", SHIPMENT_IMPORT_ACTION_CREATE)
+            combo.addItem("Skip", SHIPMENT_IMPORT_ACTION_SKIP)
+            for existing_row in self.existing_rows:
+                combo.addItem(self.existing_label(existing_row), int(existing_row.get("id") or 0))
+
+            selected_data = SHIPMENT_IMPORT_ACTION_CREATE
+            if best_match_id and score >= SHIPMENT_IMPORT_SUGGEST_SCORE:
+                selected_data = int(best_match_id)
+                match_count += 1
+                if score < SHIPMENT_IMPORT_AUTO_SCORE:
+                    low_confidence_count += 1
+            else:
+                create_count += 1
+
+            for option_index in range(combo.count()):
+                if combo.itemData(option_index) == selected_data:
+                    combo.setCurrentIndex(option_index)
+                    break
+
+            self.table.setCellWidget(row_index, 0, combo)
+            self._match_combos.append(combo)
+
+            cells = [
+                str(score) if score else "",
+                str(import_row.get("shipment_ref") or ""),
+                str(import_row.get("order_no") or ""),
+                str(import_row.get("supplier_name") or ""),
+                str(import_row.get("shipment_type") or ""),
+                str(import_row.get("due_date") or ""),
+                str(import_row.get("container_no") or ""),
+                str(import_row.get("vessel") or ""),
+                self.existing_label(best_match) if best_match else "",
+            ]
+            for col_offset, value in enumerate(cells, start=1):
+                item = QTableWidgetItem(value)
+                if col_offset in {1, 5, 6}:
+                    item.setTextAlignment(Qt.AlignCenter)
+                self.table.setItem(row_index, col_offset, item)
+
+            if selected_data == SHIPMENT_IMPORT_ACTION_SKIP:
+                skip_count += 1
+
+        self.table.resizeRowsToContents()
+        for column_index in range(self.table.columnCount()):
+            try:
+                self.table.resizeColumnToContents(column_index)
+            except Exception:
+                pass
+        try:
+            self.table.setColumnWidth(0, max(280, self.table.columnWidth(0)))
+            self.table.setColumnWidth(4, max(260, self.table.columnWidth(4)))
+            self.table.setColumnWidth(9, max(420, self.table.columnWidth(9)))
+        except Exception:
+            pass
+
+        self.summary_label.setText(
+            f"Rows found: {len(self.import_rows)}. Suggested matches: {match_count}. "
+            f"Low-confidence matches to check carefully: {low_confidence_count}. New rows: {create_count}."
+        )
+
+    def accept(self):
+        selected_ids = []
+        for combo in self._match_combos:
+            selected = combo.currentData()
+            if selected in {SHIPMENT_IMPORT_ACTION_CREATE, SHIPMENT_IMPORT_ACTION_SKIP}:
+                continue
+            try:
+                selected_ids.append(int(selected))
+            except Exception:
+                pass
+        duplicates = sorted({record_id for record_id in selected_ids if selected_ids.count(record_id) > 1})
+        if duplicates:
+            QMessageBox.warning(
+                self,
+                "Duplicate Manual Matches",
+                "The same existing shipment row has been selected more than once. "
+                "Choose a different match, Create new shipment, or Skip before importing.\n\n"
+                f"Duplicate IDs: {', '.join(str(value) for value in duplicates)}",
+            )
+            return
+        super().accept()
+
+    def confirmed_actions(self):
+        actions = []
+        for row_index, import_row in enumerate(self.import_rows):
+            combo = self._match_combos[row_index]
+            selected = combo.currentData()
+            if selected == SHIPMENT_IMPORT_ACTION_SKIP:
+                actions.append((import_row, SHIPMENT_IMPORT_ACTION_SKIP, None))
+            elif selected == SHIPMENT_IMPORT_ACTION_CREATE:
+                actions.append((import_row, SHIPMENT_IMPORT_ACTION_CREATE, None))
+            else:
+                try:
+                    actions.append((import_row, "update", int(selected)))
+                except Exception:
+                    actions.append((import_row, SHIPMENT_IMPORT_ACTION_SKIP, None))
+        return actions
+
+
 class ShipmentsWindow(QMainWindow):
     RECORD_ID_ROLE = Qt.UserRole + 500
 
@@ -1893,6 +2088,12 @@ class ShipmentsWindow(QMainWindow):
             top_layout.addSpacing(12)
             top_layout.addWidget(filter_label)
             top_layout.addWidget(self._shipment_filter_combo)
+
+        if top_layout is not None and not hasattr(self, "import_update_pushButton"):
+            self.import_update_pushButton = QPushButton("Import Update.XLSX", self)
+            self.import_update_pushButton.setToolTip("Import the forwarder shipment update workbook and confirm matches before updating.")
+            top_layout.addSpacing(12)
+            top_layout.addWidget(self.import_update_pushButton)
 
         table = self.table_widget()
         if table is None:
@@ -2047,6 +2248,558 @@ class ShipmentsWindow(QMainWindow):
         except Exception:
             pass
 
+
+    def import_shipment_update_workbook(self):
+        if load_workbook is None:
+            QMessageBox.warning(self, "Import Shipment Update", "openpyxl is not available, so the XLSX file cannot be read.")
+            return
+
+        file_path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Import shipment update workbook",
+            "",
+            "Excel Workbooks (*.xlsx *.xlsm);;All Files (*)",
+        )
+        if not file_path:
+            return
+
+        try:
+            self.refresh_supplier_names()
+            import_rows = self.parse_shipment_update_workbook(file_path)
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Import Shipment Update",
+                f"Could not read the shipment update workbook.\n\n{exc}",
+            )
+            return
+
+        if not import_rows:
+            QMessageBox.information(self, "Import Shipment Update", "No shipment rows were found in the selected workbook.")
+            return
+
+        existing_rows = self.load_existing_shipments_for_import()
+        self.attach_best_import_matches(import_rows, existing_rows)
+
+        review_dialog = ShipmentUpdateReviewDialog(import_rows, existing_rows, self)
+        if review_dialog.exec() != QDialog.Accepted:
+            return
+
+        try:
+            counts = self.apply_shipment_update_actions(review_dialog.confirmed_actions(), existing_rows)
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Import Shipment Update",
+                f"The workbook was read, but the shipment table could not be updated.\n\n{exc}",
+            )
+            return
+
+        self.load_table()
+        self.refresh_last_updated_display()
+        try:
+            self.main_window.refresh_dashboard()
+        except Exception:
+            pass
+        QMessageBox.information(
+            self,
+            "Import Shipment Update",
+            "Shipment update import complete.\n\n"
+            f"Updated: {counts.get('updated', 0)}\n"
+            f"Created: {counts.get('created', 0)}\n"
+            f"Skipped: {counts.get('skipped', 0)}",
+        )
+
+    def shipment_update_cell_text(self, cell):
+        value = getattr(cell, "value", cell)
+        if value is None:
+            return ""
+        if isinstance(value, datetime):
+            return value.strftime("%d/%m/%y")
+        if isinstance(value, date):
+            return value.strftime("%d/%m/%y")
+        if isinstance(value, float) and value.is_integer():
+            return str(int(value))
+        return str(value).strip()
+
+    def shipment_update_date_from_cell(self, cell):
+        value = getattr(cell, "value", cell)
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        text = str(value).strip()
+        if not text or text.casefold() in {"tba", "tbd", "n/a", "na"}:
+            return None
+        if isinstance(value, (int, float)):
+            try:
+                parsed = from_excel(value) if from_excel is not None else None
+                if isinstance(parsed, datetime):
+                    return parsed.date()
+                if isinstance(parsed, date):
+                    return parsed
+            except Exception:
+                pass
+        return self.parse_shipment_date(text)
+
+    def shipment_update_date_text(self, cell):
+        parsed = self.shipment_update_date_from_cell(cell)
+        return parsed.strftime("%d/%m/%y") if parsed is not None else ""
+
+    def normalise_shipment_update_header(self, value):
+        text = str(value or "").casefold().strip()
+        return re.sub(r"[^a-z0-9]+", "", text)
+
+    def shipment_update_header_field(self, header_text):
+        key = self.normalise_shipment_update_header(header_text)
+        return {
+            "orderref": "order_no",
+            "orderno": "order_no",
+            "order": "order_no",
+            "shipment": "shipment_ref",
+            "shipmentid": "shipment_ref",
+            "shipmentref": "shipment_ref",
+            "trans": "trans",
+            "consignorname": "supplier_name",
+            "consignor": "supplier_name",
+            "supplier": "supplier_name",
+            "etd": "etd",
+            "dest": "dest",
+            "destination": "dest",
+            "eta": "eta",
+            "packmode": "pack_mode",
+            "mode": "pack_mode",
+            "container": "container_no",
+            "containerno": "container_no",
+            "containerid": "container_no",
+            "arrivalvessel": "vessel",
+            "vessel": "vessel",
+            "clientvisiblejobnotes": "notes",
+            "jobnotes": "notes",
+            "notes": "notes",
+        }.get(key, "")
+
+    def find_shipment_update_table(self, workbook):
+        for worksheet in workbook.worksheets:
+            for row in worksheet.iter_rows(min_row=1, max_row=min(100, worksheet.max_row)):
+                header_map = {}
+                for column_index, cell in enumerate(row):
+                    field_name = self.shipment_update_header_field(cell.value)
+                    if field_name and field_name not in header_map:
+                        header_map[field_name] = column_index
+                required = {"shipment_ref", "supplier_name"}
+                if required.issubset(set(header_map)) and ({"eta", "etd", "dest"} & set(header_map)):
+                    return worksheet, row[0].row, header_map
+        raise ValueError("Could not find the shipment listing table. Expected headers like Shipment, Consignor Name, ETA and Client Visible Job Notes.")
+
+    def parse_shipment_update_workbook(self, file_path):
+        workbook = load_workbook(file_path, data_only=True)
+        worksheet, header_row, header_map = self.find_shipment_update_table(workbook)
+        import_rows = []
+        blank_streak = 0
+
+        for row in worksheet.iter_rows(min_row=header_row + 1, max_row=worksheet.max_row):
+            raw = {}
+            for field_name, column_index in header_map.items():
+                raw[field_name] = row[column_index] if column_index < len(row) else None
+
+            shipment_ref = self.shipment_update_cell_text(raw.get("shipment_ref"))
+            order_no = self.shipment_update_cell_text(raw.get("order_no"))
+            supplier_name = self.shipment_update_cell_text(raw.get("supplier_name"))
+            notes = self.shipment_update_cell_text(raw.get("notes"))
+            container_no = self.shipment_update_cell_text(raw.get("container_no"))
+            vessel = self.shipment_update_cell_text(raw.get("vessel"))
+
+            if not any([shipment_ref, order_no, supplier_name, notes, container_no, vessel]):
+                blank_streak += 1
+                if blank_streak >= 8 and import_rows:
+                    break
+                continue
+            blank_streak = 0
+
+            import_row = self.build_shipment_import_row(raw)
+            if import_row.get("shipment_ref") or import_row.get("order_no") or import_row.get("supplier_name"):
+                import_rows.append(import_row)
+
+        return import_rows
+
+    def build_shipment_import_row(self, raw):
+        order_no = self.shipment_update_cell_text(raw.get("order_no"))
+        shipment_ref = self.shipment_update_cell_text(raw.get("shipment_ref"))
+        supplier_raw = self.shipment_update_cell_text(raw.get("supplier_name"))
+        supplier_name = self.best_reference_supplier_name(supplier_raw) or supplier_raw
+        dest = self.shipment_update_cell_text(raw.get("dest"))
+        pack_mode = self.shipment_update_cell_text(raw.get("pack_mode"))
+        container_no = self.shipment_update_cell_text(raw.get("container_no"))
+        vessel = self.shipment_update_cell_text(raw.get("vessel"))
+        notes = self.shipment_update_cell_text(raw.get("notes"))
+        shipment_date = self.shipment_update_date_text(raw.get("etd"))
+        due_date = self.shipment_update_date_text(raw.get("eta"))
+        due_date_obj = self.shipment_update_date_from_cell(raw.get("eta"))
+        shipment_date_obj = self.shipment_update_date_from_cell(raw.get("etd"))
+        fallback_year = None
+        if due_date_obj is not None:
+            fallback_year = due_date_obj.year
+        elif shipment_date_obj is not None:
+            fallback_year = shipment_date_obj.year
+        ready_date = self.extract_ready_date_from_notes(notes, fallback_year=fallback_year)
+
+        shipment_type = self.derive_import_shipment_type(dest, supplier_name, order_no)
+        qty = self.derive_import_qty(pack_mode, container_no)
+        status = self.derive_import_status(shipment_date_obj, due_date_obj, container_no, vessel, notes)
+
+        return {
+            "entry_date": date.today().strftime("%d/%m/%y"),
+            "shipment_type": shipment_type,
+            "order_no": order_no,
+            "shipment_ref": shipment_ref,
+            "supplier_name": supplier_name,
+            "container_no": container_no,
+            "product": "",
+            "qty": qty,
+            "ready_date": ready_date,
+            "shipment_date": shipment_date,
+            "due_date": due_date,
+            "status": status,
+            "vessel": vessel,
+            "notes": notes,
+            "_dest": dest,
+            "_pack_mode": pack_mode,
+            "match_score": 0,
+            "match_id": None,
+            "match_row": None,
+        }
+
+    def normalise_company_match_key(self, text):
+        text = str(text or "").casefold()
+        text = text.replace("&", " and ")
+        text = re.sub(r"[^a-z0-9]+", " ", text)
+        stop_words = {
+            "pty", "p", "l", "pl", "ltd", "limited", "limit", "co", "company", "corp", "corporation",
+            "inc", "llc", "bv", "b", "v", "gmbh", "sa", "the", "and", "aust", "australia", "australian",
+            "trade", "trading", "industrial", "industries", "factory", "manufacture", "manufacturing", "technology",
+        }
+        words = [word for word in text.split() if word and word not in stop_words]
+        return " ".join(words)
+
+    def company_similarity(self, left, right):
+        left_key = self.normalise_company_match_key(left)
+        right_key = self.normalise_company_match_key(right)
+        if not left_key or not right_key:
+            return 0.0
+        if left_key == right_key:
+            return 1.0
+        if left_key in right_key or right_key in left_key:
+            smaller = min(len(left_key), len(right_key))
+            larger = max(len(left_key), len(right_key))
+            if smaller >= 5:
+                return max(0.88, smaller / larger)
+        return difflib.SequenceMatcher(None, left_key, right_key).ratio()
+
+    def best_reference_supplier_name(self, supplier_name):
+        supplier_name = str(supplier_name or "").strip()
+        if not supplier_name or not self.supplier_names:
+            return ""
+        best_name = ""
+        best_score = 0.0
+        for candidate in self.supplier_names:
+            score = self.company_similarity(supplier_name, candidate)
+            if score > best_score:
+                best_name = candidate
+                best_score = score
+        return best_name if best_score >= 0.84 else ""
+
+    def derive_import_shipment_type(self, dest, supplier_name, order_no):
+        combined = f"{dest} {supplier_name} {order_no}".casefold()
+        if "saba" in combined:
+            return "SABA"
+        dest_key = str(dest or "").strip().upper()
+        if dest_key.startswith("AUSYD") or "SYD" in dest_key:
+            return "Sydney"
+        if dest_key.startswith("AUMEL") or "MEL" in dest_key:
+            return "Melbourne"
+        return "Melbourne"
+
+    def derive_import_qty(self, pack_mode, container_no):
+        mode = str(pack_mode or "").strip().upper()
+        container = str(container_no or "").strip().upper()
+        combined = f"{mode} {container}"
+        if "LCL" in mode or "BCN" in mode:
+            return "LCL"
+        if "20" in combined:
+            return "20' FCL"
+        if "40" in combined:
+            return "40' FCL"
+        if "FCL" in mode:
+            return "40' FCL" if "40" in combined else "20' FCL" if "20" in combined else ""
+        return self.normalise_qty_value(mode)
+
+    def derive_import_status(self, shipment_date, due_date, container_no, vessel, notes):
+        today = date.today()
+        notes_text = str(notes or "").casefold()
+        if due_date is not None and due_date <= today:
+            return "ARRIVED"
+        if container_no or vessel or (shipment_date is not None and shipment_date <= today):
+            return "SHIPPED"
+        if shipment_date is not None or "booking" in notes_text or "vessel departing" in notes_text:
+            return "BOOKED"
+        return ""
+
+    def parse_month_name(self, month_text):
+        text = str(month_text or "").strip().casefold()[:3]
+        month_lookup = {
+            "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+            "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+        }
+        if text.isdigit():
+            number = int(text)
+            return number if 1 <= number <= 12 else None
+        return month_lookup.get(text)
+
+    def extract_ready_date_from_notes(self, notes, fallback_year=None):
+        text = str(notes or "")
+        if not text:
+            return ""
+        fallback_year = fallback_year or date.today().year
+        patterns = [
+            r"ready(?: date)?(?: is| will be| will delay to| date)?[^0-9]{0,30}(\d{1,2})[/-]([A-Za-z]{3,9}|\d{1,2})(?:[/-](\d{2,4}))?",
+            r"cargo will be ready[^0-9]{0,30}(\d{1,2})[/-]([A-Za-z]{3,9}|\d{1,2})(?:[/-](\d{2,4}))?",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            day = int(match.group(1))
+            month = self.parse_month_name(match.group(2))
+            if month is None:
+                continue
+            year_text = match.group(3)
+            year = fallback_year
+            if year_text:
+                year = int(year_text)
+                if year < 100:
+                    year += 2000 if year < 70 else 1900
+            try:
+                return date(year, month, day).strftime("%d/%m/%y")
+            except ValueError:
+                continue
+        return ""
+
+    def load_existing_shipments_for_import(self):
+        return self.main_window.db_all(
+            f"""
+            SELECT id, entry_date, shipment_type, order_no, shipment_ref, supplier_name, container_no, product, qty,
+                   ready_date, shipment_date, due_date, status, vessel, notes, updated_on
+            FROM {SHIPMENT_TABLE_NAME}
+            ORDER BY id DESC
+            """
+        )
+
+    def attach_best_import_matches(self, import_rows, existing_rows):
+        for import_row in import_rows:
+            best_score = 0
+            best_row = None
+            second_score = 0
+            for existing_row in existing_rows:
+                score = self.score_shipment_import_match(import_row, existing_row)
+                if score > best_score:
+                    second_score = best_score
+                    best_score = score
+                    best_row = existing_row
+                elif score > second_score:
+                    second_score = score
+            margin = best_score - second_score
+            if best_row is not None and (best_score >= SHIPMENT_IMPORT_AUTO_SCORE or (best_score >= SHIPMENT_IMPORT_SUGGEST_SCORE and margin >= 10)):
+                import_row["match_score"] = best_score
+                import_row["match_id"] = int(best_row.get("id") or 0)
+                import_row["match_row"] = best_row
+            else:
+                import_row["match_score"] = best_score
+                import_row["match_id"] = None
+                import_row["match_row"] = best_row if best_score else None
+
+    def score_shipment_import_match(self, import_row, existing_row):
+        score = 0
+        import_ref = str(import_row.get("shipment_ref") or "").strip().casefold()
+        existing_ref = str(existing_row.get("shipment_ref") or "").strip().casefold()
+        if import_ref and existing_ref and import_ref == existing_ref:
+            score += 130
+
+        import_order = self.normalise_order_match_key(import_row.get("order_no"))
+        existing_order = self.normalise_order_match_key(existing_row.get("order_no"))
+        if import_order and existing_order and import_order == existing_order:
+            score += 70
+
+        import_container = self.normalise_container_match_key(import_row.get("container_no"))
+        existing_container = self.normalise_container_match_key(existing_row.get("container_no"))
+        if import_container and existing_container and import_container == existing_container:
+            score += 45
+
+        supplier_score = self.company_similarity(import_row.get("supplier_name"), existing_row.get("supplier_name"))
+        if supplier_score >= 0.97:
+            score += 28
+        elif supplier_score >= 0.88:
+            score += 22
+        elif supplier_score >= 0.75:
+            score += 15
+        elif supplier_score >= 0.62:
+            score += 8
+
+        import_type = self.normalise_shipment_type_value(import_row.get("shipment_type"))
+        existing_type = self.normalise_shipment_type_value(existing_row.get("shipment_type"))
+        if import_type and existing_type and import_type == existing_type:
+            score += 8
+
+        if self.normalise_vessel_key(import_row.get("vessel")) and self.normalise_vessel_key(import_row.get("vessel")) == self.normalise_vessel_key(existing_row.get("vessel")):
+            score += 8
+
+        import_due = self.parse_shipment_date(import_row.get("due_date"))
+        existing_due = self.parse_shipment_date(existing_row.get("due_date"))
+        if import_due is not None and existing_due is not None:
+            days = abs((import_due - existing_due).days)
+            if days == 0:
+                score += 10
+            elif days <= 7:
+                score += 5
+
+        import_ship = self.parse_shipment_date(import_row.get("shipment_date"))
+        existing_ship = self.parse_shipment_date(existing_row.get("shipment_date"))
+        if import_ship is not None and existing_ship is not None:
+            days = abs((import_ship - existing_ship).days)
+            if days == 0:
+                score += 6
+            elif days <= 7:
+                score += 3
+
+        if import_order and existing_order and import_order != existing_order and not import_ref:
+            score -= 12
+        return max(0, score)
+
+    def normalise_order_match_key(self, value):
+        return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+    def normalise_container_match_key(self, value):
+        text = str(value or "").strip().upper()
+        match = re.search(r"[A-Z]{4}\d{7}", text)
+        if match:
+            return match.group(0)
+        return re.sub(r"[^A-Z0-9]+", "", text)
+
+    def normalise_vessel_key(self, value):
+        return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+    def prefer_new_value(self, new_value, old_value):
+        new_text = str(new_value or "").strip()
+        return new_text if new_text else str(old_value or "").strip()
+
+    def merge_import_notes(self, existing_notes, import_notes):
+        existing = str(existing_notes or "").strip()
+        incoming = str(import_notes or "").strip()
+        if not incoming:
+            return existing
+        if not existing:
+            return incoming
+        if incoming in existing:
+            return existing
+        if existing in incoming:
+            return incoming
+        return f"{existing}\n\n--- Shipment update import ---\n{incoming}"
+
+    def strongest_status(self, import_status, existing_status):
+        ranks = {"": 0, "BOOKED": 1, "SHIPPED": 2, "ARRIVED": 3}
+        imported = self.normalise_status_value(import_status)
+        existing = self.normalise_status_value(existing_status)
+        return imported if ranks.get(imported, 0) >= ranks.get(existing, 0) else existing
+
+    def update_values_from_import(self, import_row, existing_row=None):
+        existing = dict(existing_row or {})
+        return {
+            "entry_date": str(existing.get("entry_date") or import_row.get("entry_date") or date.today().strftime("%d/%m/%y")).strip(),
+            "shipment_type": self.prefer_new_value(import_row.get("shipment_type"), existing.get("shipment_type")),
+            "order_no": self.prefer_new_value(import_row.get("order_no"), existing.get("order_no")),
+            "shipment_ref": self.prefer_new_value(import_row.get("shipment_ref"), existing.get("shipment_ref")),
+            "supplier_name": self.prefer_new_value(import_row.get("supplier_name"), existing.get("supplier_name")),
+            "container_no": self.prefer_new_value(import_row.get("container_no"), existing.get("container_no")),
+            "product": str(existing.get("product") or import_row.get("product") or "").strip(),
+            "qty": self.prefer_new_value(import_row.get("qty"), existing.get("qty")),
+            "ready_date": self.prefer_new_value(import_row.get("ready_date"), existing.get("ready_date")),
+            "shipment_date": self.prefer_new_value(import_row.get("shipment_date"), existing.get("shipment_date")),
+            "due_date": self.prefer_new_value(import_row.get("due_date"), existing.get("due_date")),
+            "status": self.strongest_status(import_row.get("status"), existing.get("status")),
+            "vessel": self.prefer_new_value(import_row.get("vessel"), existing.get("vessel")),
+            "notes": self.merge_import_notes(existing.get("notes"), import_row.get("notes")),
+        }
+
+    def apply_shipment_update_actions(self, actions, existing_rows):
+        row_by_id = {int(row.get("id") or 0): row for row in existing_rows}
+        updated_on = date.today().isoformat()
+        counts = {"updated": 0, "created": 0, "skipped": 0}
+        cur = self.main_window.db_conn.cursor()
+
+        for import_row, action, record_id in actions:
+            if action == SHIPMENT_IMPORT_ACTION_SKIP:
+                counts["skipped"] += 1
+                continue
+            if action == SHIPMENT_IMPORT_ACTION_CREATE:
+                values = self.update_values_from_import(import_row, None)
+                cur.execute(
+                    f"""
+                    INSERT INTO {SHIPMENT_TABLE_NAME} (
+                        entry_date, shipment_type, order_no, shipment_ref, supplier_name, container_no, product, qty,
+                        ready_date, shipment_date, due_date, status, vessel, notes, updated_on
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        values["entry_date"], values["shipment_type"], values["order_no"], values["shipment_ref"],
+                        values["supplier_name"], values["container_no"], values["product"], values["qty"],
+                        values["ready_date"], values["shipment_date"], values["due_date"], values["status"],
+                        values["vessel"], values["notes"], updated_on,
+                    ),
+                )
+                counts["created"] += 1
+                continue
+
+            existing_row = row_by_id.get(int(record_id or 0))
+            if existing_row is None:
+                counts["skipped"] += 1
+                continue
+
+            values = self.update_values_from_import(import_row, existing_row)
+            cur.execute(
+                f"""
+                UPDATE {SHIPMENT_TABLE_NAME}
+                SET entry_date = ?,
+                    shipment_type = ?,
+                    order_no = ?,
+                    shipment_ref = ?,
+                    supplier_name = ?,
+                    container_no = ?,
+                    product = ?,
+                    qty = ?,
+                    ready_date = ?,
+                    shipment_date = ?,
+                    due_date = ?,
+                    status = ?,
+                    vessel = ?,
+                    notes = ?,
+                    updated_on = ?
+                WHERE id = ?
+                """,
+                (
+                    values["entry_date"], values["shipment_type"], values["order_no"], values["shipment_ref"],
+                    values["supplier_name"], values["container_no"], values["product"], values["qty"],
+                    values["ready_date"], values["shipment_date"], values["due_date"], values["status"],
+                    values["vessel"], values["notes"], updated_on, int(record_id),
+                ),
+            )
+            counts["updated"] += 1
+
+        self.main_window.db_conn.commit()
+        self.mark_shipments_changed(updated_on)
+        return counts
+
     def connect_signals(self):
         for shipment_type, button_name in SHIPMENT_BUTTON_MAP.items():
             button = getattr(self.ui, button_name, None)
@@ -2056,6 +2809,10 @@ class ShipmentsWindow(QMainWindow):
         filter_combo = getattr(self, "_shipment_filter_combo", None)
         if filter_combo is not None:
             filter_combo.currentTextChanged.connect(lambda _text: self.load_table())
+
+        import_button = getattr(self, "import_update_pushButton", None)
+        if import_button is not None:
+            import_button.clicked.connect(self.import_shipment_update_workbook)
 
         table = self.table_widget()
         if table is not None:
@@ -2104,11 +2861,11 @@ class ShipmentsWindow(QMainWindow):
         cur.execute(
             f"""
             INSERT INTO {SHIPMENT_TABLE_NAME} (
-                entry_date, shipment_type, order_no, supplier_name, container_no, product, qty,
+                entry_date, shipment_type, order_no, shipment_ref, supplier_name, container_no, product, qty,
                 ready_date, shipment_date, due_date, status, vessel, notes, updated_on
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (today_display, shipment_type, order_number, supplier_name, "", "", "", "", "", "", "", "", "", today_iso),
+            (today_display, shipment_type, order_number, "", supplier_name, "", "", "", "", "", "", "", "", "", today_iso),
         )
         self.main_window.db_conn.commit()
         self.mark_shipments_changed(today_iso)
@@ -2175,7 +2932,7 @@ class ShipmentsWindow(QMainWindow):
 
         rows = self.main_window.db_all(
             f"""
-            SELECT id, entry_date, shipment_type, order_no, supplier_name, container_no, product, qty,
+            SELECT id, entry_date, shipment_type, order_no, shipment_ref, supplier_name, container_no, product, qty,
                    ready_date, shipment_date, due_date, status, vessel, notes
             FROM {SHIPMENT_TABLE_NAME}
             """
@@ -2283,6 +3040,7 @@ class ShipmentsWindow(QMainWindow):
                 SET entry_date = ?,
                     shipment_type = ?,
                     order_no = ?,
+                    shipment_ref = ?,
                     supplier_name = ?,
                     container_no = ?,
                     product = ?,
@@ -2300,6 +3058,7 @@ class ShipmentsWindow(QMainWindow):
                     values["entry_date"],
                     values["shipment_type"],
                     values["order_no"],
+                    values.get("shipment_ref", ""),
                     values["supplier_name"],
                     values["container_no"],
                     values["product"],
@@ -4445,6 +5204,386 @@ class Ui_MainWindow(object):
         card_layout.addWidget(value_label)
         return value_label
 
+    def _dashboard_status_card(self, parent, title, value_object_name, status_object_name, minimum_width=170):
+        card = QFrame(parent)
+        card.setObjectName(f"{value_object_name}_card")
+        card.setProperty("role", "metricCard")
+        card.setFrameShape(QFrame.StyledPanel)
+        card.setMinimumWidth(minimum_width)
+        card.setMinimumHeight(66)
+        card.setMaximumHeight(92)
+        card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        card_layout = QGridLayout(card)
+        card_layout.setContentsMargins(10, 6, 10, 6)
+        card_layout.setHorizontalSpacing(8)
+        card_layout.setVerticalSpacing(2)
+
+        title_label = QLabel(title, card)
+        title_label.setProperty("role", "metricTitle")
+        title_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        title_label.setWordWrap(False)
+
+        status_label = QLabel("Unknown", card)
+        status_label.setObjectName(status_object_name)
+        status_label.setAlignment(Qt.AlignCenter)
+        status_label.setMinimumHeight(22)
+        status_label.setMinimumWidth(92)
+        status_label.setFrameShape(QFrame.StyledPanel)
+        status_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        # Make the generated labels reachable through self.ui.<objectName>.
+        # Without this, MainWindow.refresh_dashboard() can find the summary-card labels
+        # but cannot update the freshness-card labels, leaving them stuck on
+        # their placeholder text.
+        setattr(self, status_object_name, status_label)
+
+        value_label = QLabel("Not checked", card)
+        value_label.setObjectName(value_object_name)
+        value_label.setProperty("role", "metricValue")
+        value_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        value_label.setWordWrap(True)
+        value_label.setMinimumHeight(28)
+        setattr(self, value_object_name, value_label)
+
+        card_layout.addWidget(title_label, 0, 0)
+        card_layout.addWidget(status_label, 0, 1)
+        card_layout.addWidget(value_label, 1, 0, 1, 2)
+        card_layout.setColumnStretch(0, 1)
+        return card
+
+    def _build_dashboard_tab(self):
+        dashboard = QWidget(self.homeGuide_tabs)
+        dashboard.setObjectName("dashboard_tab")
+        dashboard_layout = QVBoxLayout(dashboard)
+        dashboard_layout.setContentsMargins(10, 10, 10, 10)
+        dashboard_layout.setSpacing(8)
+
+        top_row = QHBoxLayout()
+        title_col = QVBoxLayout()
+        title_col.setContentsMargins(0, 0, 0, 0)
+        title_col.setSpacing(2)
+        title = QLabel("Dashboard", dashboard)
+        title.setProperty("role", "pageTitle")
+        subtitle = QLabel("A quick health check for import freshness, critical purchasing data, inbound shipments, and app status.", dashboard)
+        subtitle.setProperty("role", "pageSubtitle")
+        subtitle.setWordWrap(True)
+        title_col.addWidget(title)
+        title_col.addWidget(subtitle)
+        top_row.addLayout(title_col, 1)
+        self.dashboardLastRefresh_label = QLabel("Not refreshed yet", dashboard)
+        self.dashboardLastRefresh_label.setObjectName("dashboardLastRefresh_label")
+        self.dashboardLastRefresh_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.dashboardRefresh_button = QPushButton("Refresh Dashboard", dashboard)
+        self.dashboardRefresh_button.setObjectName("dashboardRefresh_button")
+        top_row.addWidget(self.dashboardLastRefresh_label)
+        top_row.addWidget(self.dashboardRefresh_button)
+        dashboard_layout.addLayout(top_row)
+
+        scroll_area = QScrollArea(dashboard)
+        scroll_area.setObjectName("dashboardScroll_area")
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        dashboard_layout.addWidget(scroll_area, 1)
+
+        scroll_content = QWidget(scroll_area)
+        scroll_content.setObjectName("dashboardScroll_content")
+        scroll_content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        content_layout = QVBoxLayout(scroll_content)
+        content_layout.setContentsMargins(0, 0, 8, 0)
+        content_layout.setSpacing(10)
+        scroll_area.setWidget(scroll_content)
+
+        def section_header(parent, title_text, button_text=None, button_object_name=None):
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(8)
+            label = QLabel(title_text, parent)
+            label.setProperty("role", "sectionTitle")
+            row.addWidget(label, 1)
+            if button_text and button_object_name:
+                button = QPushButton(button_text, parent)
+                button.setObjectName(button_object_name)
+                button.setMinimumHeight(28)
+                button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+                setattr(self, button_object_name, button)
+                row.addWidget(button)
+            return row
+
+        freshness_frame = QFrame(scroll_content)
+        freshness_frame.setObjectName("dashboardFreshness_frame")
+        freshness_frame.setProperty("role", "contentCard")
+        freshness_frame.setFrameShape(QFrame.StyledPanel)
+        freshness_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        freshness_layout = QVBoxLayout(freshness_frame)
+        freshness_layout.setContentsMargins(12, 12, 12, 12)
+        freshness_layout.setSpacing(8)
+        freshness_layout.addLayout(section_header(freshness_frame, "Data freshness", "Open Update Data", "dashboardOpenUpdateData_button"))
+        freshness_grid = QGridLayout()
+        freshness_grid.setContentsMargins(0, 0, 0, 0)
+        freshness_grid.setSpacing(8)
+        freshness_cards = [
+            ("Sales", "dashboardSalesFreshness_value", "dashboardSalesFreshness_status"),
+            ("Stock", "dashboardStockFreshness_value", "dashboardStockFreshness_status"),
+            ("Orders", "dashboardOrdersFreshness_value", "dashboardOrdersFreshness_status"),
+            ("Cover Orders", "dashboardCoverOrdersFreshness_value", "dashboardCoverOrdersFreshness_status"),
+            ("Shipments", "dashboardShipmentsFreshness_value", "dashboardShipmentsFreshness_status"),
+            ("Critical Analysis", "dashboardCriticalFreshness_value", "dashboardCriticalFreshness_status"),
+        ]
+        for index, (card_title, value_name, status_name) in enumerate(freshness_cards):
+            card = self._dashboard_status_card(freshness_frame, card_title, value_name, status_name)
+            freshness_grid.addWidget(card, index // 3, index % 3)
+        freshness_layout.addLayout(freshness_grid)
+        content_layout.addWidget(freshness_frame)
+
+        snapshot_frame = QFrame(scroll_content)
+        snapshot_frame.setObjectName("dashboardSnapshot_frame")
+        snapshot_frame.setProperty("role", "contentCard")
+        snapshot_frame.setFrameShape(QFrame.StyledPanel)
+        snapshot_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        snapshot_layout = QVBoxLayout(snapshot_frame)
+        snapshot_layout.setContentsMargins(12, 12, 12, 12)
+        snapshot_layout.setSpacing(8)
+        snapshot_layout.addLayout(section_header(snapshot_frame, "Snapshot"))
+        snapshot_row = QHBoxLayout()
+        snapshot_row.setSpacing(8)
+        snapshot_layout.addLayout(snapshot_row)
+
+        self.dashboardAppVersion_value = self._summary_card(snapshot_frame, "App Version", "-", "dashboardAppVersion_value", 155)
+        self.dashboardDatabase_value = self._summary_card(snapshot_frame, "Database", "-", "dashboardDatabase_value", 200)
+        self.dashboardCriticalCount_value = self._summary_card(snapshot_frame, "Last Critical Count", "-", "dashboardCriticalCount_value", 180)
+        self.dashboardInboundCount_value = self._summary_card(snapshot_frame, "Shipments Inbound", "-", "dashboardInboundCount_value", 190)
+        for value_label in (self.dashboardAppVersion_value, self.dashboardDatabase_value, self.dashboardCriticalCount_value, self.dashboardInboundCount_value):
+            card_widget = value_label.parentWidget()
+            card_widget.setMinimumHeight(70)
+            card_widget.setMaximumHeight(98)
+            card_widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            value_label.setWordWrap(True)
+            snapshot_row.addWidget(card_widget)
+        snapshot_row.addStretch(1)
+        content_layout.addWidget(snapshot_frame)
+
+        purchasing_frame = QFrame(scroll_content)
+        purchasing_frame.setObjectName("dashboardPurchasing_frame")
+        purchasing_frame.setProperty("role", "contentCard")
+        purchasing_frame.setFrameShape(QFrame.StyledPanel)
+        purchasing_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        purchasing_layout = QVBoxLayout(purchasing_frame)
+        purchasing_layout.setContentsMargins(12, 12, 12, 12)
+        purchasing_layout.setSpacing(8)
+        purchasing_layout.addLayout(section_header(purchasing_frame, "Purchasing snapshot", "Open Order Analysis", "dashboardOpenOrderAnalysis_button"))
+
+        purchasing_grid = QGridLayout()
+        purchasing_grid.setContentsMargins(0, 0, 0, 0)
+        purchasing_grid.setSpacing(8)
+
+        purchasing_cards = [
+            self._summary_card(purchasing_frame, "Need Order", "-", "dashboardNeedOrderCount_value", 150),
+            self._summary_card(purchasing_frame, "At Risk", "-", "dashboardAtRiskCount_value", 150),
+            self._summary_card(purchasing_frame, "No Inbound", "-", "dashboardNoInboundCount_value", 150),
+            self._summary_card(purchasing_frame, "Negative SOH", "-", "dashboardNegativeStockCount_value", 150),
+            self._summary_card(purchasing_frame, "Overdue Orders", "-", "dashboardOverdueOrdersCount_value", 165),
+            self._summary_card(purchasing_frame, "Missing Dates", "-", "dashboardMissingDatesCount_value", 150),
+        ]
+        for index, value_label in enumerate(purchasing_cards):
+            card_widget = value_label.parentWidget()
+            card_widget.setMinimumHeight(66)
+            card_widget.setMaximumHeight(92)
+            card_widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            value_label.setWordWrap(True)
+            purchasing_grid.addWidget(card_widget, index // 3, index % 3)
+        purchasing_grid.setColumnStretch(3, 1)
+        purchasing_layout.addLayout(purchasing_grid)
+
+        self.dashboardPurchasingAction_table = QTableWidget(purchasing_frame)
+        self.dashboardPurchasingAction_table.setObjectName("dashboardPurchasingAction_table")
+        self.dashboardPurchasingAction_table.setColumnCount(7)
+        self.dashboardPurchasingAction_table.setHorizontalHeaderLabels(["Type", "Item", "Description", "Supplier / Order", "Qty / SOH", "Date", "Note"])
+        self.dashboardPurchasingAction_table.setAlternatingRowColors(True)
+        self.dashboardPurchasingAction_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.dashboardPurchasingAction_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.dashboardPurchasingAction_table.setMinimumHeight(270)
+        self.dashboardPurchasingAction_table.setMaximumHeight(360)
+        self.dashboardPurchasingAction_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.dashboardPurchasingAction_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.dashboardPurchasingAction_table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        try:
+            header = self.dashboardPurchasingAction_table.horizontalHeader()
+            header.setStretchLastSection(True)
+            for col in range(self.dashboardPurchasingAction_table.columnCount()):
+                header.setSectionResizeMode(col, QHeaderView.ResizeToContents if col in {0, 1, 4, 5} else QHeaderView.Stretch)
+        except Exception:
+            pass
+        purchasing_layout.addWidget(self.dashboardPurchasingAction_table)
+        content_layout.addWidget(purchasing_frame)
+
+        inbound_frame = QFrame(scroll_content)
+        inbound_frame.setObjectName("dashboardInbound_frame")
+        inbound_frame.setProperty("role", "contentCard")
+        inbound_frame.setFrameShape(QFrame.StyledPanel)
+        inbound_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        inbound_layout = QVBoxLayout(inbound_frame)
+        inbound_layout.setContentsMargins(12, 12, 12, 12)
+        inbound_layout.setSpacing(8)
+        inbound_layout.addLayout(section_header(inbound_frame, "Next inbound shipments", "Open Shipments", "dashboardOpenShipments_button"))
+        self.dashboardInboundShipments_table = QTableWidget(inbound_frame)
+        self.dashboardInboundShipments_table.setObjectName("dashboardInboundShipments_table")
+        self.dashboardInboundShipments_table.setColumnCount(6)
+        self.dashboardInboundShipments_table.setHorizontalHeaderLabels(["ETA", "Days", "Destination", "Supplier", "Container", "Status"])
+        self.dashboardInboundShipments_table.setAlternatingRowColors(True)
+        self.dashboardInboundShipments_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.dashboardInboundShipments_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.dashboardInboundShipments_table.setMinimumHeight(240)
+        self.dashboardInboundShipments_table.setMaximumHeight(320)
+        self.dashboardInboundShipments_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.dashboardInboundShipments_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.dashboardInboundShipments_table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        try:
+            header = self.dashboardInboundShipments_table.horizontalHeader()
+            header.setStretchLastSection(True)
+            for col in range(self.dashboardInboundShipments_table.columnCount()):
+                header.setSectionResizeMode(col, QHeaderView.ResizeToContents if col in {0, 1, 5} else QHeaderView.Stretch)
+        except Exception:
+            pass
+        inbound_layout.addWidget(self.dashboardInboundShipments_table)
+        content_layout.addWidget(inbound_frame)
+
+        analytics_frame = QFrame(scroll_content)
+        analytics_frame.setObjectName("dashboardAnalytics_frame")
+        analytics_frame.setProperty("role", "contentCard")
+        analytics_frame.setFrameShape(QFrame.StyledPanel)
+        analytics_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        analytics_layout = QVBoxLayout(analytics_frame)
+        analytics_layout.setContentsMargins(12, 12, 12, 12)
+        analytics_layout.setSpacing(8)
+        analytics_layout.addLayout(section_header(analytics_frame, "Sales trend / movement"))
+
+        analytics_chart_row = QHBoxLayout()
+        analytics_chart_row.setSpacing(8)
+
+        self.dashboardSalesValue_chartView = QChartView(analytics_frame)
+        self.dashboardSalesValue_chartView.setObjectName("dashboardSalesValue_chartView")
+        self.dashboardSalesValue_chartView.setRenderHint(QPainter.Antialiasing)
+        self.dashboardSalesValue_chartView.setMinimumHeight(260)
+        self.dashboardSalesValue_chartView.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        analytics_chart_row.addWidget(self.dashboardSalesValue_chartView, 1)
+
+        self.dashboardSalesUnits_chartView = QChartView(analytics_frame)
+        self.dashboardSalesUnits_chartView.setObjectName("dashboardSalesUnits_chartView")
+        self.dashboardSalesUnits_chartView.setRenderHint(QPainter.Antialiasing)
+        self.dashboardSalesUnits_chartView.setMinimumHeight(260)
+        self.dashboardSalesUnits_chartView.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        analytics_chart_row.addWidget(self.dashboardSalesUnits_chartView, 1)
+        analytics_layout.addLayout(analytics_chart_row)
+
+        analytics_bottom_row = QHBoxLayout()
+        analytics_bottom_row.setSpacing(8)
+
+        self.dashboardCriticalGroup_chartView = QChartView(analytics_frame)
+        self.dashboardCriticalGroup_chartView.setObjectName("dashboardCriticalGroup_chartView")
+        self.dashboardCriticalGroup_chartView.setRenderHint(QPainter.Antialiasing)
+        self.dashboardCriticalGroup_chartView.setMinimumHeight(270)
+        self.dashboardCriticalGroup_chartView.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        analytics_bottom_row.addWidget(self.dashboardCriticalGroup_chartView, 1)
+
+        self.dashboardMovers_table = QTableWidget(analytics_frame)
+        self.dashboardMovers_table.setObjectName("dashboardMovers_table")
+        self.dashboardMovers_table.setColumnCount(7)
+        self.dashboardMovers_table.setHorizontalHeaderLabels(["Trend", "Item", "Description", "Prev 3", "Last 3", "Change", "%"] )
+        self.dashboardMovers_table.setAlternatingRowColors(True)
+        self.dashboardMovers_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.dashboardMovers_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.dashboardMovers_table.setMinimumHeight(270)
+        self.dashboardMovers_table.setMaximumHeight(330)
+        self.dashboardMovers_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.dashboardMovers_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.dashboardMovers_table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        try:
+            header = self.dashboardMovers_table.horizontalHeader()
+            header.setStretchLastSection(True)
+            for col in range(self.dashboardMovers_table.columnCount()):
+                header.setSectionResizeMode(col, QHeaderView.ResizeToContents if col in {0, 1, 3, 4, 5, 6} else QHeaderView.Stretch)
+        except Exception:
+            pass
+        analytics_bottom_row.addWidget(self.dashboardMovers_table, 1)
+        analytics_layout.addLayout(analytics_bottom_row)
+        content_layout.addWidget(analytics_frame)
+
+        quality_frame = QFrame(scroll_content)
+        quality_frame.setObjectName("dashboardQuality_frame")
+        quality_frame.setProperty("role", "contentCard")
+        quality_frame.setFrameShape(QFrame.StyledPanel)
+        quality_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        quality_layout = QVBoxLayout(quality_frame)
+        quality_layout.setContentsMargins(12, 12, 12, 12)
+        quality_layout.setSpacing(8)
+        quality_layout.addLayout(section_header(quality_frame, "Data quality / workflow checks", "Open Update Data", "dashboardOpenUpdateDataQuality_button"))
+
+        quality_grid = QGridLayout()
+        quality_grid.setContentsMargins(0, 0, 0, 0)
+        quality_grid.setSpacing(8)
+        quality_cards = [
+            self._summary_card(quality_frame, "Unknown Sales Items", "-", "dashboardUnknownSalesItems_value", 180),
+            self._summary_card(quality_frame, "Unknown Stock Items", "-", "dashboardUnknownStockItems_value", 180),
+            self._summary_card(quality_frame, "Missing Invoices", "-", "dashboardMissingInvoiceCount_value", 170),
+            self._summary_card(quality_frame, "Missing Suppliers", "-", "dashboardMissingSupplierCount_value", 170),
+            self._summary_card(quality_frame, "Missing ETA", "-", "dashboardShipmentMissingEtaCount_value", 150),
+            self._summary_card(quality_frame, "Missing Container", "-", "dashboardShipmentMissingContainerCount_value", 170),
+        ]
+        for index, value_label in enumerate(quality_cards):
+            card_widget = value_label.parentWidget()
+            card_widget.setMinimumHeight(66)
+            card_widget.setMaximumHeight(92)
+            card_widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            value_label.setWordWrap(True)
+            quality_grid.addWidget(card_widget, index // 3, index % 3)
+        quality_grid.setColumnStretch(3, 1)
+        quality_layout.addLayout(quality_grid)
+
+        self.dashboardDataQuality_table = QTableWidget(quality_frame)
+        self.dashboardDataQuality_table.setObjectName("dashboardDataQuality_table")
+        self.dashboardDataQuality_table.setColumnCount(6)
+        self.dashboardDataQuality_table.setHorizontalHeaderLabels(["Severity", "Area", "Issue", "Count", "Sample / detail", "Suggested action"])
+        self.dashboardDataQuality_table.setAlternatingRowColors(True)
+        self.dashboardDataQuality_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.dashboardDataQuality_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.dashboardDataQuality_table.setMinimumHeight(250)
+        self.dashboardDataQuality_table.setMaximumHeight(340)
+        self.dashboardDataQuality_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.dashboardDataQuality_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.dashboardDataQuality_table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        try:
+            header = self.dashboardDataQuality_table.horizontalHeader()
+            header.setStretchLastSection(True)
+            for col in range(self.dashboardDataQuality_table.columnCount()):
+                header.setSectionResizeMode(col, QHeaderView.ResizeToContents if col in {0, 1, 3} else QHeaderView.Stretch)
+        except Exception:
+            pass
+        quality_layout.addWidget(self.dashboardDataQuality_table)
+        content_layout.addWidget(quality_frame)
+
+        warning_frame = QFrame(scroll_content)
+        warning_frame.setObjectName("dashboardWarning_frame")
+        warning_frame.setProperty("role", "contentCard")
+        warning_frame.setFrameShape(QFrame.StyledPanel)
+        warning_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        warning_layout = QVBoxLayout(warning_frame)
+        warning_layout.setContentsMargins(12, 12, 12, 12)
+        warning_layout.setSpacing(8)
+        warning_layout.addLayout(section_header(warning_frame, "Warnings / action-needed notes"))
+        self.dashboardWarning_textBrowser = QTextBrowser(warning_frame)
+        self.dashboardWarning_textBrowser.setObjectName("dashboardWarning_textBrowser")
+        self.dashboardWarning_textBrowser.setMinimumHeight(120)
+        self.dashboardWarning_textBrowser.setMaximumHeight(180)
+        self.dashboardWarning_textBrowser.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.dashboardWarning_textBrowser.setPlainText("Warnings and stale-data notes will appear here.")
+        warning_layout.addWidget(self.dashboardWarning_textBrowser)
+        content_layout.addWidget(warning_frame)
+
+        content_layout.addStretch(1)
+        return dashboard
+
     # ------------------------------------------------------------------
     # Home guide
     # ------------------------------------------------------------------
@@ -4466,6 +5605,8 @@ class Ui_MainWindow(object):
             self.homeGuide_tabs.addTab(browser, title)
             return browser
 
+        self.dashboard_tab = self._build_dashboard_tab()
+        self.homeGuide_tabs.addTab(self.dashboard_tab, "Dashboard")
         self.howToGuide_textBrowser = add_guide_tab("Overview", self._home_guide_html(), "howToGuide_textBrowser")
         add_guide_tab("Customer Summary", self._customer_summary_guide_html(), "customerSummaryGuide_textBrowser")
         add_guide_tab("Item Summary", self._item_summary_guide_html(), "itemSummaryGuide_textBrowser")
@@ -6123,6 +7264,7 @@ class MainWindow(QMainWindow):
         self.setup_chart_views()
 
         self.open_database()
+        self.ensure_app_meta_table()
         self.ensure_to_order_lines_table()
         self.ensure_on_order_lines_table()
         self.ensure_on_order_meta_table()
@@ -6148,6 +7290,7 @@ class MainWindow(QMainWindow):
         self.setup_frozen_column_tables()
         self.setup_customer_summary_layout()
         self.setup_update_page()
+        self.setup_dashboard()
         self.setup_order_table()
         self.setup_on_order_page()
         self.load_saved_order_lines()
@@ -9912,6 +11055,7 @@ class MainWindow(QMainWindow):
             ("entry_date", "TEXT"),
             ("shipment_type", "TEXT"),
             ("order_no", "TEXT"),
+            ("shipment_ref", "TEXT"),
             ("supplier_name", "TEXT"),
             ("container_no", "TEXT"),
             ("product", "TEXT"),
@@ -9934,6 +11078,7 @@ class MainWindow(QMainWindow):
                         entry_date NVARCHAR(20) NULL,
                         shipment_type NVARCHAR(50) NULL,
                         order_no NVARCHAR(100) NULL,
+                        shipment_ref NVARCHAR(100) NULL,
                         supplier_name NVARCHAR(255) NULL,
                         container_no NVARCHAR(100) NULL,
                         product NVARCHAR(255) NULL,
@@ -9956,6 +11101,7 @@ class MainWindow(QMainWindow):
                         entry_date TEXT,
                         shipment_type TEXT,
                         order_no TEXT,
+                        shipment_ref TEXT,
                         supplier_name TEXT,
                         container_no TEXT,
                         product TEXT,
@@ -9980,6 +11126,7 @@ class MainWindow(QMainWindow):
                         "entry_date": "NVARCHAR(20) NULL",
                         "shipment_type": "NVARCHAR(50) NULL",
                         "order_no": "NVARCHAR(100) NULL",
+                        "shipment_ref": "NVARCHAR(100) NULL",
                         "supplier_name": "NVARCHAR(255) NULL",
                         "container_no": "NVARCHAR(100) NULL",
                         "product": "NVARCHAR(255) NULL",
@@ -10378,22 +11525,39 @@ class MainWindow(QMainWindow):
         self.db_conn.commit()
 
     def ensure_app_meta_table(self):
-        if self.db_engine == "sqlserver":
+        if self.db_conn is None:
             return
 
         cur = self.db_conn.cursor()
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS app_meta (
-                meta_key TEXT PRIMARY KEY,
-                meta_value TEXT
+        if self.db_engine == "sqlserver":
+            cur.execute(
+                """
+                IF OBJECT_ID('dbo.app_meta', 'U') IS NULL
+                BEGIN
+                    CREATE TABLE dbo.app_meta (
+                        meta_key NVARCHAR(100) NOT NULL PRIMARY KEY,
+                        meta_value NVARCHAR(MAX) NULL
+                    )
+                END
+                """
             )
-            """
-        )
+        else:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS app_meta (
+                    meta_key TEXT PRIMARY KEY,
+                    meta_value TEXT
+                )
+                """
+            )
         self.db_conn.commit()
 
     def get_meta_value(self, key, default=""):
-        row = self.db_one("SELECT meta_value FROM app_meta WHERE meta_key = ?", (key,))
+        try:
+            self.ensure_app_meta_table()
+            row = self.db_one("SELECT meta_value FROM app_meta WHERE meta_key = ?", (key,))
+        except Exception:
+            return default
         if row is None:
             return default
         try:
@@ -10402,6 +11566,9 @@ class MainWindow(QMainWindow):
             return default
 
     def set_meta_value(self, key, value):
+        if self.db_conn is None:
+            return
+        self.ensure_app_meta_table()
         cur = self.db_conn.cursor()
         value_text = "" if value is None else str(value)
         if self.db_engine == "sqlserver":
@@ -11714,6 +12881,1305 @@ class MainWindow(QMainWindow):
             "Use the matching MYOB export or Windsor source file for this import.\n"
             "Check that the first row contains headings before uploading.\n"
         )
+
+    def setup_dashboard(self):
+        def connect_once(button, property_name, callback):
+            if button is None or bool(button.property(property_name)):
+                return
+            try:
+                button.clicked.connect(callback)
+                button.setProperty(property_name, True)
+            except Exception:
+                pass
+
+        def switch_to_page(page_attr):
+            stacked = getattr(self.ui, "stackedWidget", None)
+            page = getattr(self.ui, page_attr, None)
+            if stacked is not None and page is not None:
+                stacked.setCurrentWidget(page)
+
+        connect_once(getattr(self.ui, "dashboardRefresh_button", None), "_dashboard_connected", self.refresh_dashboard)
+        connect_once(getattr(self.ui, "dashboardOpenUpdateData_button", None), "_dashboard_nav_connected", lambda: switch_to_page("update_page"))
+        connect_once(getattr(self.ui, "dashboardOpenUpdateDataQuality_button", None), "_dashboard_nav_connected", lambda: switch_to_page("update_page"))
+        connect_once(getattr(self.ui, "dashboardOpenOrderAnalysis_button", None), "_dashboard_nav_connected", lambda: switch_to_page("orderAnalysy_page"))
+        connect_once(getattr(self.ui, "dashboardOpenShipments_button", None), "_dashboard_nav_connected", self.open_shipments_window)
+
+        tabs = getattr(self.ui, "homeGuide_tabs", None)
+        if tabs is not None and not bool(tabs.property("_dashboard_refresh_connected")):
+            tabs.currentChanged.connect(lambda _index: self.refresh_dashboard_if_visible())
+            tabs.setProperty("_dashboard_refresh_connected", True)
+
+        self.refresh_dashboard()
+
+    def refresh_dashboard_if_visible(self):
+        tabs = getattr(self.ui, "homeGuide_tabs", None)
+        dashboard = getattr(self.ui, "dashboard_tab", None)
+        if tabs is None or dashboard is None:
+            return
+        try:
+            if tabs.currentWidget() is dashboard:
+                self.refresh_dashboard()
+        except Exception:
+            pass
+
+    def set_dashboard_label_text(self, object_name, text):
+        widget = getattr(self.ui, object_name, None)
+        if widget is None:
+            return
+        try:
+            widget.setText(str(text))
+        except Exception:
+            try:
+                widget.setPlainText(str(text))
+            except Exception:
+                pass
+
+    def apply_dashboard_status_style(self, label, status_key):
+        if label is None:
+            return
+        styles = {
+            "ok": "background:#1f6f3d; color:white; border:1px solid #35a35b; border-radius:6px; padding:3px 6px; font-weight:700;",
+            "warn": "background:#8a6400; color:white; border:1px solid #d69b00; border-radius:6px; padding:3px 6px; font-weight:700;",
+            "bad": "background:#8a2020; color:white; border:1px solid #d94a4a; border-radius:6px; padding:3px 6px; font-weight:700;",
+            "neutral": "background:#3a3f46; color:white; border:1px solid #666; border-radius:6px; padding:3px 6px; font-weight:700;",
+        }
+        try:
+            label.setStyleSheet(styles.get(status_key, styles["neutral"]))
+        except Exception:
+            pass
+
+    def dashboard_parse_import_datetime(self, iso_key, display_key, ui_object_name=None):
+        iso_text = str(self.get_meta_value(iso_key, "") or "").strip()
+        if iso_text:
+            try:
+                return datetime.fromisoformat(iso_text)
+            except Exception:
+                pass
+
+        display_text = str(self.get_meta_value(display_key, "") or "")
+
+        # Fallback to the Update Data screen's visible text box.  This matters for
+        # existing installs where the update page already shows a last-import date
+        # but the newer dashboard metadata keys have not been written yet.
+        if not display_text.strip() and ui_object_name:
+            widget = getattr(self.ui, ui_object_name, None)
+            if widget is not None:
+                try:
+                    display_text = widget.toPlainText()
+                except Exception:
+                    try:
+                        display_text = widget.toHtml()
+                    except Exception:
+                        display_text = ""
+
+        match = re.search(r"Last\s+(?:import|run):\s*(\d{1,2}/\d{1,2}/\d{2,4})(?:\s+(\d{1,2}:\d{2}))?", display_text, flags=re.IGNORECASE)
+        if not match:
+            return None
+        date_text = match.group(1)
+        time_text = match.group(2) or "00:00"
+        for fmt in ("%d/%m/%Y %H:%M", "%d/%m/%y %H:%M"):
+            try:
+                return datetime.strptime(f"{date_text} {time_text}", fmt)
+            except ValueError:
+                pass
+        return None
+
+    def dashboard_shipments_last_datetime(self):
+        latest_date = None
+        try:
+            row = self.db_one("SELECT meta_value FROM shipments_meta WHERE meta_key = ?", ("last_updated",))
+            if row is not None:
+                latest_date = self.parse_date_value(row["meta_value"])
+        except Exception:
+            latest_date = None
+
+        if latest_date is None:
+            try:
+                row = self.db_one(f"SELECT MAX(updated_on) AS updated_on FROM {SHIPMENT_TABLE_NAME}")
+                if row is not None:
+                    latest_date = self.parse_date_value(row["updated_on"])
+            except Exception:
+                latest_date = None
+        if latest_date is None:
+            return None
+        return datetime.combine(latest_date, datetime.min.time())
+
+    def dashboard_freshness_status(self, last_dt, warn_days, bad_days, missing_label="Never run"):
+        if last_dt is None:
+            return missing_label, "No date found", "bad"
+        now = datetime.now()
+        if isinstance(last_dt, date) and not isinstance(last_dt, datetime):
+            last_dt = datetime.combine(last_dt, datetime.min.time())
+        age_days = max(0, (now - last_dt).days)
+        when_text = last_dt.strftime("%d/%m/%Y %H:%M") if isinstance(last_dt, datetime) and (last_dt.hour or last_dt.minute) else last_dt.strftime("%d/%m/%Y")
+        if age_days >= bad_days:
+            return f"{age_days} days old", when_text, "bad"
+        if age_days >= warn_days:
+            return f"{age_days} days old", when_text, "warn"
+        if age_days == 0:
+            return "Today", when_text, "ok"
+        if age_days == 1:
+            return "1 day old", when_text, "ok"
+        return f"{age_days} days old", when_text, "ok"
+
+    def update_dashboard_freshness_card(self, prefix, last_dt, warn_days, bad_days, missing_label="Never imported"):
+        status_text, value_text, status_key = self.dashboard_freshness_status(last_dt, warn_days, bad_days, missing_label=missing_label)
+        self.set_dashboard_label_text(f"dashboard{prefix}Freshness_value", value_text)
+        status_label = getattr(self.ui, f"dashboard{prefix}Freshness_status", None)
+        if status_label is not None:
+            status_label.setText(status_text)
+            self.apply_dashboard_status_style(status_label, status_key)
+        return status_key, f"{prefix}: {status_text}"
+
+    def dashboard_inbound_shipments(self):
+        if self.db_conn is None or not self.has_table(SHIPMENT_TABLE_NAME):
+            return []
+        try:
+            rows = self.db_all(
+                f"""
+                SELECT shipment_type, supplier_name, container_no, due_date, status, order_no
+                FROM {SHIPMENT_TABLE_NAME}
+                WHERE COALESCE(status, '') <> 'ARRIVED'
+                """
+            )
+        except Exception:
+            return []
+
+        inbound = []
+        today = date.today()
+        for row in rows:
+            status = str(row.get("status") or "").strip().upper()
+            if status == "ARRIVED":
+                continue
+            due = self.parse_date_value(row.get("due_date"))
+            days = None if due is None else (due - today).days
+            inbound.append({
+                "shipment_type": str(row.get("shipment_type") or "").strip(),
+                "supplier_name": str(row.get("supplier_name") or "").strip(),
+                "container_no": str(row.get("container_no") or "").strip(),
+                "due_date": due,
+                "days": days,
+                "status": status or "Pending",
+                "order_no": str(row.get("order_no") or "").strip(),
+            })
+        inbound.sort(key=lambda item: (item["due_date"] is None, item["due_date"] or date.max, item.get("supplier_name", "")))
+        return inbound
+
+    def populate_dashboard_inbound_table(self, inbound_rows):
+        table = getattr(self.ui, "dashboardInboundShipments_table", None)
+        if table is None:
+            return
+        table.setSortingEnabled(False)
+        table.setRowCount(0)
+        display_rows = inbound_rows[:8]
+        table.setRowCount(len(display_rows))
+        for row_index, row in enumerate(display_rows):
+            values = [
+                row["due_date"].strftime("%d/%m/%Y") if row.get("due_date") else "Missing ETA",
+                "" if row.get("days") is None else str(row.get("days")),
+                row.get("shipment_type", ""),
+                row.get("supplier_name", ""),
+                row.get("container_no", ""),
+                row.get("status", ""),
+            ]
+            for column_index, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setFlags((item.flags() | Qt.ItemIsSelectable | Qt.ItemIsEnabled) & ~Qt.ItemIsEditable)
+                if column_index == 1 and row.get("days") is not None:
+                    item.setData(TABLE_SORT_ROLE, int(row.get("days")))
+                table.setItem(row_index, column_index, item)
+        try:
+            table.resizeColumnsToContents()
+            table.resizeRowsToContents()
+        except Exception:
+            pass
+        table.setSortingEnabled(True)
+
+    def dashboard_json_meta(self, key, default=None):
+        raw_value = str(self.get_meta_value(key, "") or "").strip()
+        if not raw_value:
+            return [] if default is None else default
+        try:
+            parsed = json.loads(raw_value)
+        except Exception:
+            return [] if default is None else default
+        return parsed
+
+    def dashboard_meta_int(self, key, default=0):
+        try:
+            return int(float(str(self.get_meta_value(key, default) or default).replace(",", "")))
+        except Exception:
+            return int(default or 0)
+
+    def store_dashboard_critical_summary(self, rows_to_show):
+        rows = list(rows_to_show or [])
+        summary_rows = []
+        need_order_count = 0
+        at_risk_count = 0
+        no_hard_inbound_count = 0
+
+        for row in rows:
+            suggested = self.parse_float(row.get("suggested_order", 0))
+            at_risk = self.parse_float(row.get("at_risk", 0))
+            hard_inbound = self.parse_float(row.get("on_next_container", 0)) + self.parse_float(row.get("shipped_container", 0))
+            if suggested > 0:
+                need_order_count += 1
+            if at_risk > 0:
+                at_risk_count += 1
+            if hard_inbound <= 0:
+                no_hard_inbound_count += 1
+
+            if len(summary_rows) < 50:
+                summary_rows.append({
+                    "item_number": str(row.get("item_number") or "").strip(),
+                    "item_name": str(row.get("item_name") or "").strip(),
+                    "supplier": str(row.get("filter_value") or "").strip(),
+                    "planning_status": str(row.get("planning_status") or "").strip(),
+                    "sales_for_period": self.parse_float(row.get("sales_for_period", 0)),
+                    "avg_monthly_sales": self.parse_float(row.get("avg_monthly_sales", 0)),
+                    "soh": self.parse_float(row.get("soh", 0)),
+                    "on_order_form": self.parse_float(row.get("on_order_form", 0)),
+                    "on_next_container": self.parse_float(row.get("on_next_container", 0)),
+                    "shipped_container": self.parse_float(row.get("shipped_container", 0)),
+                    "suggested_order": suggested,
+                    "at_risk": at_risk,
+                    "critical_reason": str(row.get("critical_reason") or "").strip(),
+                })
+
+        self.set_meta_value("critical_order_analysis_last_need_order_count", str(need_order_count))
+        self.set_meta_value("critical_order_analysis_last_at_risk_count", str(at_risk_count))
+        self.set_meta_value("critical_order_analysis_last_no_hard_inbound_count", str(no_hard_inbound_count))
+        try:
+            self.set_meta_value("critical_order_analysis_last_summary_json", json.dumps(summary_rows, ensure_ascii=False))
+        except Exception:
+            self.set_meta_value("critical_order_analysis_last_summary_json", "[]")
+
+    def dashboard_last_critical_summary(self):
+        parsed = self.dashboard_json_meta("critical_order_analysis_last_summary_json", [])
+        return parsed if isinstance(parsed, list) else []
+
+    def dashboard_open_on_order_rows(self):
+        if self.db_conn is None or not self.has_table("on_order_lines"):
+            return []
+        try:
+            rows = self.db_all(
+                """
+                SELECT order_number, item_number, description, qty, supplier_name, ready_date, comments, status
+                FROM on_order_lines
+                ORDER BY line_no, id
+                """
+            )
+        except Exception:
+            return []
+
+        open_rows = []
+        closed_words = ("RECEIVED", "DONE", "CANCEL", "COMPLETE", "ARRIVED", "CLOSED")
+        for row in rows:
+            status = str(row.get("status") or "").strip()
+            status_upper = status.upper()
+            if any(word in status_upper for word in closed_words):
+                continue
+            item_number = str(row.get("item_number") or "").strip()
+            order_number = str(row.get("order_number") or "").strip()
+            description = str(row.get("description") or "").strip()
+            supplier_name = str(row.get("supplier_name") or "").strip()
+            ready_date = self.parse_date_value(row.get("ready_date"))
+            open_rows.append({
+                "order_number": order_number,
+                "item_number": item_number,
+                "description": description,
+                "qty": self.parse_float(row.get("qty", 0)),
+                "supplier_name": supplier_name,
+                "ready_date": ready_date,
+                "ready_date_text": str(row.get("ready_date") or "").strip(),
+                "comments": str(row.get("comments") or "").strip(),
+                "status": status,
+            })
+        return open_rows
+
+    def dashboard_overdue_on_order_rows(self, open_rows=None):
+        today = date.today()
+        rows = list(open_rows if open_rows is not None else self.dashboard_open_on_order_rows())
+        overdue = []
+        for row in rows:
+            ready_date = row.get("ready_date")
+            if ready_date is not None and ready_date < today:
+                copied = dict(row)
+                copied["days_overdue"] = (today - ready_date).days
+                overdue.append(copied)
+        overdue.sort(key=lambda item: (-int(item.get("days_overdue") or 0), item.get("ready_date") or date.max, item.get("item_number", "")))
+        return overdue
+
+    def dashboard_missing_ready_date_rows(self, open_rows=None):
+        rows = list(open_rows if open_rows is not None else self.dashboard_open_on_order_rows())
+        missing = [row for row in rows if row.get("ready_date") is None]
+        missing.sort(key=lambda item: (item.get("supplier_name", "").lower(), item.get("order_number", ""), item.get("item_number", "")))
+        return missing
+
+    def dashboard_negative_stock_rows(self):
+        if self.db_conn is None or not self.has_table("stock"):
+            return []
+        try:
+            rows = self.db_all(
+                """
+                SELECT item_number, on_hand, on_order, available
+                FROM stock
+                WHERE COALESCE(on_hand, 0) < 0
+                ORDER BY on_hand ASC, item_number
+                """
+            )
+        except Exception:
+            return []
+
+        negative_rows = []
+        for row in rows:
+            item_number = str(row.get("item_number") or "").strip()
+            item_master = self.get_item_master_row(item_number) if item_number else {}
+            description = str(self.get_first(item_master, "item_name", "description", "Description", default="") or "").strip()
+            supplier = str(self.get_first(item_master, "supplier_name", "supplier_code", "Column1", "Supplier", default="") or "").strip()
+            negative_rows.append({
+                "item_number": item_number,
+                "description": description,
+                "supplier_name": supplier,
+                "on_hand": self.parse_float(row.get("on_hand", 0)),
+                "on_order": self.parse_float(row.get("on_order", 0)),
+                "available": self.parse_float(row.get("available", 0)),
+            })
+        negative_rows.sort(key=lambda item: (self.parse_float(item.get("on_hand", 0)), item.get("item_number", "")))
+        return negative_rows
+
+    def dashboard_purchasing_metrics(self):
+        critical_summary = self.dashboard_last_critical_summary()
+        open_on_order = self.dashboard_open_on_order_rows()
+        overdue_rows = self.dashboard_overdue_on_order_rows(open_on_order)
+        missing_date_rows = self.dashboard_missing_ready_date_rows(open_on_order)
+        negative_stock_rows = self.dashboard_negative_stock_rows()
+
+        need_order_count = self.dashboard_meta_int("critical_order_analysis_last_need_order_count", 0)
+        at_risk_count = self.dashboard_meta_int("critical_order_analysis_last_at_risk_count", 0)
+        no_hard_inbound_count = self.dashboard_meta_int("critical_order_analysis_last_no_hard_inbound_count", 0)
+
+        if critical_summary and not any((need_order_count, at_risk_count, no_hard_inbound_count)):
+            need_order_count = sum(1 for row in critical_summary if self.parse_float(row.get("suggested_order", 0)) > 0)
+            at_risk_count = sum(1 for row in critical_summary if self.parse_float(row.get("at_risk", 0)) > 0)
+            no_hard_inbound_count = sum(
+                1 for row in critical_summary
+                if self.parse_float(row.get("on_next_container", 0)) + self.parse_float(row.get("shipped_container", 0)) <= 0
+            )
+
+        return {
+            "critical_summary": critical_summary,
+            "need_order_count": need_order_count,
+            "at_risk_count": at_risk_count,
+            "no_hard_inbound_count": no_hard_inbound_count,
+            "negative_stock_rows": negative_stock_rows,
+            "overdue_rows": overdue_rows,
+            "missing_date_rows": missing_date_rows,
+            "negative_stock_count": len(negative_stock_rows),
+            "overdue_count": len(overdue_rows),
+            "missing_date_count": len(missing_date_rows),
+        }
+
+    def build_dashboard_purchasing_action_rows(self, metrics):
+        action_rows = []
+
+        for row in (metrics.get("critical_summary") or [])[:8]:
+            supplier = str(row.get("supplier") or "").strip()
+            reason = str(row.get("critical_reason") or "").strip()
+            action_rows.append({
+                "type": "Critical",
+                "item": str(row.get("item_number") or "").strip(),
+                "description": str(row.get("item_name") or "").strip(),
+                "supplier_order": supplier,
+                "qty_soh": f"SOH {self.format_value(row.get('soh', 0))} / Risk {self.format_value(row.get('at_risk', 0))} / Order {self.format_value(row.get('suggested_order', 0))}",
+                "date": "",
+                "note": reason,
+                "priority": 10,
+            })
+
+        for row in (metrics.get("negative_stock_rows") or [])[:4]:
+            action_rows.append({
+                "type": "Negative SOH",
+                "item": row.get("item_number", ""),
+                "description": row.get("description", ""),
+                "supplier_order": row.get("supplier_name", ""),
+                "qty_soh": f"SOH {self.format_value(row.get('on_hand', 0))} / Avail {self.format_value(row.get('available', 0))}",
+                "date": "",
+                "note": "Stock on hand is below zero. Check recent sales/import timing or stock adjustment.",
+                "priority": 5,
+            })
+
+        for row in (metrics.get("overdue_rows") or [])[:6]:
+            days = int(row.get("days_overdue") or 0)
+            ready_date = row.get("ready_date")
+            date_text = self.format_display_date(ready_date)
+            if days > 0:
+                date_text = f"{date_text} ({days}d late)" if date_text else f"{days}d late"
+            order_text = row.get("supplier_name", "")
+            if row.get("order_number"):
+                order_text = f"{order_text} / {row.get('order_number')}" if order_text else row.get("order_number", "")
+            action_rows.append({
+                "type": "Overdue On Order",
+                "item": row.get("item_number", ""),
+                "description": row.get("description", ""),
+                "supplier_order": order_text,
+                "qty_soh": f"Qty {self.format_value(row.get('qty', 0))}",
+                "date": date_text,
+                "note": row.get("comments", "") or row.get("status", "") or "Ready date has passed.",
+                "priority": 20,
+            })
+
+        for row in (metrics.get("missing_date_rows") or [])[:4]:
+            order_text = row.get("supplier_name", "")
+            if row.get("order_number"):
+                order_text = f"{order_text} / {row.get('order_number')}" if order_text else row.get("order_number", "")
+            action_rows.append({
+                "type": "Missing Ready Date",
+                "item": row.get("item_number", ""),
+                "description": row.get("description", ""),
+                "supplier_order": order_text,
+                "qty_soh": f"Qty {self.format_value(row.get('qty', 0))}",
+                "date": "Missing",
+                "note": row.get("comments", "") or "No ready date on the on-order line.",
+                "priority": 30,
+            })
+
+        action_rows.sort(key=lambda item: (int(item.get("priority") or 99), str(item.get("type") or ""), str(item.get("item") or "")))
+        return action_rows
+
+    def populate_dashboard_purchasing_table(self, action_rows):
+        table = getattr(self.ui, "dashboardPurchasingAction_table", None)
+        if table is None:
+            return
+        table.setSortingEnabled(False)
+        table.setRowCount(0)
+        display_rows = list(action_rows or [])[:12]
+        if not display_rows:
+            table.setRowCount(1)
+            empty_item = QTableWidgetItem("No purchasing action items found. Run Critical Order Analysis to refresh critical-item data.")
+            empty_item.setFlags((empty_item.flags() | Qt.ItemIsSelectable | Qt.ItemIsEnabled) & ~Qt.ItemIsEditable)
+            table.setItem(0, 0, empty_item)
+            try:
+                table.setSpan(0, 0, 1, table.columnCount())
+                table.resizeColumnsToContents()
+                table.resizeRowsToContents()
+            except Exception:
+                pass
+            return
+
+        table.setRowCount(len(display_rows))
+        columns = ["type", "item", "description", "supplier_order", "qty_soh", "date", "note"]
+        for row_index, row in enumerate(display_rows):
+            for column_index, key in enumerate(columns):
+                value = str(row.get(key) or "")
+                if key == "note" and len(value) > 180:
+                    value = value[:177].rstrip() + "..."
+                item = QTableWidgetItem(value)
+                item.setFlags((item.flags() | Qt.ItemIsSelectable | Qt.ItemIsEnabled) & ~Qt.ItemIsEditable)
+                item.setData(TABLE_SORT_ROLE, row.get("priority", row_index) if column_index == 0 else value)
+                table.setItem(row_index, column_index, item)
+        try:
+            table.resizeColumnsToContents()
+            table.resizeRowsToContents()
+        except Exception:
+            pass
+        table.setSortingEnabled(True)
+
+
+    def dashboard_latest_sales_date(self):
+        if self.db_conn is None or not self.has_table("sales"):
+            return None
+        try:
+            row = self.db_one(
+                """
+                SELECT MAX(DATE(sale_date)) AS latest_date
+                FROM sales
+                WHERE sale_date IS NOT NULL
+                """
+            )
+        except Exception:
+            return None
+        if row is None:
+            return None
+        return self.parse_date_value(row.get("latest_date"))
+
+    def dashboard_month_window_ending(self, anchor_date=None, month_count=12):
+        try:
+            month_count = max(1, int(month_count))
+        except Exception:
+            month_count = 12
+        anchor = self.parse_date_value(anchor_date) or date.today()
+        current = self.first_of_month(anchor)
+        months = []
+        for _index in range(month_count):
+            months.append(current)
+            current = self.first_of_month(self.previous_month(current))
+        months.reverse()
+        return months
+
+    def dashboard_sales_monthly_totals(self, month_count=12):
+        anchor = self.dashboard_latest_sales_date() or date.today()
+        months = self.dashboard_month_window_ending(anchor, month_count)
+        totals = {month: {"qty": 0.0, "value": 0.0} for month in months}
+        if self.db_conn is None or not self.has_table("sales") or not months:
+            return months, totals
+
+        start_text = months[0].isoformat()
+        end_text = self.month_end(months[-1]).isoformat()
+        month_expr = "COALESCE(NULLIF(TRIM(month_key), ''), STRFTIME('%Y-%m', DATE(sale_date)))"
+        try:
+            rows = self.db_all(
+                f"""
+                SELECT
+                    {month_expr} AS month_key,
+                    SUM(COALESCE(quantity, 0)) AS total_qty,
+                    SUM(COALESCE(extended, COALESCE(quantity, 0) * COALESCE(price, 0))) AS total_value
+                FROM sales
+                WHERE DATE(sale_date) BETWEEN ? AND ?
+                GROUP BY {month_expr}
+                ORDER BY month_key
+                """,
+                (start_text, end_text),
+            )
+        except Exception:
+            return months, totals
+
+        for row in rows:
+            month_start = self.parse_month_key(row.get("month_key"))
+            if month_start not in totals:
+                continue
+            totals[month_start]["qty"] = self.parse_float(row.get("total_qty", 0))
+            totals[month_start]["value"] = self.parse_float(row.get("total_value", 0))
+        return months, totals
+
+    def _dashboard_chart_grid_color(self):
+        if hasattr(self.ui, "radioLight") and self.ui.radioLight.isChecked():
+            return QColor(32, 33, 36, 45)
+        return QColor(232, 234, 237, 45)
+
+    def draw_dashboard_line_chart(self, chart_view, months, totals, title, y_title="", money=False):
+        if chart_view is None:
+            return
+
+        chart = QChart()
+        chart.setTitle(title or "")
+        chart.setMargins(QMargins(10, 8, 10, 16))
+        chart.legend().setVisible(False)
+        chart.setBackgroundVisible(True)
+        chart.setBackgroundBrush(self.chart_background_color())
+
+        text_color = self.chart_text_color()
+        axis_pen = QPen(text_color)
+        grid_pen = QPen(self._dashboard_chart_grid_color())
+
+        series = QLineSeries()
+        series.setName(title or "Trend")
+        series.setPointsVisible(True)
+        if hasattr(self.ui, "radioLight") and self.ui.radioLight.isChecked():
+            pen = QPen(QColor("#005BBB"))
+        else:
+            pen = QPen(QColor("#64B5F6"))
+        pen.setWidth(3)
+        series.setPen(pen)
+
+        values = [self.parse_float(value) for value in (totals or [])]
+        for index, value in enumerate(values):
+            series.append(index, float(value))
+        chart.addSeries(series)
+
+        labels = [month.strftime("%b\n%y") if isinstance(month, date) else str(month) for month in (months or [])]
+        x_axis = QBarCategoryAxis()
+        x_axis.append(labels or [""])
+        x_axis.setLabelsAngle(0)
+
+        y_axis = QValueAxis()
+        max_value = max(values) if values else 0.0
+        y_axis.setMin(0)
+        y_axis.setMax(max(1.0, max_value * 1.15))
+        y_axis.setLabelFormat("$%.0f" if money else "%.0f")
+        if y_title:
+            y_axis.setTitleText(y_title)
+
+        axis_font = QFont()
+        axis_font.setPointSize(8)
+        x_axis.setLabelsFont(axis_font)
+        y_axis.setLabelsFont(axis_font)
+
+        chart.addAxis(x_axis, Qt.AlignBottom)
+        chart.addAxis(y_axis, Qt.AlignLeft)
+        series.attachAxis(x_axis)
+        series.attachAxis(y_axis)
+
+        for axis in chart.axes():
+            axis.setLabelsColor(text_color)
+            axis.setTitleText(axis.titleText())
+            axis.setTitleBrush(QBrush(text_color))
+            axis.setLinePen(axis_pen)
+            axis.setGridLinePen(grid_pen)
+        chart.setTitleBrush(QBrush(text_color))
+        chart_view.setChart(chart)
+
+    def draw_dashboard_bar_chart(self, chart_view, categories, values, title, value_label="Count"):
+        if chart_view is None:
+            return
+        safe_categories = [str(category or "Unknown").strip() or "Unknown" for category in (categories or [])]
+        safe_values = [self.parse_float(value) for value in (values or [])]
+        if not safe_categories:
+            safe_categories = ["No data"]
+            safe_values = [0.0]
+
+        trimmed_categories = []
+        for category in safe_categories:
+            trimmed_categories.append(category if len(category) <= 18 else category[:15].rstrip() + "...")
+
+        chart = QChart()
+        chart.setTitle(title or "")
+        chart.setMargins(QMargins(10, 8, 10, 16))
+        chart.legend().setVisible(False)
+        chart.setBackgroundVisible(True)
+        chart.setBackgroundBrush(self.chart_background_color())
+
+        bar_set = QBarSet(value_label or "Count")
+        for value in safe_values:
+            bar_set.append(float(value))
+        series = QBarSeries()
+        series.append(bar_set)
+        chart.addSeries(series)
+
+        x_axis = QBarCategoryAxis()
+        x_axis.append(trimmed_categories)
+        x_axis.setLabelsAngle(-25 if len(trimmed_categories) > 4 else 0)
+        y_axis = QValueAxis()
+        max_value = max(safe_values) if safe_values else 0.0
+        y_axis.setMin(0)
+        y_axis.setMax(max(1.0, max_value * 1.25))
+        y_axis.setLabelFormat("%.0f")
+
+        axis_font = QFont()
+        axis_font.setPointSize(8)
+        x_axis.setLabelsFont(axis_font)
+        y_axis.setLabelsFont(axis_font)
+
+        chart.addAxis(x_axis, Qt.AlignBottom)
+        chart.addAxis(y_axis, Qt.AlignLeft)
+        series.attachAxis(x_axis)
+        series.attachAxis(y_axis)
+
+        text_color = self.chart_text_color()
+        axis_pen = QPen(text_color)
+        grid_pen = QPen(self._dashboard_chart_grid_color())
+        for axis in chart.axes():
+            axis.setLabelsColor(text_color)
+            axis.setLinePen(axis_pen)
+            axis.setGridLinePen(grid_pen)
+        chart.setTitleBrush(QBrush(text_color))
+        chart_view.setChart(chart)
+
+    def dashboard_critical_counts_by_group(self, critical_summary=None, limit=8):
+        rows = list(critical_summary if critical_summary is not None else self.dashboard_last_critical_summary())
+        if not rows:
+            return []
+
+        group_by_item = {}
+        item_numbers = []
+        seen = set()
+        for row in rows:
+            item_number = str(row.get("item_number") or "").strip()
+            if not item_number:
+                continue
+            key = item_number.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            item_numbers.append(item_number)
+
+        if item_numbers and self.db_conn is not None and self.has_table("items"):
+            group_expr = self.build_items_group_expression(alias=False)
+            if group_expr:
+                in_clause, params = self.sql_in_clause(item_numbers)
+                try:
+                    item_rows = self.db_all(
+                        f"""
+                        SELECT TRIM(item_number) AS item_number, COALESCE({group_expr}, '') AS item_group
+                        FROM items
+                        WHERE TRIM(item_number) IN {in_clause}
+                        """,
+                        params,
+                    )
+                    for item_row in item_rows:
+                        item_key = str(item_row.get("item_number") or "").strip().casefold()
+                        group_by_item[item_key] = str(item_row.get("item_group") or "").strip()
+                except Exception:
+                    group_by_item = {}
+
+        counts = {}
+        for row in rows:
+            item_number = str(row.get("item_number") or "").strip()
+            group_name = group_by_item.get(item_number.casefold(), "")
+            if not group_name:
+                group_name = str(row.get("supplier") or "").strip()
+            if not group_name:
+                group_name = "Unknown"
+            counts[group_name] = counts.get(group_name, 0) + 1
+
+        ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0].casefold()))
+        try:
+            limit = max(1, int(limit))
+        except Exception:
+            limit = 8
+        return ranked[:limit]
+
+    def dashboard_top_movers(self, limit_each=5):
+        if self.db_conn is None or not self.has_table("sales"):
+            return []
+        anchor = self.dashboard_latest_sales_date() or date.today()
+        all_months = self.dashboard_month_window_ending(anchor, 6)
+        if len(all_months) < 6:
+            return []
+        previous_months = set(all_months[:3])
+        recent_months = set(all_months[3:])
+        start_text = all_months[0].isoformat()
+        end_text = self.month_end(all_months[-1]).isoformat()
+        month_expr = "COALESCE(NULLIF(TRIM(month_key), ''), STRFTIME('%Y-%m', DATE(sale_date)))"
+
+        try:
+            rows = self.db_all(
+                f"""
+                SELECT
+                    TRIM(item_number) AS item_number,
+                    {month_expr} AS month_key,
+                    SUM(COALESCE(quantity, 0)) AS total_qty
+                FROM sales
+                WHERE TRIM(COALESCE(item_number, '')) <> ''
+                  AND DATE(sale_date) BETWEEN ? AND ?
+                GROUP BY TRIM(item_number), {month_expr}
+                """,
+                (start_text, end_text),
+            )
+        except Exception:
+            return []
+
+        grouped = {}
+        for row in rows:
+            item_number = str(row.get("item_number") or "").strip()
+            if not item_number:
+                continue
+            month_start = self.parse_month_key(row.get("month_key"))
+            if month_start is None:
+                continue
+            bucket = grouped.setdefault(item_number, {"previous": 0.0, "recent": 0.0})
+            if month_start in previous_months:
+                bucket["previous"] += self.parse_float(row.get("total_qty", 0))
+            elif month_start in recent_months:
+                bucket["recent"] += self.parse_float(row.get("total_qty", 0))
+
+        movement_rows = []
+        for item_number, data in grouped.items():
+            previous_qty = self.parse_float(data.get("previous", 0))
+            recent_qty = self.parse_float(data.get("recent", 0))
+            delta = recent_qty - previous_qty
+            if abs(delta) <= 0.0001:
+                continue
+            percent = None if abs(previous_qty) <= 0.0001 else (delta / previous_qty) * 100.0
+            movement_rows.append({
+                "item_number": item_number,
+                "previous_qty": previous_qty,
+                "recent_qty": recent_qty,
+                "delta": delta,
+                "percent": percent,
+            })
+
+        rising = sorted((row for row in movement_rows if row["delta"] > 0), key=lambda row: (-row["delta"], row["item_number"].casefold()))[:limit_each]
+        falling = sorted((row for row in movement_rows if row["delta"] < 0), key=lambda row: (row["delta"], row["item_number"].casefold()))[:limit_each]
+        selected = []
+        for row in rising:
+            copied = dict(row)
+            copied["trend"] = "Rising"
+            selected.append(copied)
+        for row in falling:
+            copied = dict(row)
+            copied["trend"] = "Falling"
+            selected.append(copied)
+
+        name_map = self.fetch_item_name_map(row["item_number"] for row in selected)
+        for row in selected:
+            item_number = row["item_number"]
+            row["description"] = name_map.get(item_number.upper(), "") or name_map.get(self.item_clean_key(item_number), "")
+        return selected
+
+    def populate_dashboard_movers_table(self, mover_rows):
+        table = getattr(self.ui, "dashboardMovers_table", None)
+        if table is None:
+            return
+        table.setSortingEnabled(False)
+        table.setRowCount(0)
+        rows = list(mover_rows or [])
+        if not rows:
+            table.setRowCount(1)
+            empty_item = QTableWidgetItem("No movement rows found for the latest 3 months vs previous 3 months.")
+            empty_item.setFlags((empty_item.flags() | Qt.ItemIsSelectable | Qt.ItemIsEnabled) & ~Qt.ItemIsEditable)
+            table.setItem(0, 0, empty_item)
+            try:
+                table.setSpan(0, 0, 1, table.columnCount())
+            except Exception:
+                pass
+            return
+
+        table.setRowCount(len(rows))
+        columns = ["trend", "item_number", "description", "previous_qty", "recent_qty", "delta", "percent"]
+        for row_index, row in enumerate(rows):
+            for column_index, key in enumerate(columns):
+                if key == "percent":
+                    percent = row.get("percent")
+                    value = "New" if percent is None else f"{percent:+.1f}%"
+                    sort_value = 999999.0 if percent is None else self.parse_float(percent)
+                elif key in {"previous_qty", "recent_qty", "delta"}:
+                    value = self.format_value(row.get(key, 0)) if key != "delta" else self.format_signed_value(row.get(key, 0))
+                    sort_value = self.parse_float(row.get(key, 0))
+                else:
+                    value = str(row.get(key) or "")
+                    sort_value = value.casefold()
+                item = QTableWidgetItem(value)
+                item.setFlags((item.flags() | Qt.ItemIsSelectable | Qt.ItemIsEnabled) & ~Qt.ItemIsEditable)
+                item.setData(TABLE_SORT_ROLE, sort_value)
+                table.setItem(row_index, column_index, item)
+        try:
+            table.resizeColumnsToContents()
+            table.resizeRowsToContents()
+        except Exception:
+            pass
+        table.setSortingEnabled(True)
+
+    def dashboard_item_master_key_set(self):
+        keys = set()
+        if self.db_conn is None or not self.has_table("items"):
+            return keys
+        try:
+            rows = self.db_all(
+                """
+                SELECT TRIM(COALESCE(item_number, '')) AS item_number
+                FROM items
+                WHERE TRIM(COALESCE(item_number, '')) <> ''
+                """
+            )
+        except Exception:
+            return keys
+        for row in rows:
+            item_number = str(row.get("item_number") or "").strip()
+            if not item_number:
+                continue
+            for candidate in (item_number, self.item_exact_key(item_number), self.item_clean_key(item_number)):
+                candidate = str(candidate or "").strip().upper()
+                if candidate:
+                    keys.add(candidate)
+        return keys
+
+    def dashboard_table_has_column(self, table_name, column_name):
+        try:
+            available = {str(name).lower() for name in self.get_table_columns(table_name)}
+        except Exception:
+            return False
+        return str(column_name or "").strip().lower() in available
+
+    def dashboard_count_blank_column(self, table_name, column_name):
+        if self.db_conn is None or not self.has_table(table_name) or not self.dashboard_table_has_column(table_name, column_name):
+            return None
+        try:
+            row = self.db_one(
+                f"""
+                SELECT COUNT(*) AS row_count
+                FROM {table_name}
+                WHERE TRIM(COALESCE({self.db_identifier(column_name)}, '')) = ''
+                """
+            )
+            return int(row.get("row_count") or 0) if row is not None else 0
+        except Exception:
+            return None
+
+    def dashboard_unknown_items_from_table(self, table_name, item_column="item_number", value_column=None, limit=6):
+        if self.db_conn is None or not self.has_table(table_name) or not self.dashboard_table_has_column(table_name, item_column):
+            return {"count": 0, "samples": [], "available": False}
+        master_keys = self.dashboard_item_master_key_set()
+        if not master_keys:
+            return {"count": 0, "samples": [], "available": False}
+        value_expr = "0"
+        if value_column and self.dashboard_table_has_column(table_name, value_column):
+            value_expr = f"SUM(COALESCE({self.db_identifier(value_column)}, 0))"
+        try:
+            rows = self.db_all(
+                f"""
+                SELECT TRIM(COALESCE({self.db_identifier(item_column)}, '')) AS item_number,
+                       COUNT(*) AS row_count,
+                       {value_expr} AS total_value
+                FROM {table_name}
+                WHERE TRIM(COALESCE({self.db_identifier(item_column)}, '')) <> ''
+                GROUP BY TRIM(COALESCE({self.db_identifier(item_column)}, ''))
+                """
+            )
+        except Exception:
+            return {"count": 0, "samples": [], "available": False}
+
+        unknown = []
+        for row in rows:
+            item_number = str(row.get("item_number") or "").strip()
+            if not item_number:
+                continue
+            candidates = {
+                item_number.upper(),
+                self.item_exact_key(item_number).upper(),
+                self.item_clean_key(item_number).upper(),
+            }
+            if candidates.intersection(master_keys):
+                continue
+            unknown.append({
+                "item_number": item_number,
+                "row_count": int(row.get("row_count") or 0),
+                "total_value": self.parse_float(row.get("total_value", 0)),
+            })
+        unknown.sort(key=lambda item: (-item.get("row_count", 0), str(item.get("item_number") or "").casefold()))
+        return {"count": len(unknown), "samples": unknown[: max(1, int(limit or 1))], "available": True}
+
+    def dashboard_items_missing_description_count(self):
+        if self.db_conn is None or not self.has_table("items"):
+            return None
+        available = {str(name).lower(): name for name in self.get_table_columns("items")}
+        candidate_names = ["item_name", "description", "Item Name", "Description", "name"]
+        parts = []
+        for candidate in candidate_names:
+            actual = available.get(candidate.lower())
+            if actual:
+                parts.append(f"NULLIF(TRIM({self.db_identifier(actual)}), '')")
+        if not parts:
+            return None
+        expr = f"COALESCE({', '.join(parts)}, '')"
+        try:
+            row = self.db_one(f"SELECT COUNT(*) AS row_count FROM items WHERE TRIM(COALESCE(item_number, '')) <> '' AND {expr} = ''")
+            return int(row.get("row_count") or 0) if row is not None else 0
+        except Exception:
+            return None
+
+    def dashboard_items_missing_supplier_count(self):
+        if self.db_conn is None or not self.has_table("items"):
+            return None
+        supplier_expr = self.build_items_supplier_expression(alias=False)
+        if not supplier_expr or supplier_expr == "''":
+            return None
+        try:
+            row = self.db_one(f"SELECT COUNT(*) AS row_count FROM items WHERE TRIM(COALESCE(item_number, '')) <> '' AND {supplier_expr} = ''")
+            return int(row.get("row_count") or 0) if row is not None else 0
+        except Exception:
+            return None
+
+    def dashboard_yu_draft_count(self):
+        try:
+            drafts_dir = Path(self.get_yu_order_drafts_dir())
+            if not drafts_dir.exists():
+                return 0
+            return sum(1 for path in drafts_dir.iterdir() if path.is_file() and path.suffix.lower() in {".csv", ".json", ".xlsx", ".xlsm"})
+        except Exception:
+            return 0
+
+    def dashboard_data_quality_metrics(self, inbound_rows=None):
+        inbound_rows = list(inbound_rows if inbound_rows is not None else self.dashboard_inbound_shipments())
+        metrics = {
+            "sales_unknown": self.dashboard_unknown_items_from_table("sales", "item_number", "quantity"),
+            "stock_unknown": self.dashboard_unknown_items_from_table("stock", "item_number", "on_hand"),
+            "orders_unknown": self.dashboard_unknown_items_from_table("orders", "item_number", "quantity"),
+            "missing_invoice_count": self.dashboard_count_blank_column("sales", "invoice_no"),
+            "sales_blank_item_count": self.dashboard_count_blank_column("sales", "item_number"),
+            "items_missing_supplier_count": self.dashboard_items_missing_supplier_count(),
+            "items_missing_description_count": self.dashboard_items_missing_description_count(),
+            "shipment_missing_eta_count": sum(1 for row in inbound_rows if row.get("due_date") is None),
+            "shipment_missing_container_count": sum(1 for row in inbound_rows if not str(row.get("container_no") or "").strip()),
+            "shipment_missing_supplier_count": sum(1 for row in inbound_rows if not str(row.get("supplier_name") or "").strip()),
+            "yu_draft_count": self.dashboard_yu_draft_count(),
+        }
+        metrics["issue_rows"] = self.build_dashboard_data_quality_rows(metrics)
+        return metrics
+
+    def build_dashboard_data_quality_rows(self, metrics):
+        rows = []
+
+        def sample_text(sample_rows):
+            parts = []
+            for sample in sample_rows or []:
+                item_number = str(sample.get("item_number") or "").strip()
+                row_count = int(sample.get("row_count") or 0)
+                parts.append(f"{item_number} ({row_count})" if row_count else item_number)
+            return ", ".join(parts)
+
+        def add_row(severity, area, issue, count, detail, action):
+            try:
+                numeric_count = int(count or 0)
+            except Exception:
+                numeric_count = 0
+            if numeric_count <= 0:
+                return
+            rows.append({
+                "severity": severity,
+                "area": area,
+                "issue": issue,
+                "count": numeric_count,
+                "detail": detail,
+                "action": action,
+            })
+
+        sales_unknown = metrics.get("sales_unknown") or {}
+        stock_unknown = metrics.get("stock_unknown") or {}
+        orders_unknown = metrics.get("orders_unknown") or {}
+        add_row(
+            "High",
+            "Sales",
+            "Sold item numbers not found in item master",
+            sales_unknown.get("count", 0),
+            sample_text(sales_unknown.get("samples")),
+            "Check item import/canonical item numbers before relying on demand reports.",
+        )
+        add_row(
+            "High",
+            "Stock",
+            "Stock item numbers not found in item master",
+            stock_unknown.get("count", 0),
+            sample_text(stock_unknown.get("samples")),
+            "Check the stock import and item master.",
+        )
+        add_row(
+            "Medium",
+            "Orders",
+            "Order item numbers not found in item master",
+            orders_unknown.get("count", 0),
+            sample_text(orders_unknown.get("samples")),
+            "Check open order import item numbers.",
+        )
+        add_row(
+            "Medium",
+            "Sales",
+            "Sales rows missing invoice number",
+            metrics.get("missing_invoice_count"),
+            "Invoice drill-down and duplicate checks are weaker without invoice numbers.",
+            "Re-import sales from the MYOB export that includes Invoice No.",
+        )
+        add_row(
+            "High",
+            "Sales",
+            "Sales rows missing item number",
+            metrics.get("sales_blank_item_count"),
+            "Blank item rows cannot be tied to demand.",
+            "Check the sales export before importing.",
+        )
+        add_row(
+            "Medium",
+            "Item Master",
+            "Items missing supplier",
+            metrics.get("items_missing_supplier_count"),
+            "Supplier filtering and order analysis will be weaker.",
+            "Update the item master supplier column.",
+        )
+        add_row(
+            "Low",
+            "Item Master",
+            "Items missing description",
+            metrics.get("items_missing_description_count"),
+            "Blank descriptions make dashboard tables harder to review.",
+            "Update item descriptions in the item master.",
+        )
+        add_row(
+            "High",
+            "Shipments",
+            "Inbound shipments missing ETA",
+            metrics.get("shipment_missing_eta_count"),
+            "Dashboard cannot time inbound stock without an ETA.",
+            "Import Update.XLSX or manually enter the ETA.",
+        )
+        add_row(
+            "Medium",
+            "Shipments",
+            "Inbound shipments missing container number",
+            metrics.get("shipment_missing_container_count"),
+            "Container tracking and shipment matching are weaker.",
+            "Import Update.XLSX or manually enter the container number.",
+        )
+        add_row(
+            "Medium",
+            "Shipments",
+            "Inbound shipments missing supplier",
+            metrics.get("shipment_missing_supplier_count"),
+            "Supplier context is missing from inbound shipment rows.",
+            "Review shipment rows and fill supplier names.",
+        )
+        add_row(
+            "Low",
+            "YU Orders",
+            "Saved YU order drafts still present",
+            metrics.get("yu_draft_count"),
+            "Draft files exist in the local YU draft folder.",
+            "Review whether they are still needed or already exported.",
+        )
+
+        severity_rank = {"High": 0, "Medium": 1, "Low": 2}
+        rows.sort(key=lambda row: (severity_rank.get(row.get("severity"), 9), -int(row.get("count") or 0), str(row.get("area") or "")))
+        return rows
+
+    def populate_dashboard_data_quality_table(self, rows):
+        table = getattr(self.ui, "dashboardDataQuality_table", None)
+        if table is None:
+            return
+        table.setSortingEnabled(False)
+        table.setRowCount(0)
+        if not rows:
+            table.setRowCount(1)
+            item = QTableWidgetItem("No data-quality issues detected.")
+            item.setFlags((item.flags() | Qt.ItemIsSelectable | Qt.ItemIsEnabled) & ~Qt.ItemIsEditable)
+            table.setItem(0, 0, item)
+            try:
+                table.setSpan(0, 0, 1, table.columnCount())
+            except Exception:
+                pass
+            return
+
+        table.setRowCount(len(rows))
+        columns = ["severity", "area", "issue", "count", "detail", "action"]
+        severity_sort = {"High": 0, "Medium": 1, "Low": 2}
+        for row_index, row in enumerate(rows):
+            for column_index, key in enumerate(columns):
+                value = row.get(key, "")
+                if key == "count":
+                    value = f"{int(value or 0):,}"
+                    sort_value = int(row.get(key) or 0)
+                elif key == "severity":
+                    sort_value = severity_sort.get(str(value), 9)
+                else:
+                    sort_value = str(value or "").casefold()
+                item = QTableWidgetItem(str(value))
+                item.setFlags((item.flags() | Qt.ItemIsSelectable | Qt.ItemIsEnabled) & ~Qt.ItemIsEditable)
+                item.setData(TABLE_SORT_ROLE, sort_value)
+                table.setItem(row_index, column_index, item)
+        try:
+            table.resizeColumnsToContents()
+            table.resizeRowsToContents()
+        except Exception:
+            pass
+        table.setSortingEnabled(True)
+
+    def refresh_dashboard_analytics(self, purchasing_metrics=None):
+        months, monthly_totals = self.dashboard_sales_monthly_totals(12)
+        sales_values = [monthly_totals.get(month, {}).get("value", 0.0) for month in months]
+        sales_units = [monthly_totals.get(month, {}).get("qty", 0.0) for month in months]
+        self.draw_dashboard_line_chart(
+            getattr(self.ui, "dashboardSalesValue_chartView", None),
+            months,
+            sales_values,
+            "Sales value - last 12 months",
+            "Value",
+            money=True,
+        )
+        self.draw_dashboard_line_chart(
+            getattr(self.ui, "dashboardSalesUnits_chartView", None),
+            months,
+            sales_units,
+            "Units sold - last 12 months",
+            "Units",
+            money=False,
+        )
+
+        critical_summary = []
+        if isinstance(purchasing_metrics, dict):
+            critical_summary = purchasing_metrics.get("critical_summary") or []
+        group_counts = self.dashboard_critical_counts_by_group(critical_summary, limit=8)
+        self.draw_dashboard_bar_chart(
+            getattr(self.ui, "dashboardCriticalGroup_chartView", None),
+            [name for name, _count in group_counts],
+            [count for _name, count in group_counts],
+            "Critical items by product group / supplier",
+            "Critical",
+        )
+        self.populate_dashboard_movers_table(self.dashboard_top_movers(limit_each=5))
+
+
+    def refresh_dashboard(self):
+        warnings_out = []
+        try:
+            self.set_dashboard_label_text("dashboardAppVersion_value", APP_VERSION)
+            db_name = str(self.db_config.get("database") or "").strip()
+            db_server = str(self.db_config.get("server") or "").strip()
+            db_text = db_name or "SQL Server"
+            if db_server:
+                db_text = f"{db_text}\n{db_server}"
+            self.set_dashboard_label_text("dashboardDatabase_value", db_text)
+
+            freshness_checks = [
+                ("Sales", self.dashboard_parse_import_datetime("sales_last_import_iso", "sales_last_import_display", "lastUpdateSales_textBrowser"), 7, 14, "Never imported"),
+                ("Stock", self.dashboard_parse_import_datetime("stock_last_import_iso", "stock_last_import_display", "lastUPdateStock_textBrowser_2"), 3, 7, "Never imported"),
+                ("Orders", self.dashboard_parse_import_datetime("orders_last_import_iso", "orders_last_import_display", "lastUpdateOrders_textBrowser_3"), 7, 14, "Never imported"),
+                ("CoverOrders", self.dashboard_parse_import_datetime("cover_orders_last_import_iso", "cover_orders_last_import_display", "lastUpdateCoverOrders_textBrowser"), 14, 30, "Never imported"),
+                ("Shipments", self.dashboard_shipments_last_datetime(), 2, 5, "Never updated"),
+                ("Critical", self.dashboard_parse_import_datetime("critical_order_analysis_last_run_iso", "critical_order_analysis_last_run_display"), 3, 7, "Never run"),
+            ]
+            for prefix, last_dt, warn_days, bad_days, missing_label in freshness_checks:
+                status_key, message = self.update_dashboard_freshness_card(prefix, last_dt, warn_days, bad_days, missing_label=missing_label)
+                if status_key in {"warn", "bad"}:
+                    warnings_out.append(message)
+
+            critical_count = str(self.get_meta_value("critical_order_analysis_last_count", "-") or "-")
+            self.set_dashboard_label_text("dashboardCriticalCount_value", critical_count)
+
+            purchasing_metrics = self.dashboard_purchasing_metrics()
+            self.set_dashboard_label_text("dashboardNeedOrderCount_value", f"{purchasing_metrics.get('need_order_count', 0):,}")
+            self.set_dashboard_label_text("dashboardAtRiskCount_value", f"{purchasing_metrics.get('at_risk_count', 0):,}")
+            self.set_dashboard_label_text("dashboardNoInboundCount_value", f"{purchasing_metrics.get('no_hard_inbound_count', 0):,}")
+            self.set_dashboard_label_text("dashboardNegativeStockCount_value", f"{purchasing_metrics.get('negative_stock_count', 0):,}")
+            self.set_dashboard_label_text("dashboardOverdueOrdersCount_value", f"{purchasing_metrics.get('overdue_count', 0):,}")
+            self.set_dashboard_label_text("dashboardMissingDatesCount_value", f"{purchasing_metrics.get('missing_date_count', 0):,}")
+            self.populate_dashboard_purchasing_table(self.build_dashboard_purchasing_action_rows(purchasing_metrics))
+
+            if purchasing_metrics.get("at_risk_count", 0) > 0:
+                warnings_out.append(f"Purchasing: {purchasing_metrics.get('at_risk_count', 0):,} critical items are at risk")
+            if purchasing_metrics.get("no_hard_inbound_count", 0) > 0:
+                warnings_out.append(f"Purchasing: {purchasing_metrics.get('no_hard_inbound_count', 0):,} critical items have no hard inbound stock")
+            if purchasing_metrics.get("negative_stock_count", 0) > 0:
+                warnings_out.append(f"Stock: {purchasing_metrics.get('negative_stock_count', 0):,} items have negative SOH")
+            if purchasing_metrics.get("overdue_count", 0) > 0:
+                warnings_out.append(f"On Order: {purchasing_metrics.get('overdue_count', 0):,} open lines are overdue")
+            if purchasing_metrics.get("missing_date_count", 0) > 0:
+                warnings_out.append(f"On Order: {purchasing_metrics.get('missing_date_count', 0):,} open lines are missing ready dates")
+
+            inbound_rows = self.dashboard_inbound_shipments()
+            due_soon = sum(1 for row in inbound_rows if row.get("days") is not None and 0 <= row.get("days") <= 14)
+            missing_eta = sum(1 for row in inbound_rows if row.get("due_date") is None)
+            inbound_text = f"{len(inbound_rows)} total\n{due_soon} due 14d\n{missing_eta} missing ETA"
+            self.set_dashboard_label_text("dashboardInboundCount_value", inbound_text)
+            self.populate_dashboard_inbound_table(inbound_rows)
+
+            quality_metrics = self.dashboard_data_quality_metrics(inbound_rows)
+            self.set_dashboard_label_text("dashboardUnknownSalesItems_value", f"{int((quality_metrics.get('sales_unknown') or {}).get('count', 0)):,}")
+            self.set_dashboard_label_text("dashboardUnknownStockItems_value", f"{int((quality_metrics.get('stock_unknown') or {}).get('count', 0)):,}")
+            missing_invoice_count = quality_metrics.get("missing_invoice_count")
+            self.set_dashboard_label_text("dashboardMissingInvoiceCount_value", "N/A" if missing_invoice_count is None else f"{int(missing_invoice_count):,}")
+            missing_supplier_count = quality_metrics.get("items_missing_supplier_count")
+            self.set_dashboard_label_text("dashboardMissingSupplierCount_value", "N/A" if missing_supplier_count is None else f"{int(missing_supplier_count):,}")
+            self.set_dashboard_label_text("dashboardShipmentMissingEtaCount_value", f"{int(quality_metrics.get('shipment_missing_eta_count') or 0):,}")
+            self.set_dashboard_label_text("dashboardShipmentMissingContainerCount_value", f"{int(quality_metrics.get('shipment_missing_container_count') or 0):,}")
+            self.populate_dashboard_data_quality_table(quality_metrics.get("issue_rows", []))
+
+            for issue_row in quality_metrics.get("issue_rows", []):
+                if str(issue_row.get("severity") or "") in {"High", "Medium"}:
+                    warnings_out.append(f"{issue_row.get('area')}: {issue_row.get('count'):,} {issue_row.get('issue')}")
+
+            self.refresh_dashboard_analytics(purchasing_metrics)
+
+            last_refresh = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+            self.set_dashboard_label_text("dashboardLastRefresh_label", f"Refreshed {last_refresh}")
+            if not warnings_out:
+                warning_text = "No stale-data warnings detected."
+            else:
+                warning_text = "Stale / action-needed notes:\n" + "\n".join(f"- {line}" for line in warnings_out)
+            warning_box = getattr(self.ui, "dashboardWarning_textBrowser", None)
+            if warning_box is not None:
+                warning_box.setPlainText(warning_text)
+        except Exception as exc:
+            warning_box = getattr(self.ui, "dashboardWarning_textBrowser", None)
+            if warning_box is not None:
+                warning_box.setPlainText(f"Dashboard refresh failed:\n{exc}")
 
     def setup_update_data_instruction_tabs(self):
         page = getattr(self.ui, "update_page", None)
@@ -14793,9 +17259,11 @@ class MainWindow(QMainWindow):
             f"Rows imported: {imported_count:,}"
         )
         self.set_meta_value("orders_last_import_display", display_text)
+        self.set_meta_value("orders_last_import_iso", datetime.now().isoformat(timespec="seconds"))
         browser = getattr(self.ui, "lastUpdateOrders_textBrowser_3", None)
         if browser is not None:
             browser.setPlainText(display_text)
+        self.refresh_dashboard()
 
         self.refresh_order_table_on_order_column()
         if self.current_item_number:
@@ -15175,9 +17643,11 @@ class MainWindow(QMainWindow):
             f"New customers added: {customers_added:,}"
         )
         self.set_meta_value("sales_last_import_display", display_text)
+        self.set_meta_value("sales_last_import_iso", datetime.now().isoformat(timespec="seconds"))
         browser = getattr(self.ui, "lastUpdateSales_textBrowser", None)
         if browser is not None:
             browser.setPlainText(display_text)
+        self.refresh_dashboard()
 
         self.load_reference_lists()
         self.setup_customer_autocomplete()
@@ -15511,9 +17981,11 @@ class MainWindow(QMainWindow):
             f"Rows imported: {imported_count:,}"
         )
         self.set_meta_value("cover_orders_last_import_display", display_text)
+        self.set_meta_value("cover_orders_last_import_iso", datetime.now().isoformat(timespec="seconds"))
         browser = getattr(self.ui, "lastUpdateCoverOrders_textBrowser", None)
         if browser is not None:
             browser.setPlainText(display_text)
+        self.refresh_dashboard()
 
         self.rerun_search_if_ready()
         self.close_import_progress(progress)
@@ -15666,9 +18138,11 @@ class MainWindow(QMainWindow):
             f"Rows imported: {imported_count:,}"
         )
         self.set_meta_value("stock_last_import_display", display_text)
+        self.set_meta_value("stock_last_import_iso", datetime.now().isoformat(timespec="seconds"))
         browser = getattr(self.ui, "lastUPdateStock_textBrowser_2", None)
         if browser is not None:
             browser.setPlainText(display_text)
+        self.refresh_dashboard()
 
         self.rerun_item_if_ready()
         self.rerun_order_analysis_if_ready()
@@ -20829,6 +23303,18 @@ $mail.Display()
         self.apply_order_analysis_filters()
 
         visible_rows = table.rowCount() if table is not None else 0
+        if critical_only:
+            now = datetime.now()
+            self.set_meta_value("critical_order_analysis_last_run_iso", now.isoformat(timespec="seconds"))
+            self.set_meta_value(
+                "critical_order_analysis_last_run_display",
+                f"Last run: {now.strftime('%d/%m/%Y %H:%M')}\n"
+                f"Rows shown: {visible_rows:,}\n"
+                f"Range: {start_date.strftime('%d/%m/%Y')} - {end_date.strftime('%d/%m/%Y')}"
+            )
+            self.set_meta_value("critical_order_analysis_last_count", str(visible_rows))
+            self.store_dashboard_critical_summary(rows_to_show)
+            self.refresh_dashboard()
         if critical_only and visible_rows == 0 and show_warning:
             QMessageBox.information(
                 self,
