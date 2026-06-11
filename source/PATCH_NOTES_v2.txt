@@ -1,0 +1,17 @@
+Windsor Widget Collaboration Patch v2
+
+Changes:
+- Fixed datetime.utcnow() deprecation warnings by using timezone-aware UTC timestamps.
+- Fixed missing Active users indicators on To Order and Build Container by looking up UI-owned widgets correctly.
+- Made Active user labels more visible.
+- Added dashboard card: "This App User".
+- Added dashboard button: "Edit User".
+- Editing the app user updates the local identity file and presence record.
+- Bumped APP_VERSION to 1.3.1.
+
+Install:
+- Replace main_patched_status_yu.py with the patched file.
+- Run: python main_patched_status_yu.py
+
+Identity file:
+- Windows: %LOCALAPPDATA%\WindsorWidget\user_instance.json

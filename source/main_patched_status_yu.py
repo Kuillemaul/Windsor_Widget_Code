@@ -2,6 +2,10 @@ import sys
 import re
 import math
 import difflib
+import getpass
+import hashlib
+import socket
+import uuid
 try:
     import pyodbc
 except Exception:
@@ -32,7 +36,7 @@ try:
 except Exception:
     certifi = None
 from pathlib import Path
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from collections import Counter
 
 from PySide6.QtCore import Qt, QDate, QSettings, QMargins, QUrl, QEvent, QSignalBlocker, QTimer, QObject, Signal, QCoreApplication, QMetaObject, QSize
@@ -74,6 +78,7 @@ from PySide6.QtWidgets import (
     QDateEdit,
     QFileDialog,
     QInputDialog,
+    QColorDialog,
     QProgressDialog,
     QCheckBox,
     QTableView,
@@ -111,7 +116,7 @@ from yu_order_workflow import YUOrderEntryDialog, load_yu_review_module
 TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
 TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
 TABLE_FORMAT_SETTINGS_PREFIX = "table_format"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.3"
 APP_DESIGNER = "Bradley Mayze"
 # After the one-time no-space item-number migration, sales/order/stock tables
 # store canonical item numbers.  Keep runtime item-number resolution for entry/import,
@@ -275,6 +280,7 @@ def qt_object_is_alive(obj):
         return True
 
 TABLE_SORT_ROLE = Qt.UserRole + 950
+EDIT_AUDIT_ROLE = Qt.UserRole + 951
 
 
 def _sortable_role_value(item):
@@ -5354,10 +5360,27 @@ class Ui_MainWindow(object):
         self.dashboardDatabase_value = self._summary_card(snapshot_frame, "Database", "-", "dashboardDatabase_value", 200)
         self.dashboardCriticalCount_value = self._summary_card(snapshot_frame, "Last Critical Count", "-", "dashboardCriticalCount_value", 180)
         self.dashboardInboundCount_value = self._summary_card(snapshot_frame, "Shipments Inbound", "-", "dashboardInboundCount_value", 190)
-        for value_label in (self.dashboardAppVersion_value, self.dashboardDatabase_value, self.dashboardCriticalCount_value, self.dashboardInboundCount_value):
+        self.dashboardCollaborationUser_value = self._summary_card(snapshot_frame, "This App User", "-", "dashboardCollaborationUser_value", 230)
+        user_card = self.dashboardCollaborationUser_value.parentWidget()
+        self.dashboardEditUser_button = QPushButton("Edit User", user_card)
+        self.dashboardEditUser_button.setObjectName("dashboardEditUser_button")
+        self.dashboardEditUser_button.setMinimumHeight(26)
+        self.dashboardEditUser_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        try:
+            user_card.layout().addWidget(self.dashboardEditUser_button, alignment=Qt.AlignCenter)
+        except Exception:
+            pass
+
+        for value_label in (
+            self.dashboardAppVersion_value,
+            self.dashboardDatabase_value,
+            self.dashboardCriticalCount_value,
+            self.dashboardInboundCount_value,
+            self.dashboardCollaborationUser_value,
+        ):
             card_widget = value_label.parentWidget()
             card_widget.setMinimumHeight(70)
-            card_widget.setMaximumHeight(98)
+            card_widget.setMaximumHeight(118 if value_label is self.dashboardCollaborationUser_value else 98)
             card_widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
             value_label.setWordWrap(True)
             snapshot_row.addWidget(card_widget)
@@ -6465,6 +6488,7 @@ class Ui_MainWindow(object):
         actions = QFrame(self.frame_23)
         actions.setObjectName("toOrderActions_frame")
         actions.setFrameShape(QFrame.NoFrame)
+        actions.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         actions_layout = QHBoxLayout(actions)
         actions_layout.setContentsMargins(0, 0, 0, 0)
         actions_layout.setSpacing(8)
@@ -6477,9 +6501,19 @@ class Ui_MainWindow(object):
         self.createYUOrder_pushButton.setObjectName("createYUOrder_pushButton")
         self.createYUOrder_pushButton.setMinimumWidth(142)
 
+        self.toOrderUsers_label = QLabel("Active: -", actions)
+        self.toOrderUsers_label.setObjectName("toOrderUsers_label")
+        self.toOrderUsers_label.setMinimumWidth(420)
+        self.toOrderUsers_label.setMinimumHeight(30)
+        self.toOrderUsers_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.toOrderUsers_label.setWordWrap(False)
+        self.toOrderUsers_label.setToolTip("People with this screen open. Updates every few seconds.")
+        self.toOrderUsers_label.setStyleSheet("padding: 4px 8px; border: 1px solid #8a94a3; border-radius: 6px; font-weight: 700;")
+
         actions_layout.addWidget(self.updateOrders_button)
         actions_layout.addWidget(self.createYUOrder_pushButton)
-        self.horizontalLayout_9.addWidget(actions, 0)
+        actions_layout.addWidget(self.toOrderUsers_label, 1)
+        self.horizontalLayout_9.addWidget(actions, 1)
 
         table_card = QFrame(self.toOrderSheet_page)
         table_card.setObjectName("toOrderTable_frame")
@@ -7207,6 +7241,7 @@ class MainWindow(QMainWindow):
         self.order_priority_column = 5
         self.order_status_column = self.order_priority_column
         self.order_remove_column = 6
+        self.order_edit_column = 7
         self._updating_container_table = False
         self._spin_arrow_icon_cache = {}
         self.container_item_completer = None
@@ -7235,6 +7270,7 @@ class MainWindow(QMainWindow):
             "urgent": 6,
             "additional": 7,
             "remove": 8,
+            "edit": 9,
         }
         self.container_sort_column = None
         self.container_sort_descending = False
@@ -7257,6 +7293,12 @@ class MainWindow(QMainWindow):
         self.live_page_refresh_interval_ms = 4000
         self.live_page_refresh_timer = None
         self._live_page_refresh_busy = False
+        self.collaboration_presence_ttl_seconds = 45
+        self.collaboration_user_profile = self.load_or_create_collaboration_user_profile()
+        self.collaboration_session_id = f"{self.collaboration_user_profile.get('local_user_id', uuid.uuid4().hex)}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        self.collaboration_labels = {}
+        self.collaboration_loaded_revisions = {}
+        self._collaboration_busy = False
 
         self.setup_navigation()
         self.add_left_shipments_nav_button()
@@ -7265,9 +7307,11 @@ class MainWindow(QMainWindow):
 
         self.open_database()
         self.ensure_app_meta_table()
+        self.ensure_collaboration_tables()
         self.ensure_to_order_lines_table()
         self.ensure_on_order_lines_table()
         self.ensure_on_order_meta_table()
+        self.ensure_edit_audit_columns()
         self.ensure_supplier_master_table()
         self.ensure_sales_optional_columns()
         self.ensure_customer_flag_columns()
@@ -7689,6 +7733,8 @@ class MainWindow(QMainWindow):
         self._install_to_order_refresh_button()
         self._install_on_order_refresh_button()
         self._install_build_container_refresh_button()
+        self._install_collaboration_indicators()
+        self.update_collaboration_for_current_page()
 
         if self.live_page_refresh_timer is None:
             timer = QTimer(self)
@@ -7834,6 +7880,8 @@ class MainWindow(QMainWindow):
         current_page = stacked_widget.currentWidget() if stacked_widget is not None else None
         if current_page is None:
             return False
+
+        self.update_collaboration_for_current_page()
 
         to_order_page = getattr(self.ui, "toOrderSheet_page", None)
         on_order_page = getattr(self.ui, "onOrder_page", None)
@@ -8299,6 +8347,7 @@ class MainWindow(QMainWindow):
 
     def handle_stacked_widget_changed(self, *_args):
         self.update_navigation_button_highlight()
+        self.update_collaboration_for_current_page()
         self.refresh_page_data_on_navigation()
 
     def refresh_page_data_on_navigation(self):
@@ -9200,6 +9249,10 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         try:
+            self.remove_collaboration_presence()
+        except Exception:
+            pass
+        try:
             if self.db_conn is not None:
                 self.db_conn.close()
         finally:
@@ -9707,6 +9760,707 @@ class MainWindow(QMainWindow):
         self.update_item_status_controls(PLANNING_STATUS_ACTIVE)
 
 
+
+    # ------------------------------------------------------------------
+    # Multi-user presence + optimistic save guards
+    # ------------------------------------------------------------------
+    def collaboration_data_dir(self):
+        candidates = [
+            os.environ.get("LOCALAPPDATA"),
+            os.environ.get("APPDATA"),
+            str(Path.home() / "AppData" / "Local") if os.name == "nt" else "",
+            str(Path.home()),
+            tempfile.gettempdir(),
+        ]
+        base = next((Path(value) for value in candidates if value), Path(tempfile.gettempdir()))
+        return base / "WindsorWidget"
+
+    def collaboration_identity_file_path(self):
+        return self.collaboration_data_dir() / "user_instance.json"
+
+    def load_or_create_collaboration_user_profile(self):
+        path = self.collaboration_identity_file_path()
+        machine_name = socket.gethostname() or platform.node() or "PC"
+        user_name = getpass.getuser() or os.environ.get("USERNAME") or os.environ.get("USER") or "User"
+        profile = {}
+        try:
+            if path.exists():
+                profile = json.loads(path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            profile = {}
+
+        changed = False
+        if not str(profile.get("local_user_id") or "").strip():
+            profile["local_user_id"] = uuid.uuid4().hex
+            changed = True
+        if not str(profile.get("user_name") or "").strip():
+            profile["user_name"] = user_name
+            changed = True
+        if not str(profile.get("machine_name") or "").strip():
+            profile["machine_name"] = machine_name
+            changed = True
+        if not str(profile.get("display_name") or "").strip():
+            profile["display_name"] = f"{profile.get('user_name', user_name)}@{profile.get('machine_name', machine_name)}"
+            changed = True
+        if not re.match(r"^#[0-9A-Fa-f]{6}$", str(profile.get("edit_color") or "")):
+            seed = str(profile.get("local_user_id") or profile.get("display_name") or user_name)
+            digest = hashlib.sha1(seed.encode("utf-8", "ignore")).hexdigest()
+            palette = ["#D9534F", "#F0AD4E", "#5CB85C", "#5BC0DE", "#428BCA", "#7E57C2", "#EC407A", "#26A69A"]
+            profile["edit_color"] = palette[int(digest[:2], 16) % len(palette)]
+            changed = True
+        profile["identity_file"] = str(path)
+
+        if changed or not path.exists():
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(profile, indent=2, sort_keys=True), encoding="utf-8")
+            except Exception:
+                pass
+        return profile
+
+    def save_collaboration_user_profile(self):
+        profile = dict(getattr(self, "collaboration_user_profile", {}) or {})
+        path = self.collaboration_identity_file_path()
+        profile["identity_file"] = str(path)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(profile, indent=2, sort_keys=True), encoding="utf-8")
+        except Exception:
+            pass
+        self.collaboration_user_profile = profile
+        return profile
+
+    def collaboration_display_name(self):
+        profile = getattr(self, "collaboration_user_profile", {}) or {}
+        return str(profile.get("display_name") or profile.get("user_name") or "User").strip() or "User"
+
+    def collaboration_edit_color(self):
+        profile = getattr(self, "collaboration_user_profile", {}) or {}
+        color = str(profile.get("edit_color") or "").strip()
+        if re.match(r"^#[0-9A-Fa-f]{6}$", color):
+            return color.upper()
+
+        # Stable fallback colour from the local user id.  This avoids every new PC showing the same edit colour.
+        seed = str(profile.get("local_user_id") or profile.get("display_name") or profile.get("user_name") or "User")
+        digest = hashlib.sha1(seed.encode("utf-8", "ignore")).hexdigest()
+        palette = ["#D9534F", "#F0AD4E", "#5CB85C", "#5BC0DE", "#428BCA", "#7E57C2", "#EC407A", "#26A69A"]
+        try:
+            return palette[int(digest[:2], 16) % len(palette)]
+        except Exception:
+            return "#428BCA"
+
+    def refresh_collaboration_user_dashboard_card(self):
+        profile = getattr(self, "collaboration_user_profile", {}) or {}
+        display_name = self.collaboration_display_name()
+        machine_name = str(profile.get("machine_name") or "").strip()
+        identity_file = str(profile.get("identity_file") or self.collaboration_identity_file_path())
+        edit_color = self.collaboration_edit_color()
+        text = f"{display_name}\nEdit colour: {edit_color}"
+        if machine_name and machine_name.casefold() not in display_name.casefold():
+            text += f"\n{machine_name}"
+        self.set_dashboard_label_text("dashboardCollaborationUser_value", text)
+        value_label = getattr(self.ui, "dashboardCollaborationUser_value", None)
+        if value_label is not None:
+            try:
+                value_label.setToolTip(f"Presence name: {display_name}\nEdit colour: {edit_color}\nIdentity file: {identity_file}")
+                value_label.setStyleSheet(f"border-left: 10px solid {edit_color}; padding-left: 8px;")
+            except Exception:
+                pass
+
+    def edit_collaboration_user_name(self):
+        current_name = self.collaboration_display_name()
+        current_color = self.collaboration_edit_color()
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Edit App User")
+        dialog.resize(460, 180)
+        layout = QVBoxLayout(dialog)
+        form = QFormLayout()
+
+        name_edit = QLineEdit(dialog)
+        name_edit.setText(current_name)
+        name_edit.setPlaceholderText("Name shown to other Windsor Widget users")
+        form.addRow("User name", name_edit)
+
+        colour_row = QHBoxLayout()
+        colour_preview = QLabel("     ", dialog)
+        colour_preview.setMinimumWidth(48)
+        colour_preview.setMinimumHeight(28)
+        colour_preview.setStyleSheet(f"background: {current_color}; border: 1px solid #888; border-radius: 4px;")
+        colour_button = QPushButton("Choose Colour", dialog)
+        colour_row.addWidget(colour_preview)
+        colour_row.addWidget(colour_button)
+        colour_row.addStretch(1)
+        form.addRow("Edit colour", colour_row)
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=dialog)
+        layout.addWidget(buttons)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+
+        selected_color = {"value": current_color}
+
+        def choose_colour():
+            colour = QColorDialog.getColor(QColor(selected_color["value"]), dialog, "Choose Edit Colour")
+            if colour.isValid():
+                selected_color["value"] = colour.name().upper()
+                colour_preview.setStyleSheet(f"background: {selected_color['value']}; border: 1px solid #888; border-radius: 4px;")
+
+        colour_button.clicked.connect(choose_colour)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+        new_name = str(name_edit.text() or "").strip()
+        if not new_name:
+            QMessageBox.warning(self, "Edit App User", "The user name cannot be blank.")
+            return
+        profile = dict(getattr(self, "collaboration_user_profile", {}) or {})
+        profile["display_name"] = new_name
+        profile["edit_color"] = selected_color["value"]
+        self.collaboration_user_profile = profile
+        self.save_collaboration_user_profile()
+        self.refresh_collaboration_user_dashboard_card()
+        self.update_collaboration_for_current_page()
+        self.refresh_collaboration_indicators()
+        self._show_refresh_message(f"App user changed to {new_name}")
+
+    def ensure_edit_audit_columns(self):
+        """Add last-edit metadata columns to shared editable line tables.
+
+        These columns are intentionally simple text fields.  They survive full-snapshot saves
+        and let the UI show who last touched each line without needing a separate audit log.
+        """
+        if self.db_conn is None:
+            return
+        targets = ("to_order_lines", "on_order_lines", "container_lines")
+        desired = (
+            ("edit_user_id", "NVARCHAR(100) NULL", "TEXT"),
+            ("edit_display_name", "NVARCHAR(255) NULL", "TEXT"),
+            ("edit_machine_name", "NVARCHAR(255) NULL", "TEXT"),
+            ("edit_color", "NVARCHAR(20) NULL", "TEXT"),
+            ("edit_at", "NVARCHAR(40) NULL", "TEXT"),
+        )
+        cur = self.db_conn.cursor()
+        for table_name in targets:
+            try:
+                if not self.has_table(table_name):
+                    continue
+                existing = {str(name).lower() for name in self.get_table_columns(table_name)}
+                for column_name, sqlserver_type, sqlite_type in desired:
+                    if column_name.lower() in existing:
+                        continue
+                    if self.db_engine == "sqlserver":
+                        cur.execute(f"ALTER TABLE {table_name} ADD [{column_name}] {sqlserver_type}")
+                    else:
+                        cur.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {sqlite_type}")
+                    existing.add(column_name.lower())
+            except Exception:
+                # Never block app startup because an optional marker column could not be added.
+                continue
+        try:
+            self.db_conn.commit()
+        except Exception:
+            pass
+
+    def current_edit_audit_metadata(self):
+        profile = dict(getattr(self, "collaboration_user_profile", {}) or {})
+        return {
+            "edit_user_id": str(profile.get("local_user_id") or "").strip(),
+            "edit_display_name": self.collaboration_display_name(),
+            "edit_machine_name": str(profile.get("machine_name") or socket.gethostname() or "").strip(),
+            "edit_color": self.collaboration_edit_color(),
+            "edit_at": self.collaboration_utc_now_text(),
+        }
+
+    def normalise_edit_audit_metadata(self, data=None):
+        data = dict(data or {})
+        color = str(data.get("edit_color") or "").strip()
+        if not re.match(r"^#[0-9A-Fa-f]{6}$", color):
+            color = "#777777"
+        return {
+            "edit_user_id": str(data.get("edit_user_id") or "").strip(),
+            "edit_display_name": str(data.get("edit_display_name") or data.get("updated_by") or "Unknown").strip() or "Unknown",
+            "edit_machine_name": str(data.get("edit_machine_name") or "").strip(),
+            "edit_color": color.upper(),
+            "edit_at": str(data.get("edit_at") or "").strip(),
+        }
+
+    def edit_audit_tooltip_text(self, metadata):
+        meta = self.normalise_edit_audit_metadata(metadata)
+        lines = [f"Last edited by: {meta['edit_display_name']}"]
+        if meta["edit_machine_name"]:
+            lines.append(f"Machine: {meta['edit_machine_name']}")
+        if meta["edit_at"]:
+            lines.append(f"Time: {meta['edit_at']}")
+        if meta["edit_user_id"]:
+            lines.append(f"User ID: {meta['edit_user_id']}")
+        return "\n".join(lines)
+
+    def make_edit_audit_item(self, metadata=None):
+        meta = self.normalise_edit_audit_metadata(metadata)
+        item = QTableWidgetItem("")
+        item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+        item.setTextAlignment(Qt.AlignCenter)
+        item.setData(EDIT_AUDIT_ROLE, meta)
+        item.setToolTip(self.edit_audit_tooltip_text(meta))
+        try:
+            item.setBackground(QBrush(QColor(meta["edit_color"])))
+        except Exception:
+            item.setBackground(QBrush(QColor("#777777")))
+        return item
+
+    def get_row_edit_audit_metadata(self, table, row, column):
+        if table is None or row < 0 or column is None or column < 0 or column >= table.columnCount():
+            return self.current_edit_audit_metadata()
+        item = table.item(row, column)
+        data = item.data(EDIT_AUDIT_ROLE) if item is not None else None
+        if not isinstance(data, dict):
+            return self.current_edit_audit_metadata()
+        return self.normalise_edit_audit_metadata(data)
+
+    def set_row_edit_audit_metadata(self, table, row, column, metadata=None):
+        if table is None or row < 0 or column is None or column < 0 or column >= table.columnCount():
+            return
+        table.setItem(row, column, self.make_edit_audit_item(metadata or self.current_edit_audit_metadata()))
+
+    def mark_row_edited_by_current_user(self, table, row, column):
+        self.set_row_edit_audit_metadata(table, row, column, self.current_edit_audit_metadata())
+
+    def ensure_collaboration_tables(self):
+        if self.db_conn is None:
+            return
+        cur = self.db_conn.cursor()
+        if self.db_engine == "sqlserver":
+            cur.execute(
+                """
+                IF OBJECT_ID('dbo.collaboration_presence', 'U') IS NULL
+                BEGIN
+                    CREATE TABLE dbo.collaboration_presence (
+                        session_id NVARCHAR(160) NOT NULL PRIMARY KEY,
+                        local_user_id NVARCHAR(100) NULL,
+                        display_name NVARCHAR(255) NULL,
+                        user_name NVARCHAR(255) NULL,
+                        machine_name NVARCHAR(255) NULL,
+                        page_key NVARCHAR(80) NULL,
+                        record_key NVARCHAR(255) NULL,
+                        app_version NVARCHAR(40) NULL,
+                        started_at NVARCHAR(40) NULL,
+                        last_seen NVARCHAR(40) NULL
+                    )
+                END
+                """
+            )
+            cur.execute(
+                """
+                IF OBJECT_ID('dbo.collaboration_state', 'U') IS NULL
+                BEGIN
+                    CREATE TABLE dbo.collaboration_state (
+                        scope_key NVARCHAR(80) NOT NULL,
+                        scope_detail NVARCHAR(255) NOT NULL DEFAULT '',
+                        revision INT NOT NULL DEFAULT 0,
+                        data_hash NVARCHAR(80) NULL,
+                        updated_at NVARCHAR(40) NULL,
+                        updated_by NVARCHAR(255) NULL,
+                        updated_instance NVARCHAR(160) NULL,
+                        CONSTRAINT PK_collaboration_state PRIMARY KEY (scope_key, scope_detail)
+                    )
+                END
+                """
+            )
+        else:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS collaboration_presence (
+                    session_id TEXT PRIMARY KEY,
+                    local_user_id TEXT,
+                    display_name TEXT,
+                    user_name TEXT,
+                    machine_name TEXT,
+                    page_key TEXT,
+                    record_key TEXT,
+                    app_version TEXT,
+                    started_at TEXT,
+                    last_seen TEXT
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS collaboration_state (
+                    scope_key TEXT NOT NULL,
+                    scope_detail TEXT NOT NULL DEFAULT '',
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    data_hash TEXT,
+                    updated_at TEXT,
+                    updated_by TEXT,
+                    updated_instance TEXT,
+                    PRIMARY KEY (scope_key, scope_detail)
+                )
+                """
+            )
+        self.db_conn.commit()
+
+    def collaboration_utc_now_text(self):
+        return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    def collaboration_cutoff_text(self):
+        ttl = int(getattr(self, "collaboration_presence_ttl_seconds", 45) or 45)
+        return (datetime.now(timezone.utc) - timedelta(seconds=ttl)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    def current_collaboration_scope(self):
+        stacked_widget = getattr(self.ui, "stackedWidget", None)
+        current_page = stacked_widget.currentWidget() if stacked_widget is not None else None
+        if current_page is getattr(self.ui, "toOrderSheet_page", None):
+            return "to_order", ""
+        if current_page is getattr(self.ui, "onOrder_page", None):
+            return "on_order", ""
+        if current_page is getattr(self.ui, "buildContainer_page", None):
+            return "container", (self.current_container_ref or self.get_container_ref_text() or "").strip()
+        return "", ""
+
+    def update_collaboration_for_current_page(self):
+        page_key, record_key = self.current_collaboration_scope()
+        if not page_key:
+            self.remove_collaboration_presence(commit=True)
+            self.refresh_collaboration_indicators()
+            return
+        self.update_collaboration_presence(page_key, record_key)
+        self.refresh_collaboration_indicators()
+
+    def update_collaboration_presence(self, page_key, record_key=""):
+        if self.db_conn is None or not self.has_table("collaboration_presence"):
+            return
+        profile = getattr(self, "collaboration_user_profile", {}) or {}
+        now_text = self.collaboration_utc_now_text()
+        cutoff_text = self.collaboration_cutoff_text()
+        display_name = str(profile.get("display_name") or profile.get("user_name") or "User").strip()
+        user_name = str(profile.get("user_name") or "").strip()
+        machine_name = str(profile.get("machine_name") or "").strip()
+        local_user_id = str(profile.get("local_user_id") or "").strip()
+        session_id = str(getattr(self, "collaboration_session_id", "") or uuid.uuid4().hex)
+        self.collaboration_session_id = session_id
+        page_key = str(page_key or "").strip()
+        record_key = str(record_key or "").strip()
+        cur = self.db_conn.cursor()
+        try:
+            cur.execute("DELETE FROM collaboration_presence WHERE COALESCE(last_seen, '') < ?", (cutoff_text,))
+        except Exception:
+            pass
+        cur.execute(
+            """
+            UPDATE collaboration_presence
+            SET local_user_id = ?, display_name = ?, user_name = ?, machine_name = ?,
+                page_key = ?, record_key = ?, app_version = ?, last_seen = ?
+            WHERE session_id = ?
+            """,
+            (local_user_id, display_name, user_name, machine_name, page_key, record_key, APP_VERSION, now_text, session_id),
+        )
+        if getattr(cur, "rowcount", 0) == 0:
+            cur.execute(
+                """
+                INSERT INTO collaboration_presence (
+                    session_id, local_user_id, display_name, user_name, machine_name,
+                    page_key, record_key, app_version, started_at, last_seen
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (session_id, local_user_id, display_name, user_name, machine_name, page_key, record_key, APP_VERSION, now_text, now_text),
+            )
+        self.db_conn.commit()
+
+    def remove_collaboration_presence(self, commit=True):
+        if self.db_conn is None or not self.has_table("collaboration_presence"):
+            return
+        session_id = str(getattr(self, "collaboration_session_id", "") or "").strip()
+        if not session_id:
+            return
+        cur = self.db_conn.cursor()
+        cur.execute("DELETE FROM collaboration_presence WHERE session_id = ?", (session_id,))
+        if commit:
+            self.db_conn.commit()
+
+    def active_collaboration_users(self, page_key, record_key=None):
+        if self.db_conn is None or not self.has_table("collaboration_presence"):
+            return []
+        cutoff_text = self.collaboration_cutoff_text()
+        params = [str(page_key or "").strip(), cutoff_text]
+        where_record = ""
+        if record_key is not None:
+            where_record = " AND COALESCE(record_key, '') = ?"
+            params.append(str(record_key or "").strip())
+        rows = self.db_all(
+            f"""
+            SELECT display_name, user_name, machine_name, record_key, session_id, last_seen
+            FROM collaboration_presence
+            WHERE page_key = ?
+              AND COALESCE(last_seen, '') >= ?
+              {where_record}
+            ORDER BY display_name, machine_name, session_id
+            """,
+            params,
+        )
+        users = []
+        seen = set()
+        for row in rows:
+            display_name = str(row.get("display_name") or row.get("user_name") or "User").strip()
+            machine_name = str(row.get("machine_name") or "").strip()
+            record = str(row.get("record_key") or "").strip()
+            label = display_name
+            if machine_name and machine_name.casefold() not in label.casefold():
+                label = f"{label} ({machine_name})"
+            if page_key == "container" and record:
+                label = f"{label}: {record}"
+            key = (label.casefold(), str(row.get("session_id") or ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            users.append(label)
+        return users
+
+    def _install_collaboration_indicators(self):
+        if getattr(self, "collaboration_labels", None) is None:
+            self.collaboration_labels = {}
+
+        def ui_attr(name):
+            value = getattr(self, name, None)
+            if value is not None:
+                return value
+            return getattr(getattr(self, "ui", None), name, None)
+
+        def style_label(label, min_width=420):
+            if label is None:
+                return label
+            try:
+                label.setProperty("role", "metricPill")
+                label.setMinimumWidth(min_width)
+                label.setMinimumHeight(30)
+                label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                label.setWordWrap(False)
+                label.setToolTip("People with this screen open. Updates every few seconds.")
+                label.setStyleSheet("padding: 4px 8px; border: 1px solid #8a94a3; border-radius: 6px; font-weight: 700;")
+            except Exception:
+                pass
+            return label
+
+        def make_label(parent, object_name, min_width=420):
+            label = QLabel("Active: -", parent)
+            label.setObjectName(object_name)
+            return style_label(label, min_width=min_width)
+
+        if "to_order" not in self.collaboration_labels:
+            existing = ui_attr("toOrderUsers_label")
+            if existing is not None:
+                self.collaboration_labels["to_order"] = style_label(existing, 420)
+            else:
+                parent = ui_attr("toOrderActions_frame")
+                layout = parent.layout() if parent is not None else None
+                if parent is not None and layout is not None:
+                    label = make_label(parent, "toOrderUsers_label", 420)
+                    try:
+                        layout.addWidget(label, 1)
+                    except Exception:
+                        pass
+                    self.collaboration_labels["to_order"] = label
+
+        if "on_order" not in self.collaboration_labels:
+            existing = ui_attr("onOrderUsers_label")
+            if existing is not None:
+                self.collaboration_labels["on_order"] = style_label(existing, 440)
+            else:
+                parent = ui_attr("onOrderAction_frame")
+                layout = parent.layout() if parent is not None else None
+                if parent is not None and layout is not None:
+                    label = make_label(parent, "onOrderUsers_label", 440)
+                    stretch_index = max(0, layout.count() - 1)
+                    try:
+                        layout.insertWidget(stretch_index, label, 1)
+                    except Exception:
+                        try:
+                            layout.addWidget(label, 1)
+                        except Exception:
+                            pass
+                    self.collaboration_labels["on_order"] = label
+
+        if "container" not in self.collaboration_labels:
+            existing = ui_attr("buildContainerUsers_label")
+            if existing is not None:
+                self.collaboration_labels["container"] = style_label(existing, 420)
+            else:
+                parent = ui_attr("frame_29")
+                layout = ui_attr("horizontalLayout_11")
+                if parent is not None and layout is not None:
+                    label = make_label(parent, "buildContainerUsers_label", 420)
+                    try:
+                        # Visible in the header grid, beside the Additional/Dog Lead row.
+                        layout.addWidget(label, 1, 6, 1, 2)
+                        layout.setColumnStretch(6, 1)
+                    except Exception:
+                        try:
+                            layout.addWidget(label)
+                        except Exception:
+                            pass
+                    self.collaboration_labels["container"] = label
+
+        self.refresh_collaboration_indicators()
+
+    def refresh_collaboration_indicators(self):
+        labels = getattr(self, "collaboration_labels", {}) or {}
+        for page_key, label in list(labels.items()):
+            if label is None or not qt_object_is_alive(label):
+                continue
+            try:
+                users = self.active_collaboration_users(page_key, None)
+            except Exception:
+                users = []
+            if users:
+                text = "Active: " + ", ".join(users[:4])
+                if len(users) > 4:
+                    text += f" +{len(users) - 4}"
+            else:
+                text = "Active: -"
+            try:
+                label.setText(text)
+            except Exception:
+                pass
+
+    def _collaboration_scope_key(self, scope_key, scope_detail=""):
+        return (str(scope_key or "").strip(), str(scope_detail or "").strip())
+
+    def collaboration_state_row(self, scope_key, scope_detail=""):
+        if self.db_conn is None or not self.has_table("collaboration_state"):
+            return None
+        return self.db_one(
+            """
+            SELECT scope_key, scope_detail, revision, data_hash, updated_at, updated_by, updated_instance
+            FROM collaboration_state
+            WHERE scope_key = ? AND scope_detail = ?
+            """,
+            (str(scope_key or "").strip(), str(scope_detail or "").strip()),
+        )
+
+    def collaboration_revision(self, scope_key, scope_detail=""):
+        row = self.collaboration_state_row(scope_key, scope_detail)
+        if row is None:
+            return 0
+        try:
+            return int(row.get("revision") or 0)
+        except Exception:
+            return 0
+
+    def mark_collaboration_state_loaded(self, scope_key, scope_detail=""):
+        key = self._collaboration_scope_key(scope_key, scope_detail)
+        try:
+            self.collaboration_loaded_revisions[key] = self.collaboration_revision(scope_key, scope_detail)
+        except Exception:
+            self.collaboration_loaded_revisions[key] = 0
+
+    def collaboration_data_hash(self, payload):
+        try:
+            data = json.dumps(payload, sort_keys=True, default=str, ensure_ascii=False)
+        except Exception:
+            data = repr(payload)
+        return hashlib.sha256(data.encode("utf-8", errors="replace")).hexdigest()
+
+    def check_collaboration_save_allowed(self, scope_key, scope_detail="", title="This screen"):
+        if self.db_conn is None or not self.has_table("collaboration_state"):
+            return True
+        key = self._collaboration_scope_key(scope_key, scope_detail)
+        current_row = self.collaboration_state_row(scope_key, scope_detail)
+        current_revision = 0
+        updated_by = "another user"
+        updated_at = ""
+        if current_row is not None:
+            try:
+                current_revision = int(current_row.get("revision") or 0)
+            except Exception:
+                current_revision = 0
+            updated_by = str(current_row.get("updated_by") or updated_by)
+            updated_at = str(current_row.get("updated_at") or "")
+        loaded_revision = self.collaboration_loaded_revisions.get(key)
+        if loaded_revision is None:
+            self.collaboration_loaded_revisions[key] = current_revision
+            return True
+        if int(loaded_revision or 0) == current_revision:
+            return True
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Shared edit warning")
+        detail_text = f"\n\nLast saved by: {updated_by}"
+        if updated_at:
+            detail_text += f"\nSaved at: {updated_at}"
+        box.setText(
+            f"{title} has changed in the database since this copy was loaded."
+            f"{detail_text}\n\nReload is safest. Overwrite will replace their latest changes with your current screen."
+        )
+        reload_button = box.addButton("Reload", QMessageBox.AcceptRole)
+        overwrite_button = box.addButton("Overwrite", QMessageBox.DestructiveRole)
+        cancel_button = box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(reload_button)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is overwrite_button:
+            self.collaboration_loaded_revisions[key] = current_revision
+            return True
+        if clicked is reload_button:
+            self.reload_collaboration_scope(scope_key, scope_detail)
+        return False
+
+    def bump_collaboration_revision(self, scope_key, scope_detail="", payload=None):
+        if self.db_conn is None or not self.has_table("collaboration_state"):
+            return 0
+        scope_key = str(scope_key or "").strip()
+        scope_detail = str(scope_detail or "").strip()
+        row = self.collaboration_state_row(scope_key, scope_detail)
+        current_revision = 0 if row is None else int(row.get("revision") or 0)
+        new_revision = current_revision + 1
+        now_text = self.collaboration_utc_now_text()
+        profile = getattr(self, "collaboration_user_profile", {}) or {}
+        updated_by = str(profile.get("display_name") or profile.get("user_name") or "User").strip()
+        updated_instance = str(getattr(self, "collaboration_session_id", "") or "").strip()
+        data_hash = self.collaboration_data_hash(payload if payload is not None else {})
+        cur = self.db_conn.cursor()
+        cur.execute(
+            """
+            UPDATE collaboration_state
+            SET revision = ?, data_hash = ?, updated_at = ?, updated_by = ?, updated_instance = ?
+            WHERE scope_key = ? AND scope_detail = ?
+            """,
+            (new_revision, data_hash, now_text, updated_by, updated_instance, scope_key, scope_detail),
+        )
+        if getattr(cur, "rowcount", 0) == 0:
+            cur.execute(
+                """
+                INSERT INTO collaboration_state (scope_key, scope_detail, revision, data_hash, updated_at, updated_by, updated_instance)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (scope_key, scope_detail, new_revision, data_hash, now_text, updated_by, updated_instance),
+            )
+        self.db_conn.commit()
+        self.collaboration_loaded_revisions[self._collaboration_scope_key(scope_key, scope_detail)] = new_revision
+        return new_revision
+
+    def reload_collaboration_scope(self, scope_key, scope_detail=""):
+        scope_key = str(scope_key or "").strip()
+        scope_detail = str(scope_detail or "").strip()
+        if scope_key == "to_order":
+            self.load_saved_order_lines()
+            self.refresh_order_table_on_order_column()
+            self.refresh_item_summary_context_boxes()
+        elif scope_key == "on_order":
+            self.load_saved_on_order_lines()
+            self.refresh_on_order_statuses_from_container_data(persist=False)
+            self.refresh_item_summary_context_boxes()
+        elif scope_key == "on_order_comments":
+            self.load_on_order_general_comments()
+        elif scope_key == "container":
+            if scope_detail:
+                self.current_container_ref = scope_detail
+                self.reload_current_container_state()
+            else:
+                self.refresh_build_container_page_data(manual=False)
+        self.refresh_collaboration_indicators()
+
     def ensure_supplier_master_table(self):
         cur = self.db_conn.cursor()
 
@@ -10156,12 +10910,14 @@ class MainWindow(QMainWindow):
             widget.setMinimumHeight(32)
             widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        self.onOrderOrderNumber_lineEdit.setMinimumWidth(170)
-        self.onOrderItem_lineEdit.setMinimumWidth(240)
-        self.onOrderQty_lineEdit.setMinimumWidth(100)
-        self.onOrderQty_lineEdit.setMaximumWidth(140)
-        self.onOrderReadyDate_dateEdit.setMinimumWidth(130)
-        self.onOrderComments_lineEdit.setMinimumWidth(260)
+        self.onOrderOrderNumber_lineEdit.setMinimumWidth(150)
+        self.onOrderItem_lineEdit.setMinimumWidth(160)
+        self.onOrderItem_lineEdit.setMaximumWidth(240)
+        self.onOrderQty_lineEdit.setMinimumWidth(90)
+        self.onOrderQty_lineEdit.setMaximumWidth(120)
+        self.onOrderReadyDate_dateEdit.setMinimumWidth(120)
+        self.onOrderComments_lineEdit.setMinimumWidth(160)
+        self.onOrderComments_lineEdit.setMaximumWidth(280)
 
         self.onOrderAdd_button = QPushButton("Add Line", entry_frame)
         self.onOrderAdd_button.setObjectName("onOrderAdd_button")
@@ -10175,7 +10931,16 @@ class MainWindow(QMainWindow):
         action_layout = QHBoxLayout(self.onOrderAction_frame)
         action_layout.setContentsMargins(0, 0, 0, 0)
         action_layout.setSpacing(8)
+        self.onOrderUsers_label = QLabel("Active: -", self.onOrderAction_frame)
+        self.onOrderUsers_label.setObjectName("onOrderUsers_label")
+        self.onOrderUsers_label.setMinimumWidth(440)
+        self.onOrderUsers_label.setMinimumHeight(30)
+        self.onOrderUsers_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.onOrderUsers_label.setWordWrap(False)
+        self.onOrderUsers_label.setToolTip("People with this screen open. Updates every few seconds.")
+        self.onOrderUsers_label.setStyleSheet("padding: 4px 8px; border: 1px solid #8a94a3; border-radius: 6px; font-weight: 700;")
         action_layout.addWidget(self.onOrderAdd_button)
+        action_layout.addWidget(self.onOrderUsers_label, 1)
         action_layout.addStretch(1)
 
         entry_grid.addWidget(self.onOrderOrderNumber_label, 0, 0)
@@ -10187,8 +10952,8 @@ class MainWindow(QMainWindow):
         entry_grid.addWidget(self.onOrderReadyDate_label, 1, 0)
         entry_grid.addWidget(self.onOrderReadyDate_dateEdit, 1, 1)
         entry_grid.addWidget(self.onOrderComments_label, 1, 2)
-        entry_grid.addWidget(self.onOrderComments_lineEdit, 1, 3, 1, 3)
-        entry_grid.addWidget(self.onOrderAction_frame, 1, 6, 1, 2)
+        entry_grid.addWidget(self.onOrderComments_lineEdit, 1, 3, 1, 2)
+        entry_grid.addWidget(self.onOrderAction_frame, 1, 5, 1, 3)
         entry_grid.setColumnStretch(3, 1)
         entry_grid.setColumnStretch(4, 1)
         entry_grid.setColumnStretch(5, 1)
@@ -10293,7 +11058,7 @@ class MainWindow(QMainWindow):
         if table is None:
             return
 
-        headers = ["Order No", "Item Number", "Description", "Qty", "Supplier", "Ready Date", "Comments", "Status", "Add To Container", "Remove"]
+        headers = ["Order No", "Item Number", "Description", "Qty", "Supplier", "Ready Date", "Comments", "Status", "Add To Container", "Remove", "Edit"]
         self.on_order_order_number_column = 0
         self.on_order_item_column = 1
         self.on_order_description_column = 2
@@ -10304,6 +11069,7 @@ class MainWindow(QMainWindow):
         self.on_order_status_column = 7
         self.on_order_add_column = 8
         self.on_order_remove_column = 9
+        self.on_order_edit_column = 10
 
         table.clear()
         table.setColumnCount(len(headers))
@@ -10319,6 +11085,8 @@ class MainWindow(QMainWindow):
         table.horizontalHeader().setSectionResizeMode(self.on_order_comments_column, QHeaderView.Stretch)
         for col in (self.on_order_qty_column, self.on_order_supplier_column, self.on_order_ready_date_column, self.on_order_status_column, self.on_order_add_column, self.on_order_remove_column):
             table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(self.on_order_edit_column, QHeaderView.Fixed)
+        table.setColumnWidth(self.on_order_edit_column, 34)
         table.setProperty("_table_font_settings_token", "main_window/on_order_table")
         table.setContextMenuPolicy(Qt.CustomContextMenu)
         table.customContextMenuRequested.connect(self.show_on_order_table_context_menu)
@@ -10354,7 +11122,7 @@ class MainWindow(QMainWindow):
             item = table.item(row, col)
             if item is None:
                 continue
-            if col in {self.on_order_status_column, self.on_order_add_column, self.on_order_remove_column}:
+            if col in {self.on_order_status_column, self.on_order_add_column, self.on_order_remove_column, getattr(self, "on_order_edit_column", -1)}:
                 continue
             if is_ready:
                 item.setBackground(QBrush(ready_bg))
@@ -10438,6 +11206,7 @@ class MainWindow(QMainWindow):
             table.setItem(row, self.on_order_status_column, self.build_on_order_status_item(line.get("status", "")))
             table.setItem(row, self.on_order_add_column, self.build_on_order_add_item())
             table.setItem(row, self.on_order_remove_column, self.build_on_order_remove_item())
+            self.set_row_edit_audit_metadata(table, row, self.on_order_edit_column, line)
             self.apply_on_order_row_styles(row)
 
         self._updating_on_order_table = False
@@ -10469,6 +11238,7 @@ class MainWindow(QMainWindow):
             status_text = status_item.text().strip().upper() if status_item is not None and status_item.text() else ""
             if not item_number:
                 continue
+            edit_meta = self.get_row_edit_audit_metadata(table, row, self.on_order_edit_column)
             rows.append({
                 "order_number": order_number,
                 "item_number": item_number,
@@ -10478,20 +11248,25 @@ class MainWindow(QMainWindow):
                 "ready_date": ready_date_value,
                 "comments": comments_text,
                 "status": status_text,
+                **edit_meta,
             })
         return rows
 
     def save_on_order_table_state(self):
         if self.db_conn is None or not self.has_table("on_order_lines"):
-            return
+            return False
         rows = self.get_on_order_table_rows()
+        if not self.check_collaboration_save_allowed("on_order", "", "On Order"):
+            return False
         cur = self.db_conn.cursor()
         cur.execute("DELETE FROM on_order_lines")
         for line_no, row in enumerate(rows, start=1):
             cur.execute(
                 """
-                INSERT INTO on_order_lines (line_no, order_number, item_number, description, qty, supplier_name, ready_date, comments, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO on_order_lines (
+                    line_no, order_number, item_number, description, qty, supplier_name, ready_date, comments, status,
+                    edit_user_id, edit_display_name, edit_machine_name, edit_color, edit_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     line_no,
@@ -10503,16 +11278,25 @@ class MainWindow(QMainWindow):
                     row.get("ready_date", ""),
                     row.get("comments", ""),
                     row.get("status", ""),
+                    row.get("edit_user_id", ""),
+                    row.get("edit_display_name", ""),
+                    row.get("edit_machine_name", ""),
+                    row.get("edit_color", ""),
+                    row.get("edit_at", ""),
                 ),
             )
         self.db_conn.commit()
+        self.bump_collaboration_revision("on_order", "", rows)
+        self.update_collaboration_for_current_page()
+        return True
 
     def load_saved_on_order_lines(self):
         if self.db_conn is None or not self.has_table("on_order_lines"):
             return
         rows = self.db_all(
             """
-            SELECT order_number, item_number, description, qty, supplier_name, ready_date, comments, status
+            SELECT order_number, item_number, description, qty, supplier_name, ready_date, comments, status,
+                   edit_user_id, edit_display_name, edit_machine_name, edit_color, edit_at
             FROM on_order_lines
             ORDER BY line_no, id
             """
@@ -10527,11 +11311,17 @@ class MainWindow(QMainWindow):
                 "ready_date": row.get("ready_date") or "",
                 "comments": row.get("comments") or "",
                 "status": (row.get("status") or "").strip().upper(),
+                "edit_user_id": row.get("edit_user_id") or "",
+                "edit_display_name": row.get("edit_display_name") or "",
+                "edit_machine_name": row.get("edit_machine_name") or "",
+                "edit_color": row.get("edit_color") or "",
+                "edit_at": row.get("edit_at") or "",
             }
             for row in rows
         ]
         self.populate_on_order_table_from_rows(parsed_rows)
         self.refresh_on_order_statuses_from_container_data(persist=False)
+        self.mark_collaboration_state_loaded("on_order")
 
     def load_on_order_general_comments(self):
         editor = getattr(self, "onOrderGeneralComments_textEdit", None)
@@ -10544,12 +11334,15 @@ class MainWindow(QMainWindow):
             editor.setPlainText(text_value)
         finally:
             del blocker
+        self.mark_collaboration_state_loaded("on_order_comments")
 
     def save_on_order_general_comments(self):
         editor = getattr(self, "onOrderGeneralComments_textEdit", None)
         if editor is None or self.db_conn is None or not self.has_table("on_order_meta"):
-            return
+            return False
         text_value = editor.toPlainText().strip()
+        if not self.check_collaboration_save_allowed("on_order_comments", "", "On Order comments"):
+            return False
         cur = self.db_conn.cursor()
         if self.db_engine == "sqlserver":
             cur.execute("DELETE FROM on_order_meta WHERE meta_key = ?", ("general_comments",))
@@ -10567,6 +11360,9 @@ class MainWindow(QMainWindow):
                 ("general_comments", text_value),
             )
         self.db_conn.commit()
+        self.bump_collaboration_revision("on_order_comments", "", {"general_comments": text_value})
+        self.update_collaboration_for_current_page()
+        return True
 
     def on_order_line_is_in_any_container(self, order_number, item_number):
         if self.db_conn is None or not self.has_table("container_lines"):
@@ -10686,6 +11482,7 @@ class MainWindow(QMainWindow):
                     comments_item.setText(comments_text)
                 self.apply_on_order_row_styles(row)
                 self._updating_on_order_table = False
+                self.mark_row_edited_by_current_user(table, row, self.on_order_edit_column)
                 self.save_on_order_table_state()
                 item_edit.clear()
                 order_widget.clear()
@@ -10721,6 +11518,7 @@ class MainWindow(QMainWindow):
         table.setItem(row, self.on_order_status_column, self.build_on_order_status_item(""))
         table.setItem(row, self.on_order_add_column, self.build_on_order_add_item())
         table.setItem(row, self.on_order_remove_column, self.build_on_order_remove_item())
+        self.mark_row_edited_by_current_user(table, row, self.on_order_edit_column)
         self.apply_on_order_row_styles(row)
         self._updating_on_order_table = False
 
@@ -10776,6 +11574,7 @@ class MainWindow(QMainWindow):
                     comments_item.setText(comments_text)
                 self.apply_on_order_row_styles(row)
                 self._updating_on_order_table = False
+                self.mark_row_edited_by_current_user(table, row, self.on_order_edit_column)
                 self.save_on_order_table_state()
                 return True, f"Updated On Order line for {item_number}."
 
@@ -10806,6 +11605,7 @@ class MainWindow(QMainWindow):
         table.setItem(row, self.on_order_status_column, self.build_on_order_status_item(""))
         table.setItem(row, self.on_order_add_column, self.build_on_order_add_item())
         table.setItem(row, self.on_order_remove_column, self.build_on_order_remove_item())
+        self.mark_row_edited_by_current_user(table, row, self.on_order_edit_column)
         self.apply_on_order_row_styles(row)
         self._updating_on_order_table = False
 
@@ -10916,6 +11716,7 @@ class MainWindow(QMainWindow):
             self._updating_on_order_table = True
             table.setItem(row, self.on_order_status_column, self.build_on_order_status_item("IN CONTAINER"))
             self._updating_on_order_table = False
+            self.mark_row_edited_by_current_user(table, row, self.on_order_edit_column)
         self.save_on_order_table_state()
         self.refresh_on_order_statuses_from_container_data(persist=True)
         self.refresh_item_summary_context_boxes()
@@ -10997,6 +11798,7 @@ class MainWindow(QMainWindow):
             self.setup_supplier_autocomplete()
             self.setup_on_order_autocomplete()
             self.apply_on_order_row_styles(row)
+            self.mark_row_edited_by_current_user(table, row, self.on_order_edit_column)
             self.save_on_order_table_state()
             return
 
@@ -11020,6 +11822,7 @@ class MainWindow(QMainWindow):
             item.setData(TABLE_SORT_ROLE, new_qty)
             self.apply_on_order_row_styles(item.row())
             self._updating_on_order_table = False
+            self.mark_row_edited_by_current_user(getattr(self, "onOrder_table", None), item.row(), self.on_order_edit_column)
             self.save_on_order_table_state()
             return
 
@@ -11037,6 +11840,7 @@ class MainWindow(QMainWindow):
             item.setData(TABLE_SORT_ROLE, self.sort_date_value(parsed))
             self.apply_on_order_row_styles(item.row())
             self._updating_on_order_table = False
+            self.mark_row_edited_by_current_user(getattr(self, "onOrder_table", None), item.row(), self.on_order_edit_column)
             self.save_on_order_table_state()
             return
 
@@ -11045,6 +11849,7 @@ class MainWindow(QMainWindow):
             item.setText((item.text() or "").strip())
             self.apply_on_order_row_styles(item.row())
             self._updating_on_order_table = False
+            self.mark_row_edited_by_current_user(getattr(self, "onOrder_table", None), item.row(), self.on_order_edit_column)
             self.save_on_order_table_state()
             return
 
@@ -11422,6 +12227,11 @@ class MainWindow(QMainWindow):
             ("additional_cartons", "INTEGER DEFAULT 0"),
             ("urgent", "INTEGER DEFAULT 0"),
             ("additional", "INTEGER DEFAULT 0"),
+            ("edit_user_id", "TEXT"),
+            ("edit_display_name", "TEXT"),
+            ("edit_machine_name", "TEXT"),
+            ("edit_color", "TEXT"),
+            ("edit_at", "TEXT"),
         ]
 
         def create_container_lines_table():
@@ -11439,6 +12249,11 @@ class MainWindow(QMainWindow):
                     additional_cartons INTEGER DEFAULT 0,
                     urgent INTEGER DEFAULT 0,
                     additional INTEGER DEFAULT 0,
+                    edit_user_id TEXT,
+                    edit_display_name TEXT,
+                    edit_machine_name TEXT,
+                    edit_color TEXT,
+                    edit_at TEXT,
                     FOREIGN KEY(container_ref) REFERENCES containers(container_ref) ON DELETE CASCADE
                 )
                 """
@@ -12899,6 +13714,7 @@ class MainWindow(QMainWindow):
                 stacked.setCurrentWidget(page)
 
         connect_once(getattr(self.ui, "dashboardRefresh_button", None), "_dashboard_connected", self.refresh_dashboard)
+        connect_once(getattr(self.ui, "dashboardEditUser_button", None), "_dashboard_user_connected", self.edit_collaboration_user_name)
         connect_once(getattr(self.ui, "dashboardOpenUpdateData_button", None), "_dashboard_nav_connected", lambda: switch_to_page("update_page"))
         connect_once(getattr(self.ui, "dashboardOpenUpdateDataQuality_button", None), "_dashboard_nav_connected", lambda: switch_to_page("update_page"))
         connect_once(getattr(self.ui, "dashboardOpenOrderAnalysis_button", None), "_dashboard_nav_connected", lambda: switch_to_page("orderAnalysy_page"))
@@ -14106,6 +14922,7 @@ class MainWindow(QMainWindow):
             if db_server:
                 db_text = f"{db_text}\n{db_server}"
             self.set_dashboard_label_text("dashboardDatabase_value", db_text)
+            self.refresh_collaboration_user_dashboard_card()
 
             freshness_checks = [
                 ("Sales", self.dashboard_parse_import_datetime("sales_last_import_iso", "sales_last_import_display", "lastUpdateSales_textBrowser"), 7, 14, "Never imported"),
@@ -14298,8 +15115,8 @@ class MainWindow(QMainWindow):
             return
 
         table.clear()
-        table.setColumnCount(7)
-        table.setHorizontalHeaderLabels(["Item Number", "Description", "On Order", "Qty", "Supplier", "Status", "Remove"])
+        table.setColumnCount(8)
+        table.setHorizontalHeaderLabels(["Item Number", "Description", "On Order", "Qty", "Supplier", "Status", "Remove", "Edit"])
         table.setRowCount(0)
         table.setSelectionBehavior(QAbstractItemView.SelectRows)
         table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -14312,6 +15129,8 @@ class MainWindow(QMainWindow):
         table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
         table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Fixed)
+        table.setColumnWidth(7, 34)
         table.setProperty("_table_font_menu_installed", True)
         table.setProperty("_table_font_scope_key", "main_window")
         table.setProperty("_table_font_default_size", current_table_font_size(table))
@@ -14530,6 +15349,7 @@ class MainWindow(QMainWindow):
                 table.setItem(row, self.on_order_status_column, self.build_on_order_status_item(final_status))
                 self.apply_on_order_row_styles(row)
                 self._updating_on_order_table = False
+                self.mark_row_edited_by_current_user(table, row, self.on_order_edit_column)
                 self.save_on_order_table_state()
                 self.refresh_on_order_statuses_from_container_data(persist=True)
                 return True
@@ -14558,6 +15378,7 @@ class MainWindow(QMainWindow):
         table.setItem(row, self.on_order_status_column, self.build_on_order_status_item(status_text))
         table.setItem(row, self.on_order_add_column, self.build_on_order_add_item())
         table.setItem(row, self.on_order_remove_column, self.build_on_order_remove_item())
+        self.mark_row_edited_by_current_user(table, row, self.on_order_edit_column)
         self.apply_on_order_row_styles(row)
         self._updating_on_order_table = False
         table.resizeRowsToContents()
@@ -14642,8 +15463,9 @@ class MainWindow(QMainWindow):
                 """
                 INSERT INTO container_lines (
                     container_ref, line_no, order_number, item_number, description, qty, cartons,
-                    additional_cartons, urgent, additional
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    additional_cartons, urgent, additional,
+                    edit_user_id, edit_display_name, edit_machine_name, edit_color, edit_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     ref,
@@ -14656,6 +15478,11 @@ class MainWindow(QMainWindow):
                     int(line.get("additional_cartons", 0) or 0),
                     1 if line.get("urgent") else 0,
                     1 if line.get("additional") else 0,
+                    line.get("edit_user_id", ""),
+                    line.get("edit_display_name", ""),
+                    line.get("edit_machine_name", ""),
+                    line.get("edit_color", ""),
+                    line.get("edit_at", ""),
                 ),
             )
         self.db_conn.commit()
@@ -14788,7 +15615,8 @@ class MainWindow(QMainWindow):
             return []
         rows = self.db_all(
             """
-            SELECT order_number, item_number, description, qty, cartons, additional_cartons, urgent, additional
+            SELECT order_number, item_number, description, qty, cartons, additional_cartons, urgent, additional,
+                   edit_user_id, edit_display_name, edit_machine_name, edit_color, edit_at
             FROM container_lines
             WHERE UPPER(TRIM(container_ref)) = UPPER(TRIM(?))
             ORDER BY line_no, id
@@ -14805,6 +15633,11 @@ class MainWindow(QMainWindow):
                 "additional_cartons": int(round(self.parse_float(row["additional_cartons"]))),
                 "urgent": bool(row["urgent"]),
                 "additional": bool(row["additional"]),
+                "edit_user_id": row.get("edit_user_id") or "",
+                "edit_display_name": row.get("edit_display_name") or "",
+                "edit_machine_name": row.get("edit_machine_name") or "",
+                "edit_color": row.get("edit_color") or "",
+                "edit_at": row.get("edit_at") or "",
             }
             for row in rows
             if str(row["item_number"] or "").strip()
@@ -14866,6 +15699,7 @@ class MainWindow(QMainWindow):
             "additional_cartons": 0,
             "urgent": bool(is_urgent),
             "additional": False,
+            **self.current_edit_audit_metadata(),
         })
 
         cur.execute(
@@ -14878,8 +15712,9 @@ class MainWindow(QMainWindow):
                 """
                 INSERT INTO container_lines (
                     container_ref, line_no, order_number, item_number, description, qty, cartons,
-                    additional_cartons, urgent, additional
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    additional_cartons, urgent, additional,
+                    edit_user_id, edit_display_name, edit_machine_name, edit_color, edit_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     ref,
@@ -14892,6 +15727,11 @@ class MainWindow(QMainWindow):
                     int(line.get("additional_cartons", 0) or 0),
                     1 if line.get("urgent") else 0,
                     1 if line.get("additional") else 0,
+                    line.get("edit_user_id", ""),
+                    line.get("edit_display_name", ""),
+                    line.get("edit_machine_name", ""),
+                    line.get("edit_color", ""),
+                    line.get("edit_at", ""),
                 ),
             )
         self.db_conn.commit()
@@ -15556,10 +16396,10 @@ class MainWindow(QMainWindow):
         self._updating_container_table = True
         table.clearSpans()
         table.clear()
-        table.setColumnCount(9)
+        table.setColumnCount(10)
         table.setHorizontalHeaderLabels([
             "Order Number", "Item Number", "Description", "Qty", "Cartons",
-            "Additional Cartons", "Urgent", "Additional", "Remove"
+            "Additional Cartons", "Urgent", "Additional", "Remove", "Edit"
         ])
         table.setRowCount(0)
         table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -15575,8 +16415,12 @@ class MainWindow(QMainWindow):
         table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
         table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Fixed)
+        table.setColumnWidth(7, 34)
         table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeToContents)
         table.horizontalHeader().setSectionResizeMode(8, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(9, QHeaderView.Fixed)
+        table.setColumnWidth(9, 34)
         if not bool(table.property("_container_header_sort_connected")):
             table.horizontalHeader().sectionClicked.connect(self.handle_container_header_sort_clicked)
             table.horizontalHeader().sectionDoubleClicked.connect(self.handle_container_header_sort_clicked)
@@ -16183,6 +17027,7 @@ class MainWindow(QMainWindow):
             meta = first_item.data(Qt.UserRole) if first_item is not None else None
             if isinstance(meta, dict) and meta.get("note_row"):
                 continue
+            edit_meta = self.get_row_edit_audit_metadata(table, row, cols.get("edit"))
             line = {
                 "order_number": first_item.text().strip() if first_item is not None and first_item.text() else "",
                 "item_number": table.item(row, cols["item"]).text().strip() if table.item(row, cols["item"]) is not None and table.item(row, cols["item"]).text() else "",
@@ -16192,6 +17037,7 @@ class MainWindow(QMainWindow):
                 "additional_cartons": int(round(self.parse_float(table.item(row, cols["additional_cartons"]).text() if table.item(row, cols["additional_cartons"]) is not None else 0))),
                 "urgent": bool(meta.get("urgent")) if isinstance(meta, dict) else False,
                 "additional": bool(meta.get("additional")) if isinstance(meta, dict) else False,
+                **edit_meta,
             }
             if line["item_number"]:
                 lines.append(line)
@@ -16223,6 +17069,7 @@ class MainWindow(QMainWindow):
             table.setItem(row, cols["urgent"], self.make_container_table_item("Urgent", align=Qt.AlignCenter, bold=True))
             table.setItem(row, cols["additional"], self.make_container_table_item("Additional", align=Qt.AlignCenter, bold=True))
             table.setItem(row, cols["remove"], self.make_container_table_item("Remove", align=Qt.AlignCenter, bold=True))
+            self.set_row_edit_audit_metadata(table, row, cols.get("edit"), line)
             self.apply_container_row_style(row, bool(line.get("urgent")), bool(line.get("additional")))
         self.append_container_note_rows()
         self._updating_container_table = False
@@ -16270,6 +17117,8 @@ class MainWindow(QMainWindow):
         for col in range(table.columnCount()):
             item = table.item(row, col)
             if item is None:
+                continue
+            if col == self.container_columns.get("edit", -1):
                 continue
             meta = item.data(Qt.UserRole) if col == 0 else None
             if bg is None:
@@ -16510,6 +17359,7 @@ class MainWindow(QMainWindow):
             "additional_cartons": 0,
             "urgent": False,
             "additional": False,
+            **self.current_edit_audit_metadata(),
         })
         self.populate_container_table(lines)
         self.set_updated_box_today()
@@ -16568,6 +17418,7 @@ class MainWindow(QMainWindow):
             if bool(line.get("additional")):
                 line["additional_cartons"] = cartons
                 self.adjust_remaining_additional_cartons(old_additional_cartons - cartons)
+            line.update(self.current_edit_audit_metadata())
             lines[row] = line
             self.populate_container_table(lines)
             self.set_updated_box_today()
@@ -16580,6 +17431,7 @@ class MainWindow(QMainWindow):
                 self.adjust_remaining_additional_cartons(old_additional_cartons)
                 line["additional"] = False
                 line["additional_cartons"] = 0
+            line.update(self.current_edit_audit_metadata())
             lines[row] = line
             self.populate_container_table(lines)
             self.set_updated_box_today()
@@ -16596,6 +17448,7 @@ class MainWindow(QMainWindow):
             else:
                 self.adjust_remaining_additional_cartons(old_additional_cartons)
                 line["additional_cartons"] = 0
+            line.update(self.current_edit_audit_metadata())
             lines[row] = line
             self.populate_container_table(lines)
             self.set_updated_box_today()
@@ -16657,7 +17510,7 @@ class MainWindow(QMainWindow):
     def save_current_container_state(self):
         ref = self.get_container_ref_text() or self.current_container_ref
         if not ref:
-            return
+            return False
         self.current_container_ref = ref
         updated_display = getattr(self.ui, "updated_box", None).toPlainText().strip() if getattr(self.ui, "updated_box", None) is not None else date.today().strftime("%d/%m/%Y")
         updated_iso = self.display_to_iso_date(updated_display) or date.today().isoformat()
@@ -16668,6 +17521,18 @@ class MainWindow(QMainWindow):
         dog_leads = 1 if getattr(self.ui, "checkBox", None) is not None and self.ui.checkBox.isChecked() else 0
         notes = (self.current_container_notes or "").strip()
         lines = self.get_container_line_dicts()
+
+        payload = {
+            "container_ref": ref,
+            "updated_on": updated_iso,
+            "eta_date": eta_iso,
+            "additional_cartons": extra,
+            "dog_leads": dog_leads,
+            "notes": notes,
+            "lines": lines,
+        }
+        if not self.check_collaboration_save_allowed("container", ref, f"Container {ref}"):
+            return False
 
         cur = self.db_conn.cursor()
         if self.db_engine == "sqlserver":
@@ -16700,19 +17565,25 @@ class MainWindow(QMainWindow):
                 """
                 INSERT INTO container_lines (
                     container_ref, line_no, order_number, item_number, description, qty, cartons,
-                    additional_cartons, urgent, additional
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    additional_cartons, urgent, additional,
+                    edit_user_id, edit_display_name, edit_machine_name, edit_color, edit_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     ref, idx, line.get("order_number", ""), line.get("item_number", ""), line.get("description", ""),
                     float(line.get("qty", 0) or 0), int(line.get("cartons", 0) or 0),
                     int(line.get("additional_cartons", 0) or 0), 1 if line.get("urgent") else 0, 1 if line.get("additional") else 0,
+                    line.get("edit_user_id", ""), line.get("edit_display_name", ""), line.get("edit_machine_name", ""),
+                    line.get("edit_color", ""), line.get("edit_at", ""),
                 ),
             )
         self.db_conn.commit()
+        self.bump_collaboration_revision("container", ref, payload)
+        self.update_collaboration_for_current_page()
         self.refresh_container_totals()
         self.refresh_containers_list()
         self.refresh_on_order_statuses_from_container_data(persist=True)
+        return True
 
     def refresh_containers_list(self):
         table = getattr(self.ui, "containers_tableWidget", None)
@@ -16764,7 +17635,8 @@ class MainWindow(QMainWindow):
         )
         lines = self.db_all(
             """
-            SELECT order_number, item_number, description, qty, cartons, additional_cartons, urgent, additional
+            SELECT order_number, item_number, description, qty, cartons, additional_cartons, urgent, additional,
+                   edit_user_id, edit_display_name, edit_machine_name, edit_color, edit_at
             FROM container_lines
             WHERE container_ref = ?
             ORDER BY line_no, id
@@ -16781,10 +17653,17 @@ class MainWindow(QMainWindow):
                 "additional_cartons": int(self.parse_float(r["additional_cartons"])),
                 "urgent": bool(r["urgent"]),
                 "additional": bool(r["additional"]),
+                "edit_user_id": r.get("edit_user_id") or "",
+                "edit_display_name": r.get("edit_display_name") or "",
+                "edit_machine_name": r.get("edit_machine_name") or "",
+                "edit_color": r.get("edit_color") or "",
+                "edit_at": r.get("edit_at") or "",
             }
             for r in lines
         ]
         self.populate_container_table(parsed_lines)
+        self.mark_collaboration_state_loaded("container", container_ref)
+        self.update_collaboration_for_current_page()
         return True
 
     def load_container_into_page(self, container_ref):
@@ -18463,6 +19342,7 @@ class MainWindow(QMainWindow):
 
             table.setItem(row, self.order_priority_column, self.build_order_status_item(line.get("status", ""), bool(line.get("urgent"))))
             table.setItem(row, self.order_remove_column, self.build_order_remove_item())
+            self.set_row_edit_audit_metadata(table, row, self.order_edit_column, line)
         self._updating_order_table = False
         table.resizeRowsToContents()
 
@@ -18485,6 +19365,7 @@ class MainWindow(QMainWindow):
             priority_text = table.item(row, self.order_priority_column).text().strip().upper() if table.item(row, self.order_priority_column) is not None and table.item(row, self.order_priority_column).text() else ""
             if not item_number:
                 continue
+            edit_meta = self.get_row_edit_audit_metadata(table, row, self.order_edit_column)
             rows.append({
                 "item_number": item_number,
                 "description": description,
@@ -18492,20 +19373,25 @@ class MainWindow(QMainWindow):
                 "supplier_name": supplier_value,
                 "urgent": priority_text == "URGENT",
                 "status": self.normalise_order_status(priority_text),
+                **edit_meta,
             })
         return rows
 
     def save_order_table_state(self):
         if self.db_conn is None or not self.has_table("to_order_lines"):
-            return
+            return False
         rows = self.get_order_table_rows()
+        if not self.check_collaboration_save_allowed("to_order", "", "To Order"):
+            return False
         cur = self.db_conn.cursor()
         cur.execute("DELETE FROM to_order_lines")
         for line_no, row in enumerate(rows, start=1):
             cur.execute(
                 """
-                INSERT INTO to_order_lines (line_no, item_number, description, qty, supplier_name, urgent, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO to_order_lines (
+                    line_no, item_number, description, qty, supplier_name, urgent, status,
+                    edit_user_id, edit_display_name, edit_machine_name, edit_color, edit_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     line_no,
@@ -18515,16 +19401,25 @@ class MainWindow(QMainWindow):
                     row.get("supplier_name", ""),
                     1 if row.get("urgent") else 0,
                     row.get("status", ""),
+                    row.get("edit_user_id", ""),
+                    row.get("edit_display_name", ""),
+                    row.get("edit_machine_name", ""),
+                    row.get("edit_color", ""),
+                    row.get("edit_at", ""),
                 ),
             )
         self.db_conn.commit()
+        self.bump_collaboration_revision("to_order", "", rows)
+        self.update_collaboration_for_current_page()
+        return True
 
     def load_saved_order_lines(self):
         if self.db_conn is None or not self.has_table("to_order_lines"):
             return
         rows = self.db_all(
             """
-            SELECT item_number, description, qty, supplier_name, urgent, status
+            SELECT item_number, description, qty, supplier_name, urgent, status,
+                   edit_user_id, edit_display_name, edit_machine_name, edit_color, edit_at
             FROM to_order_lines
             ORDER BY line_no, id
             """
@@ -18537,10 +19432,16 @@ class MainWindow(QMainWindow):
                 "supplier_name": row["supplier_name"] or "",
                 "urgent": bool(row["urgent"]),
                 "status": self.normalise_order_status(row.get("status", ""), bool(row["urgent"])),
+                "edit_user_id": row.get("edit_user_id") or "",
+                "edit_display_name": row.get("edit_display_name") or "",
+                "edit_machine_name": row.get("edit_machine_name") or "",
+                "edit_color": row.get("edit_color") or "",
+                "edit_at": row.get("edit_at") or "",
             }
             for row in rows
         ]
         self.populate_order_table_from_rows(parsed_rows)
+        self.mark_collaboration_state_loaded("to_order")
 
     def prompt_for_supplier_name(self, current_supplier=""):
         dialog = QDialog(self)
@@ -18717,6 +19618,7 @@ class MainWindow(QMainWindow):
             self.update_item_supplier_in_database(item_number, resolved_supplier)
             self.load_reference_lists()
             self.setup_supplier_autocomplete()
+            self.mark_row_edited_by_current_user(table, row, self.order_edit_column)
             self.save_order_table_state()
             return
 
@@ -18727,6 +19629,7 @@ class MainWindow(QMainWindow):
             self._updating_order_table = True
             table.setItem(row, column, self.build_order_status_item(new_status))
             self._updating_order_table = False
+            self.mark_row_edited_by_current_user(table, row, self.order_edit_column)
             self.save_order_table_state()
             return
 
@@ -18751,6 +19654,7 @@ class MainWindow(QMainWindow):
             item.setText(self.format_value(new_qty))
             item.setData(Qt.UserRole, new_qty)
             self._updating_order_table = False
+            self.mark_row_edited_by_current_user(getattr(self.ui, "order_table", None), item.row(), self.order_edit_column)
             self.save_order_table_state()
             self.refresh_item_summary_context_boxes()
             self.rerun_order_analysis_if_ready()
@@ -18781,6 +19685,7 @@ class MainWindow(QMainWindow):
             self.update_item_supplier_in_database(item_number, resolved_supplier)
             self.load_reference_lists()
             self.setup_supplier_autocomplete()
+            self.mark_row_edited_by_current_user(getattr(self.ui, "order_table", None), item.row(), self.order_edit_column)
             self.save_order_table_state()
             return
 

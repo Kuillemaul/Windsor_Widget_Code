@@ -50,7 +50,7 @@ If Inno Setup is not found automatically:
 The finished installer is created in:
 
 ```text
-output\WindsorWidget_Client_1_2_4.exe
+output\WindsorWidget_Client_1_3_3.exe
 ```
 
 ## Client install flow
