@@ -116,7 +116,7 @@ from yu_order_workflow import YUOrderEntryDialog, load_yu_review_module
 TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
 TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
 TABLE_FORMAT_SETTINGS_PREFIX = "table_format"
-APP_VERSION = "1.3.3"
+APP_VERSION = "1.4.0"
 APP_DESIGNER = "Bradley Mayze"
 # After the one-time no-space item-number migration, sales/order/stock tables
 # store canonical item numbers.  Keep runtime item-number resolution for entry/import,
@@ -237,23 +237,27 @@ def build_update_ssl_context():
 
 
 PLANNING_STATUS_ACTIVE = "ACTIVE"
+PLANNING_STATUS_CRITICAL = "CRITICAL"
 PLANNING_STATUS_SPECIAL_ORDER = "SPECIAL_ORDER"
 PLANNING_STATUS_PHASE_OUT = "PHASE_OUT"
 PLANNING_STATUS_OBSOLETE = "OBSOLETE"
 PLANNING_STATUSES = (
     PLANNING_STATUS_ACTIVE,
+    PLANNING_STATUS_CRITICAL,
     PLANNING_STATUS_SPECIAL_ORDER,
     PLANNING_STATUS_PHASE_OUT,
     PLANNING_STATUS_OBSOLETE,
 )
 PLANNING_STATUS_DISPLAY = {
     PLANNING_STATUS_ACTIVE: "Active",
+    PLANNING_STATUS_CRITICAL: "Critical",
     PLANNING_STATUS_SPECIAL_ORDER: "Special Order",
     PLANNING_STATUS_PHASE_OUT: "Phase Out",
     PLANNING_STATUS_OBSOLETE: "Obsolete",
 }
 PLANNING_STATUS_COLORS = {
     PLANNING_STATUS_ACTIVE: {"bg": "#2B2F36", "fg": "#F0F0F0", "border": "#5A5F69"},
+    PLANNING_STATUS_CRITICAL: {"bg": "#6B1111", "fg": "#FFEAEA", "border": "#FF4D4D"},
     PLANNING_STATUS_SPECIAL_ORDER: {"bg": "#1F3B57", "fg": "#EAF4FF", "border": "#5EA6E8"},
     PLANNING_STATUS_PHASE_OUT: {"bg": "#5A431A", "fg": "#FFF3D6", "border": "#E7B14C"},
     PLANNING_STATUS_OBSOLETE: {"bg": "#5A1F1F", "fg": "#FFEAEA", "border": "#E47C7C"},
@@ -6944,8 +6948,8 @@ class Ui_MainWindow(object):
             "Show Critical Order Analysis across all suppliers. This ignores the Supplier / Group box and scans every item. "
             "Criteria: Sales for the selected period must be greater than 0, and either At Risk is greater than 0 "
             "or stock cover is under one month. Stock cover is calculated as SOH + On Order Form + On Next Container "
-            "+ Shipped Container compared with Avg Monthly Sales. The Special Order / Phase Out / Obsolete checkboxes "
-            "still control whether those statuses are included."
+            "+ Shipped Container compared with Avg Monthly Sales. Items marked with Planning Status = Critical are always included in this view. "
+            "The Special Order / Phase Out / Obsolete checkboxes still control whether those statuses are included."
         )
         for widget in (
             self.enterSupplier_label,
@@ -7099,8 +7103,10 @@ class Ui_MainWindow(object):
             if title == "Cover Orders":
                 placeholder.setPlainText(
                     "COVER ORDERS IMPORT\n\n"
-                    "Use a CSV or Excel file exported with these headings:\n"
-                    "Invoice No., Co./Last Name, Item Number, Quantity, Date, Journal Memo\n\n"
+                    "Export from MYOB: Export > Sales > Orders.\n"
+                    "Date range: earliest cover order date to today.\n"
+                    "Columns: Date, Co./Last Name, Invoice No., Item Number, Quantity, Journal Memo.\n\n"
+                    "Do not manually filter the file. The app imports only rows where Journal Memo contains COVER ORDER.\n"
                     "The import replaces the existing cover order table."
                 )
             else:
@@ -9329,6 +9335,13 @@ class MainWindow(QMainWindow):
             return PLANNING_STATUS_ACTIVE
         text_value = text_value.replace("-", "_").replace(" ", "_")
         aliases = {
+            "CRITICAL": PLANNING_STATUS_CRITICAL,
+            "CRIT": PLANNING_STATUS_CRITICAL,
+            "CANNOT_RUN_OUT": PLANNING_STATUS_CRITICAL,
+            "CANT_RUN_OUT": PLANNING_STATUS_CRITICAL,
+            "DO_NOT_RUN_OUT": PLANNING_STATUS_CRITICAL,
+            "MUST_NOT_RUN_OUT": PLANNING_STATUS_CRITICAL,
+            "NO_STOCKOUT": PLANNING_STATUS_CRITICAL,
             "SPECIAL": PLANNING_STATUS_SPECIAL_ORDER,
             "SPECIAL_ORDER_ONLY": PLANNING_STATUS_SPECIAL_ORDER,
             "SPECIALONLY": PLANNING_STATUS_SPECIAL_ORDER,
@@ -9352,6 +9365,7 @@ class MainWindow(QMainWindow):
         if theme_name == "light":
             light_colors = {
                 PLANNING_STATUS_ACTIVE: {"bg": "#f4f7fa", "fg": "#111111", "border": "#667789", "check_bg": "#ffffff", "check_border": "#667789"},
+                PLANNING_STATUS_CRITICAL: {"bg": "#ffd9d9", "fg": "#7f1d1d", "border": "#e03131", "check_bg": "#ffffff", "check_border": "#e03131"},
                 PLANNING_STATUS_SPECIAL_ORDER: {"bg": "#dceeff", "fg": "#093a65", "border": "#2f80d0", "check_bg": "#ffffff", "check_border": "#2f80d0"},
                 PLANNING_STATUS_PHASE_OUT: {"bg": "#fff2cc", "fg": "#5f3b00", "border": "#d49a00", "check_bg": "#ffffff", "check_border": "#d49a00"},
                 PLANNING_STATUS_OBSOLETE: {"bg": "#ffe1e1", "fg": "#7b0000", "border": "#cf3030", "check_bg": "#ffffff", "check_border": "#cf3030"},
@@ -9610,6 +9624,8 @@ class MainWindow(QMainWindow):
         status = self.normalise_planning_status(status)
         if status == PLANNING_STATUS_ACTIVE:
             return True
+        if status == PLANNING_STATUS_CRITICAL:
+            return True
         if status == PLANNING_STATUS_SPECIAL_ORDER:
             return bool(self.order_analysis_show_special_checkbox is not None and self.order_analysis_show_special_checkbox.isChecked())
         if status == PLANNING_STATUS_PHASE_OUT:
@@ -9637,6 +9653,41 @@ class MainWindow(QMainWindow):
         if changed:
             self.apply_order_analysis_filters()
 
+    def update_item_overview_planning_highlight(self, status=None):
+        """Highlight the whole Item Summary identity band for Critical items."""
+        status = self.normalise_planning_status(status or self.current_item_planning_status)
+        overview_frame = getattr(self.ui, "itemOverview_frame", None)
+        if overview_frame is None:
+            return
+
+        if status != PLANNING_STATUS_CRITICAL:
+            try:
+                overview_frame.setStyleSheet("")
+                overview_frame.setToolTip("")
+            except Exception:
+                pass
+            return
+
+        is_light = self.current_theme_name() == "light"
+        if is_light:
+            background = "#fff1f1"
+            border = "#e03131"
+        else:
+            background = "#2b2020"
+            border = "#ff2d2d"
+
+        try:
+            overview_frame.setStyleSheet(
+                f"QFrame#itemOverview_frame {{ "
+                f"background-color: {background}; "
+                f"border: 3px solid {border}; "
+                f"border-radius: 10px; "
+                f"}}"
+            )
+            overview_frame.setToolTip("Critical item: cannot run out. Treat this item as a hard purchasing priority.")
+        except Exception:
+            pass
+
     def update_item_status_controls(self, status=None):
         status = self.normalise_planning_status(status or self.current_item_planning_status)
         self.current_item_planning_status = status
@@ -9647,6 +9698,10 @@ class MainWindow(QMainWindow):
             checkbox.blockSignals(False)
         if self.item_status_value_label is not None:
             self.item_status_value_label.setText(self.planning_status_display_text(status))
+            if status == PLANNING_STATUS_CRITICAL:
+                self.item_status_value_label.setToolTip("Critical item: cannot run out. Keep this item prioritised in purchasing.")
+            else:
+                self.item_status_value_label.setToolTip("")
         if self.item_status_frame is not None:
             is_light = self.current_theme_name() == "light"
             check_border = colors.get("border", "#5A5F69")
@@ -9672,6 +9727,7 @@ class MainWindow(QMainWindow):
                 f"QFrame#itemStatus_frame QCheckBox::indicator {{ width: 13px; height: 13px; border: 1px solid {check_border}; background-color: {check_bg}; }}"
                 f"QFrame#itemStatus_frame QCheckBox::indicator:checked {{ background-color: {colors['border']}; border: 1px solid {checked_border}; }}"
             )
+        self.update_item_overview_planning_highlight(status)
 
     def toggle_item_planning_status(self, status):
         if not self.current_item_number:
@@ -9731,14 +9787,15 @@ class MainWindow(QMainWindow):
 
         self.item_status_checkboxes = {}
         self.item_status_checkbox_map = {}
-        for status, short_label, full_label in (
-            (PLANNING_STATUS_SPECIAL_ORDER, "Special", "Special Order"),
-            (PLANNING_STATUS_PHASE_OUT, "Phase Out", "Phase Out"),
-            (PLANNING_STATUS_OBSOLETE, "Obsolete", "Obsolete"),
+        for status, short_label, full_label, tooltip_detail in (
+            (PLANNING_STATUS_CRITICAL, "Critical", "Critical", "Cannot run out. Highlight this item as a hard purchasing priority."),
+            (PLANNING_STATUS_SPECIAL_ORDER, "Special", "Special Order", "Special order / not normal stock."),
+            (PLANNING_STATUS_PHASE_OUT, "Phase Out", "Phase Out", "Phase-out stock. Order cautiously."),
+            (PLANNING_STATUS_OBSOLETE, "Obsolete", "Obsolete", "Obsolete / discontinued stock."),
         ):
             checkbox = QCheckBox(short_label, status_frame)
             checkbox.setObjectName(f"itemStatus_{status.lower()}_checkBox")
-            checkbox.setToolTip(f"Double-click to set this item as {full_label}. Double-click again to return it to Active.")
+            checkbox.setToolTip(f"Double-click to set this item as {full_label}. Double-click again to return it to Active. {tooltip_detail}")
             checkbox.installEventFilter(self)
             checkbox.setMinimumWidth(82)
             checkbox.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
@@ -12032,7 +12089,8 @@ class MainWindow(QMainWindow):
                 price REAL,
                 extended REAL,
                 invoice_no TEXT,
-                freight_amount REAL
+                freight_amount REAL,
+                customer_po TEXT
             )
             """
         )
@@ -12048,6 +12106,7 @@ class MainWindow(QMainWindow):
             ("extended", "REAL"),
             ("invoice_no", "TEXT"),
             ("freight_amount", "REAL"),
+            ("customer_po", "TEXT"),
         ]
         existing_columns = {row[1] for row in cur.execute("PRAGMA table_info(sales)").fetchall()}
         for column_name, ddl in desired_columns:
@@ -12066,6 +12125,7 @@ class MainWindow(QMainWindow):
         desired_columns = [
             ("invoice_no", "NVARCHAR(80) NULL", "TEXT"),
             ("freight_amount", "FLOAT NULL", "REAL"),
+            ("customer_po", "NVARCHAR(120) NULL", "TEXT"),
         ]
 
         cur = self.db_conn.cursor()
@@ -12078,6 +12138,351 @@ class MainWindow(QMainWindow):
             else:
                 cur.execute(f"ALTER TABLE sales ADD COLUMN {column_name} {sqlite_type}")
             changed = True
+
+        if changed:
+            self.db_conn.commit()
+
+        if self.db_engine == "sqlserver":
+            self.ensure_sales_sqlserver_text_column_types()
+
+    def sales_sqlserver_table_schema(self, cur=None):
+        """Return the SQL Server schema that owns the sales table."""
+        if self.db_conn is None or self.db_engine != "sqlserver":
+            return "dbo"
+        cur = cur or self.db_conn.cursor()
+        try:
+            row = cur.execute(
+                """
+                SELECT TOP 1 TABLE_SCHEMA
+                FROM INFORMATION_SCHEMA.TABLES
+                WHERE TABLE_NAME = 'sales'
+                  AND TABLE_TYPE = 'BASE TABLE'
+                ORDER BY CASE WHEN TABLE_SCHEMA = 'dbo' THEN 0 ELSE 1 END, TABLE_SCHEMA
+                """
+            ).fetchone()
+            if row is not None:
+                try:
+                    schema_name = str(row["TABLE_SCHEMA"] or "").strip()
+                except Exception:
+                    schema_name = str(row[0] or "").strip()
+                if schema_name:
+                    return schema_name
+        except Exception:
+            pass
+        return "dbo"
+
+    def sales_sqlserver_table_identifier(self, schema_name=None):
+        schema_name = str(schema_name or "dbo").strip() or "dbo"
+        return f"{self.db_identifier(schema_name)}.{self.db_identifier('sales')}"
+
+    def sales_sqlserver_index_create_sql(self, cur, schema_name, index_name):
+        """Build a recreate script for a normal sales table index.
+
+        SQL Server will not alter a column while a dependent index exists.  We
+        preserve normal nonclustered indexes, drop them, alter the text column,
+        then recreate the same index definition.
+        """
+        schema_name = str(schema_name or "dbo").strip() or "dbo"
+        index_name = str(index_name or "").strip()
+        if not index_name:
+            return ""
+
+        meta = cur.execute(
+            """
+            SELECT
+                i.name AS index_name,
+                i.is_unique,
+                i.type_desc,
+                i.has_filter,
+                i.filter_definition
+            FROM sys.indexes i
+            INNER JOIN sys.tables t ON i.object_id = t.object_id
+            INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
+            WHERE s.name = ?
+              AND t.name = 'sales'
+              AND i.name = ?
+              AND i.is_primary_key = 0
+              AND i.is_unique_constraint = 0
+            """,
+            (schema_name, index_name),
+        ).fetchone()
+        if meta is None:
+            return ""
+
+        try:
+            is_unique = bool(meta["is_unique"])
+            type_desc = str(meta["type_desc"] or "NONCLUSTERED").strip().upper()
+            has_filter = bool(meta["has_filter"])
+            filter_definition = str(meta["filter_definition"] or "").strip()
+        except Exception:
+            is_unique = bool(meta[1]) if len(meta) > 1 else False
+            type_desc = str(meta[2] if len(meta) > 2 else "NONCLUSTERED").strip().upper()
+            has_filter = bool(meta[3]) if len(meta) > 3 else False
+            filter_definition = str(meta[4] if len(meta) > 4 else "").strip()
+
+        # This migration only needs to handle ordinary rowstore indexes.  Do not
+        # try to rebuild unusual index types with guessed syntax.
+        if type_desc not in {"NONCLUSTERED", "CLUSTERED"}:
+            return ""
+
+        column_rows = cur.execute(
+            """
+            SELECT
+                c.name AS column_name,
+                ic.key_ordinal,
+                ic.is_descending_key,
+                ic.is_included_column,
+                ic.index_column_id
+            FROM sys.indexes i
+            INNER JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+            INNER JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+            INNER JOIN sys.tables t ON i.object_id = t.object_id
+            INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
+            WHERE s.name = ?
+              AND t.name = 'sales'
+              AND i.name = ?
+            ORDER BY
+                CASE WHEN ic.is_included_column = 0 THEN ic.key_ordinal ELSE 2147483647 END,
+                ic.index_column_id
+            """,
+            (schema_name, index_name),
+        ).fetchall()
+
+        key_columns = []
+        included_columns = []
+        for row in column_rows:
+            try:
+                column_name = str(row["column_name"] or "").strip()
+                is_desc = bool(row["is_descending_key"])
+                is_included = bool(row["is_included_column"])
+            except Exception:
+                column_name = str(row[0] if len(row) > 0 else "").strip()
+                is_desc = bool(row[2]) if len(row) > 2 else False
+                is_included = bool(row[3]) if len(row) > 3 else False
+            if not column_name:
+                continue
+            if is_included:
+                included_columns.append(self.db_identifier(column_name))
+            else:
+                direction = "DESC" if is_desc else "ASC"
+                key_columns.append(f"{self.db_identifier(column_name)} {direction}")
+
+        if not key_columns:
+            return ""
+
+        unique_sql = "UNIQUE " if is_unique else ""
+        table_name = self.sales_sqlserver_table_identifier(schema_name)
+        create_sql = (
+            f"CREATE {unique_sql}{type_desc} INDEX {self.db_identifier(index_name)} "
+            f"ON {table_name} ({', '.join(key_columns)})"
+        )
+        if included_columns:
+            create_sql += f" INCLUDE ({', '.join(included_columns)})"
+        if has_filter and filter_definition:
+            create_sql += f" WHERE {filter_definition}"
+        return create_sql
+
+    def sales_sqlserver_dependent_indexes_for_columns(self, cur, schema_name, column_names):
+        schema_name = str(schema_name or "dbo").strip() or "dbo"
+        cleaned_columns = [str(value or "").strip() for value in column_names if str(value or "").strip()]
+        if not cleaned_columns:
+            return []
+
+        placeholders = ", ".join("?" for _ in cleaned_columns)
+        rows = cur.execute(
+            f"""
+            SELECT DISTINCT i.name AS index_name
+            FROM sys.indexes i
+            INNER JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+            INNER JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+            INNER JOIN sys.tables t ON i.object_id = t.object_id
+            INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
+            WHERE s.name = ?
+              AND t.name = 'sales'
+              AND c.name IN ({placeholders})
+              AND i.name IS NOT NULL
+              AND i.is_primary_key = 0
+              AND i.is_unique_constraint = 0
+            ORDER BY i.name
+            """,
+            tuple([schema_name] + cleaned_columns),
+        ).fetchall()
+
+        index_specs = []
+        seen = set()
+        for row in rows:
+            try:
+                index_name = str(row["index_name"] or "").strip()
+            except Exception:
+                index_name = str(row[0] if len(row) > 0 else "").strip()
+            if not index_name or index_name.lower() in seen:
+                continue
+            create_sql = self.sales_sqlserver_index_create_sql(cur, schema_name, index_name)
+            if not create_sql:
+                continue
+            seen.add(index_name.lower())
+            index_specs.append({"name": index_name, "create_sql": create_sql})
+        return index_specs
+
+    def drop_sales_sqlserver_index_if_exists(self, cur, schema_name, index_name):
+        schema_name = str(schema_name or "dbo").strip() or "dbo"
+        index_name = str(index_name or "").strip()
+        if not index_name:
+            return
+        table_name = self.sales_sqlserver_table_identifier(schema_name)
+        cur.execute(
+            f"""
+            IF EXISTS (
+                SELECT 1
+                FROM sys.indexes i
+                INNER JOIN sys.tables t ON i.object_id = t.object_id
+                INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
+                WHERE s.name = ?
+                  AND t.name = 'sales'
+                  AND i.name = ?
+            )
+            BEGIN
+                DROP INDEX {self.db_identifier(index_name)} ON {table_name}
+            END
+            """,
+            (schema_name, index_name),
+        )
+
+    def recreate_sales_sqlserver_index_if_missing(self, cur, schema_name, index_spec):
+        schema_name = str(schema_name or "dbo").strip() or "dbo"
+        index_name = str((index_spec or {}).get("name") or "").strip()
+        create_sql = str((index_spec or {}).get("create_sql") or "").strip()
+        if not index_name or not create_sql:
+            return
+        cur.execute(
+            f"""
+            IF NOT EXISTS (
+                SELECT 1
+                FROM sys.indexes i
+                INNER JOIN sys.tables t ON i.object_id = t.object_id
+                INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
+                WHERE s.name = ?
+                  AND t.name = 'sales'
+                  AND i.name = ?
+            )
+            BEGIN
+                {create_sql}
+            END
+            """,
+            (schema_name, index_name),
+        )
+
+    def ensure_sales_sqlserver_text_column_types(self):
+        """Keep sales text fields as text in existing SQL Server databases.
+
+        Some older/manual SQL Server databases can have Customer PO as BIGINT
+        because early values were numeric. MYOB exports can contain non-numeric
+        Customer PO values such as names, slashes, or mixed codes, so the sales
+        import must force customer_po back to NVARCHAR before inserting or
+        updating rows. Do not alter invoice_no here; invoice numbers were not
+        part of this change.
+        """
+        if self.db_conn is None or self.db_engine != "sqlserver" or not self.has_table("sales"):
+            return
+
+        # Only Customer PO is part of the new sales import change.
+        # Leave invoice_no exactly as the existing database already has it.
+        desired_text_columns = {
+            "customer_po": 120,
+        }
+        text_types = {"char", "nchar", "varchar", "nvarchar", "text", "ntext"}
+
+        cur = self.db_conn.cursor()
+        try:
+            column_rows = cur.execute(
+                """
+                SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_NAME = 'sales'
+                """
+            ).fetchall()
+        except Exception:
+            # Do not mask the original import path on databases that do not allow
+            # INFORMATION_SCHEMA access. The later INSERT/UPDATE will still report
+            # the real database problem.
+            return
+
+        column_info = {}
+        for row in column_rows:
+            try:
+                column_name = str(row["COLUMN_NAME"] or "").strip().lower()
+                data_type = str(row["DATA_TYPE"] or "").strip().lower()
+                max_length = row["CHARACTER_MAXIMUM_LENGTH"]
+            except Exception:
+                column_name = str(row[0] if len(row) > 0 else "").strip().lower()
+                data_type = str(row[1] if len(row) > 1 else "").strip().lower()
+                max_length = row[2] if len(row) > 2 else None
+            if column_name:
+                column_info[column_name] = (data_type, max_length)
+
+        columns_to_alter = []
+        for column_name, desired_length in desired_text_columns.items():
+            if column_name not in column_info:
+                continue
+            data_type, max_length = column_info[column_name]
+            try:
+                current_length = int(max_length) if max_length is not None else 0
+            except Exception:
+                current_length = 0
+
+            needs_alter = data_type not in text_types
+            if data_type in {"char", "nchar", "varchar", "nvarchar"} and 0 < current_length < desired_length:
+                needs_alter = True
+
+            if needs_alter:
+                columns_to_alter.append((column_name, desired_length, data_type))
+
+        if not columns_to_alter:
+            return
+
+        schema_name = self.sales_sqlserver_table_schema(cur)
+        table_name = self.sales_sqlserver_table_identifier(schema_name)
+        dependent_indexes = self.sales_sqlserver_dependent_indexes_for_columns(
+            cur,
+            schema_name,
+            [column_name for column_name, _desired_length, _data_type in columns_to_alter],
+        )
+        dropped_indexes = []
+        changed = False
+
+        try:
+            for index_spec in dependent_indexes:
+                self.drop_sales_sqlserver_index_if_exists(cur, schema_name, index_spec["name"])
+                dropped_indexes.append(index_spec)
+
+            for column_name, desired_length, _data_type in columns_to_alter:
+                cur.execute(
+                    f"ALTER TABLE {table_name} ALTER COLUMN {self.db_identifier(column_name)} NVARCHAR({desired_length}) NULL"
+                )
+                changed = True
+
+            for index_spec in dependent_indexes:
+                self.recreate_sales_sqlserver_index_if_missing(cur, schema_name, index_spec)
+
+        except Exception as exc:
+            # Best effort restore.  If the ALTER failed after dropping indexes,
+            # put the indexes back so the app does not leave the database half-migrated.
+            for index_spec in dropped_indexes:
+                try:
+                    self.recreate_sales_sqlserver_index_if_missing(cur, schema_name, index_spec)
+                except Exception:
+                    pass
+            try:
+                self.db_conn.commit()
+            except Exception:
+                pass
+            first_column = columns_to_alter[0]
+            raise ValueError(
+                f"The sales table column {first_column[0]} is currently {first_column[2] or 'an incompatible type'} "
+                f"and could not be changed to NVARCHAR({first_column[1]}). "
+                f"Customer PO must be a text field. Invoice numbers are left unchanged by this migration. "
+                f"Dependent sales indexes were handled automatically, but SQL Server still said: {exc}"
+            ) from exc
 
         if changed:
             self.db_conn.commit()
@@ -13644,12 +14049,12 @@ class MainWindow(QMainWindow):
             "Date\n"
             "Co./Last Name\n"
             "Item Number\n"
+            "Description\n"
             "Quantity\n"
             "Price\n"
-            "Invoice No.\n\n"
-            "Optional columns:\n"
-            "Description\n"
-            "Freight Amount\n\n"
+            "Freight Amount\n"
+            "Invoice No.\n"
+            "Customer PO\n\n"
             "How to export from MYOB AccountRight:\n"
             "1. Open MYOB AccountRight and open the company file.\n"
             "2. Go to File > Import/Export Assistant.\n"
@@ -13658,35 +14063,106 @@ class MainWindow(QMainWindow):
             "5. Choose Item Sales / Item Sales Data / All Sales, depending on the wording in your MYOB version.\n"
             "6. Choose comma-separated or tab-separated text. Comma-separated is preferred.\n"
             "7. Choose to include a header record / first record contains field names.\n"
-            "8. Select these fields: Date, Co./Last Name, Item Number, Description, Quantity, Price, Freight Amount, Invoice No.\n"
+            "8. Select these fields: Date, Co./Last Name, Item Number, Description, Quantity, Price, Freight Amount, Invoice No., Customer PO.\n"
             "9. Export the file and save it somewhere easy to find.\n"
-            "10. In Windsor Widget, click Update Sales and select that exported file.\n\n"
+            "10. In Windsor Widget, click Update Sales. The app will show the exact date range to use before it asks for the file.\n\n"
             "Important:\n"
-            "- Invoice No. is required.\n"
+            "- Use the date range shown in the import instruction window. It starts from the latest sales date already in the database so same-day updates are re-captured.\n"
+            "- Description, Freight Amount, Invoice No., and Customer PO must be present as columns in the export.\n"
+            "- Description values are required for normal item rows. Rare MYOB backslash/non-stock rows can have a blank description and will still import.\n"
+            "- Customer PO values are saved to the sales table. If an imported row already exists, the matching row is updated with the Customer PO from the new file.\n"
+            "- Freight Amount can be blank on a row; blank freight imports as 0.\n"
             "- Multiple rows can share the same Invoice No. This is normal for multi-line invoices.\n"
             "- Duplicate checking uses Invoice No. + Date + Customer + Item Number + Quantity + Price.\n"
             "- Blank rows are ignored.\n"
             "- Rows with a blank Item Number are skipped.\n"
             "- A backslash item number is kept, because MYOB uses it on some non-stock or repair lines.\n"
-            "- Quantity and Price should be numeric.\n"
-            "- Freight Amount is optional.\n\n"
+            "- Quantity and Price should be numeric.\n\n"
             "Example header:\n"
-            "Date,Co./Last Name,Item Number,Description,Quantity,Price,Freight Amount,Invoice No.\n"
+            "Date,Co./Last Name,Item Number,Quantity,Price,Invoice No.,Description,Freight Amount,Customer PO\n"
+        )
+
+    def orders_import_instruction_text(self):
+        return (
+            "ORDERS IMPORT\n\n"
+            "Use this import to rebuild the current on-order purchase lines from MYOB AccountRight.\n"
+            "The import asks for two files and only imports item-purchase rows whose Purchase No. matches an open PO / ID No. on the To Do List report.\n"
+            "The import clears the existing orders table first, then imports the current matched rows.\n\n"
+            "File 1 - To Do List report:\n"
+            "Reports > Purchases > To Do List - Orders To Be Received\n"
+            "Required column: ID No.\n"
+            "Optional but useful columns: Name, Promised Date.\n\n"
+            "File 2 - Item Purchases export:\n"
+            "File > Import/Export Assistant > Export data > Purchases > Item Purchases > Orders\n"
+            "Use the date range from the previous 6 months through today's date.\n"
+            "Required columns: Purchase No., Item Number, Quantity, Shipping Date.\n\n"
+            "How the import works:\n"
+            "1. Select the To Do List - Orders To Be Received report.\n"
+            "2. Select the Item Purchases Orders export.\n"
+            "3. The app matches Item Purchases Purchase No. to To Do List ID No.\n"
+            "4. Matching item rows are imported into Orders.\n"
+            "5. Existing Orders rows are deleted first, so the table reflects the current MYOB open-order list.\n\n"
+            "Important:\n"
+            "- Purchase No. matching ignores spaces and a trailing #, so 26700500# and 26700500 match.\n"
+            "- Backslash/non-stock rows such as \\ON, \\FC, and freight/charge lines are skipped.\n"
+            "- Shipping Date comes from the Item Purchases export. If it is blank, the To Do List Promised Date is used as a fallback.\n"
+            "- Quantity must be greater than 0 for normal item rows.\n"
+            "- TXT, CSV, XLSX, and XLSM are accepted.\n\n"
+            "Expected Item Purchases header:\n"
+            "Purchase No.,Item Number,Quantity,Shipping Date\n"
+        )
+
+    def stock_import_instruction_text(self):
+        return (
+            "STOCK IMPORT\n\n"
+            "Use this import for the MYOB AccountRight Analyze Inventory [Summary] report.\n"
+            "The import replaces the existing stock table with the latest figures from the report.\n\n"
+            "Accepted file types:\n"
+            "CSV, TXT, XLSX, XLSM\n\n"
+            "Required report columns:\n"
+            "Item No.\n"
+            "On Hand\n"
+            "Committed\n"
+            "On Order\n"
+            "Available\n\n"
+            "How to get the report from MYOB AccountRight:\n"
+            "1. Open MYOB AccountRight and open the company file.\n"
+            "2. Go to Reports.\n"
+            "3. Open the Inventory report group.\n"
+            "4. Run Analyze Inventory [Summary].\n"
+            "5. Set the report date/filters you want. For the normal stock update, use the current stock position.\n"
+            "6. Export the report to Excel or CSV.\n"
+            "7. Do not delete rows, rename headings, move columns, or reformat the report. The import scans the report and finds the header row automatically.\n"
+            "8. In Windsor Widget, click Update Stock and select the exported report.\n\n"
+            "Important:\n"
+            "- Nothing needs to be changed in the MYOB report before import.\n"
+            "- The report can contain title/filter rows above the headings; those are ignored.\n"
+            "- Rows with a blank Item No. are ignored.\n"
+            "- Rows where Item No. starts with a backslash are ignored.\n"
+            "- Stock import replaces the previous stock snapshot. It does not append to it.\n\n"
+            "Expected heading example:\n"
+            "Item No.,Item Name,On Hand,Committed,On Order,Available\n"
         )
 
     def cover_orders_import_instruction_text(self):
         return (
             "COVER ORDERS IMPORT\n\n"
-            "Use this for the cover order export. The import replaces the existing cover order data.\n\n"
+            "Use this for customer cover orders. The import replaces the existing cover order data.\n\n"
+            "MYOB export steps:\n"
+            "1. Export > Sales > Orders.\n"
+            "2. Date range: use the date range shown in the import instruction window. It starts from the earliest cover order date currently held in the app through to today.\n"
+            "   Important: this import clears and replaces the cover order table, so exporting only recent rows will remove older cover orders from the app.\n"
+            "3. Export these columns only, matching the MYOB file format below.\n"
+            "4. Do not manually filter the file. The app imports only rows where Journal Memo contains COVER ORDER.\n\n"
             "Required columns:\n"
-            "- Invoice No.\n"
+            "- Date\n"
             "- Co./Last Name\n"
+            "- Invoice No.\n"
             "- Item Number\n"
             "- Quantity\n"
-            "- Date\n"
             "- Journal Memo\n\n"
             "Example header:\n"
-            "Invoice No.,Co./Last Name,Item Number,Quantity,Date,Journal Memo\n"
+            "Date,Co./Last Name,Invoice No.,Item Number,Quantity,Journal Memo\n"
         )
 
     def placeholder_import_instruction_text(self, import_name):
@@ -13696,6 +14172,174 @@ class MainWindow(QMainWindow):
             "Use the matching MYOB export or Windsor source file for this import.\n"
             "Check that the first row contains headings before uploading.\n"
         )
+
+    def subtract_months_from_date(self, value, months):
+        anchor = self.parse_date_value(value) or self.current_business_date()
+        try:
+            months = max(0, int(months))
+        except Exception:
+            months = 0
+        year = anchor.year
+        month = anchor.month - months
+        while month <= 0:
+            month += 12
+            year -= 1
+        while month > 12:
+            month -= 12
+            year += 1
+        if month == 12:
+            next_month_first = date(year + 1, 1, 1)
+        else:
+            next_month_first = date(year, month + 1, 1)
+        last_day = (next_month_first - timedelta(days=1)).day
+        return date(year, month, min(anchor.day, last_day))
+
+    def latest_sales_export_start_date(self):
+        if self.db_conn is None or not self.has_table("sales"):
+            return None
+        try:
+            row = self.db_one(
+                """
+                SELECT MAX(DATE(sale_date)) AS start_date
+                FROM sales
+                WHERE sale_date IS NOT NULL
+                  AND TRIM(CAST(sale_date AS TEXT)) <> ''
+                """
+            )
+        except Exception:
+            return None
+        if row is None:
+            return None
+        return self.parse_date_value(row.get("start_date"))
+
+    def earliest_cover_order_export_start_date(self):
+        if self.db_conn is None or not self.has_table("cover_orders"):
+            return None
+        try:
+            row = self.db_one(
+                """
+                SELECT MIN(DATE(cover_date)) AS start_date
+                FROM cover_orders
+                WHERE cover_date IS NOT NULL
+                  AND TRIM(CAST(cover_date AS TEXT)) <> ''
+                """
+            )
+        except Exception:
+            return None
+        if row is None:
+            return None
+        return self.parse_date_value(row.get("start_date"))
+
+    def import_dialog_today_text(self):
+        return self.current_business_date().strftime("%d/%m/%Y")
+
+    def import_dialog_date_range_text(self, import_key):
+        today = self.current_business_date()
+        today_text = today.strftime("%d/%m/%Y")
+        import_key = str(import_key or "").strip().lower()
+
+        if import_key == "sales":
+            start_date = self.latest_sales_export_start_date()
+            if start_date is None:
+                return (
+                    "DATE RANGE TO USE\n"
+                    f"To date: {today_text}\n"
+                    "From date: no existing sales date was found in the database. Export the full sales history you want stored in the app.\n"
+                )
+            return (
+                "DATE RANGE TO USE\n"
+                f"From date: {start_date.strftime('%d/%m/%Y')}\n"
+                f"To date: {today_text}\n"
+                "Use the latest existing sales date as the from date. Do not start the day after it.\n"
+                "This deliberately re-captures the same day in case invoices were added or changed after the last update.\n"
+            )
+
+        if import_key == "orders":
+            start_date = self.subtract_months_from_date(today, 6)
+            return (
+                "DATE RANGE TO USE\n"
+                f"From date: {start_date.strftime('%d/%m/%Y')}\n"
+                f"To date: {today_text}\n"
+                "This is the previous 6 months through today for the Item Purchases Orders export.\n"
+            )
+
+        if import_key == "cover_orders":
+            start_date = self.earliest_cover_order_export_start_date()
+            if start_date is None:
+                return (
+                    "DATE RANGE TO USE\n"
+                    f"To date: {today_text}\n"
+                    "From date: no existing cover order date was found in the database. Use the earliest cover order date you want kept in the app.\n"
+                    "Remember: this import clears and replaces the cover order table.\n"
+                )
+            return (
+                "DATE RANGE TO USE\n"
+                f"Earliest cover order date currently in the app: {start_date.strftime('%d/%m/%Y')}\n"
+                f"From date: {start_date.strftime('%d/%m/%Y')}\n"
+                f"To date: {today_text}\n"
+                "Start from this earliest date because the cover order import clears and replaces the existing cover order table.\n"
+            )
+
+        if import_key == "stock":
+            return (
+                "DATE RANGE TO USE\n"
+                "No historical date range is needed. Export the current Analyze Inventory [Summary] report.\n"
+            )
+
+        return ""
+
+    def import_instruction_dialog_text(self, import_key):
+        import_key = str(import_key or "").strip().lower()
+        if import_key == "sales":
+            title = "SALES IMPORT"
+            body = self.sales_import_instruction_text()
+        elif import_key == "orders":
+            title = "ORDERS IMPORT"
+            body = self.orders_import_instruction_text()
+        elif import_key == "stock":
+            title = "STOCK IMPORT"
+            body = self.stock_import_instruction_text()
+        elif import_key == "cover_orders":
+            title = "COVER ORDERS IMPORT"
+            body = self.cover_orders_import_instruction_text()
+        else:
+            title = "IMPORT"
+            body = self.placeholder_import_instruction_text(import_key or "data")
+
+        date_range = self.import_dialog_date_range_text(import_key)
+        parts = [title]
+        if date_range:
+            parts.extend(["", date_range.strip()])
+        parts.extend(["", "INSTRUCTIONS", body.strip()])
+        return "\n".join(parts).strip() + "\n"
+
+    def show_import_instructions_dialog(self, import_key, window_title=None, ok_text="OK - Select File"):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(window_title or "Import instructions")
+        dialog.resize(820, 680)
+        layout = QVBoxLayout(dialog)
+
+        instructions = QTextEdit(dialog)
+        instructions.setReadOnly(True)
+        instructions.setPlainText(self.import_instruction_dialog_text(import_key))
+        try:
+            instructions.moveCursor(QTextCursor.Start)
+        except Exception:
+            pass
+        layout.addWidget(instructions, 1)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=dialog)
+        ok_button = button_box.button(QDialogButtonBox.Ok)
+        if ok_button is not None:
+            ok_button.setText(ok_text)
+        cancel_button = button_box.button(QDialogButtonBox.Cancel)
+        if cancel_button is not None:
+            cancel_button.setText("Cancel")
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+
+        return dialog.exec() == QDialog.Accepted
 
     def setup_dashboard(self):
         def connect_once(button, property_name, callback):
@@ -15013,14 +15657,34 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             try:
+                found_stock_tab = False
+                found_orders_tab = False
                 found_cover_tab = False
                 for idx in range(existing_tabs.count()):
-                    if existing_tabs.tabText(idx).strip().casefold() == "cover orders":
-                        widget = existing_tabs.widget(idx)
+                    tab_name = existing_tabs.tabText(idx).strip().casefold()
+                    widget = existing_tabs.widget(idx)
+                    if tab_name == "stock":
+                        if hasattr(widget, "setPlainText"):
+                            widget.setPlainText(self.stock_import_instruction_text())
+                        found_stock_tab = True
+                    elif tab_name == "orders":
+                        if hasattr(widget, "setPlainText"):
+                            widget.setPlainText(self.orders_import_instruction_text())
+                        found_orders_tab = True
+                    elif tab_name == "cover orders":
                         if hasattr(widget, "setPlainText"):
                             widget.setPlainText(self.cover_orders_import_instruction_text())
                         found_cover_tab = True
-                        break
+                if not found_stock_tab:
+                    stock_text = QTextEdit(existing_tabs)
+                    stock_text.setReadOnly(True)
+                    stock_text.setPlainText(self.stock_import_instruction_text())
+                    existing_tabs.addTab(stock_text, "Stock")
+                if not found_orders_tab:
+                    orders_text = QTextEdit(existing_tabs)
+                    orders_text.setReadOnly(True)
+                    orders_text.setPlainText(self.orders_import_instruction_text())
+                    existing_tabs.addTab(orders_text, "Orders")
                 if not found_cover_tab:
                     cover_text = QTextEdit(existing_tabs)
                     cover_text.setReadOnly(True)
@@ -15060,11 +15724,14 @@ class MainWindow(QMainWindow):
         for tab_name in ("Stock", "Orders", "Cover Orders", "Customers", "Items"):
             text_box = QTextEdit(tabs)
             text_box.setReadOnly(True)
-            text_box.setPlainText(
-                self.cover_orders_import_instruction_text()
-                if tab_name == "Cover Orders"
-                else self.placeholder_import_instruction_text(tab_name)
-            )
+            if tab_name == "Stock":
+                text_box.setPlainText(self.stock_import_instruction_text())
+            elif tab_name == "Orders":
+                text_box.setPlainText(self.orders_import_instruction_text())
+            elif tab_name == "Cover Orders":
+                text_box.setPlainText(self.cover_orders_import_instruction_text())
+            else:
+                text_box.setPlainText(self.placeholder_import_instruction_text(tab_name))
             tabs.addTab(text_box, tab_name)
 
         layout.addWidget(tabs, 1)
@@ -15972,8 +16639,8 @@ class MainWindow(QMainWindow):
             "Show Critical Order Analysis across all suppliers. This ignores the Supplier / Group box and scans every item. "
             "Criteria: Sales for the selected period must be greater than 0, and either At Risk is greater than 0 "
             "or stock cover is under one month. Stock cover is calculated as SOH + On Order Form + On Next Container "
-            "+ Shipped Container compared with Avg Monthly Sales. The Special Order / Phase Out / Obsolete checkboxes "
-            "still control whether those statuses are included."
+            "+ Shipped Container compared with Avg Monthly Sales. Items marked with Planning Status = Critical are always included in this view. "
+            "The Special Order / Phase Out / Obsolete checkboxes still control whether those statuses are included."
         )
 
     def handle_order_analysis_header_double_click(self, logical_index):
@@ -18113,30 +18780,60 @@ class MainWindow(QMainWindow):
 
 
     def import_orders_from_dialog(self):
-        filters = "Orders files (*.csv *.xlsx *.xlsm);;CSV files (*.csv);;Excel files (*.xlsx *.xlsm);;All files (*.*)"
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Choose orders import file",
-            str(self.base_dir),
-            filters,
-        )
-        if not file_path:
+        if not self.show_import_instructions_dialog("orders", "Orders import instructions", "OK - Select first file"):
             return
 
-        progress = self.create_import_progress_dialog("Importing orders...", file_path)
+        todo_filters = "MYOB To Do List files (*.xlsx *.xlsm *.csv *.txt);;Excel files (*.xlsx *.xlsm);;Text/CSV files (*.csv *.txt);;All files (*.*)"
+        todo_file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choose MYOB To Do List - Orders To Be Received report",
+            str(self.base_dir),
+            todo_filters,
+        )
+        if not todo_file_path:
+            return
+
+        purchase_filters = "MYOB item purchases export (*.txt *.csv *.xlsx *.xlsm);;Text/CSV files (*.txt *.csv);;Excel files (*.xlsx *.xlsm);;All files (*.*)"
+        purchase_file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choose MYOB Item Purchases Orders export",
+            str(Path(todo_file_path).parent if todo_file_path else self.base_dir),
+            purchase_filters,
+        )
+        if not purchase_file_path:
+            return
+
+        progress = self.create_import_progress_dialog("Importing orders...", purchase_file_path)
         try:
-            imported_count = self.import_orders_file(file_path, progress=progress)
+            imported_count = self.import_orders_files(todo_file_path, purchase_file_path, progress=progress)
             self.update_import_progress(progress, 95, "Refreshing order displays...")
         except Exception as exc:
             self.close_import_progress(progress)
-            QMessageBox.critical(self, "Orders import failed", f"Could not import orders file.\n\n{exc}")
+            QMessageBox.critical(self, "Orders import failed", f"Could not import orders files.\n\n{exc}")
             return
+
+        summary = getattr(self, "_last_orders_import_summary", {}) or {}
+        todo_count = int(summary.get("todo_po_count") or 0)
+        matched_count = int(summary.get("matched_po_count") or 0)
+        unmatched_count = int(summary.get("unmatched_todo_po_count") or 0)
+        skipped_backslash = int(summary.get("skipped_backslash_rows") or 0)
+        skipped_unmatched = int(summary.get("skipped_unmatched_purchase_rows") or 0)
 
         display_text = (
             f"Last import: {datetime.now().strftime('%d/%m/%Y %H:%M')}\n"
-            f"File: {Path(file_path).name}\n"
+            f"To Do List: {Path(todo_file_path).name}\n"
+            f"Item Purchases: {Path(purchase_file_path).name}\n"
+            f"To Do List POs: {todo_count:,}\n"
+            f"Matched POs: {matched_count:,}\n"
             f"Rows imported: {imported_count:,}"
         )
+        if unmatched_count:
+            display_text += f"\nUnmatched To Do List POs: {unmatched_count:,}"
+        if skipped_backslash:
+            display_text += f"\nBackslash/non-stock rows skipped: {skipped_backslash:,}"
+        if skipped_unmatched:
+            display_text += f"\nPurchase rows outside To Do List skipped: {skipped_unmatched:,}"
+
         self.set_meta_value("orders_last_import_display", display_text)
         self.set_meta_value("orders_last_import_iso", datetime.now().isoformat(timespec="seconds"))
         browser = getattr(self.ui, "lastUpdateOrders_textBrowser_3", None)
@@ -18150,12 +18847,46 @@ class MainWindow(QMainWindow):
         self.rerun_order_analysis_if_ready()
 
         self.close_import_progress(progress)
-        QMessageBox.information(self, "Orders imported", f"Imported {imported_count:,} rows into the orders table.")
+        message = f"Imported {imported_count:,} rows into the orders table from {matched_count:,} matched PO(s)."
+        if unmatched_count:
+            message += f"\n\n{unmatched_count:,} To Do List PO(s) had no matching item-purchase rows."
+        QMessageBox.information(self, "Orders imported", message)
 
     def import_orders_file(self, file_path, progress=None):
+        """Legacy single-file orders import.
+
+        The Update Data button now uses import_orders_files(), which combines the
+        MYOB To Do List report with the Item Purchases export. Keep this method
+        so older test harnesses and direct calls can still import a prepared
+        tdlordrs-style file.
+        """
         self.update_import_progress(progress, 8, "Reading orders file...")
         rows = self.read_orders_import_rows(file_path)
         self.update_import_progress(progress, 45, f"Preparing {len(rows):,} order rows...")
+        return self.replace_orders_table_rows(rows, progress=progress)
+
+    def import_orders_files(self, todo_file_path, purchase_file_path, progress=None):
+        self.update_import_progress(progress, 8, "Reading To Do List - Orders To Be Received...")
+        todo_lookup = self.read_order_todo_purchase_lookup(todo_file_path)
+        if not todo_lookup:
+            raise ValueError("The To Do List report did not contain any open purchase order ID No. values.")
+
+        self.update_import_progress(progress, 28, f"Reading item purchases for {len(todo_lookup):,} To Do List PO(s)...")
+        rows, stats = self.read_matched_order_purchase_rows(purchase_file_path, todo_lookup)
+        if not rows:
+            sample_pos = ", ".join(sorted({info.get("purchase_no", "") for info in todo_lookup.values() if info.get("purchase_no")})[:8])
+            raise ValueError(
+                "No item-purchase rows matched the PO / ID No. values from the To Do List report."
+                + (f"\n\nSample To Do List PO values: {sample_pos}" if sample_pos else "")
+            )
+
+        self.update_import_progress(progress, 45, f"Preparing {len(rows):,} matched order rows...")
+        imported_count = self.replace_orders_table_rows(rows, progress=progress)
+        stats["rows_imported"] = imported_count
+        self._last_orders_import_summary = stats
+        return imported_count
+
+    def replace_orders_table_rows(self, rows, progress=None):
         cur = self.db_conn.cursor()
         self.update_import_progress(progress, 60, "Clearing existing order rows...")
         cur.execute("DELETE FROM orders")
@@ -18172,11 +18903,170 @@ class MainWindow(QMainWindow):
     def read_orders_import_rows(self, file_path):
         path = Path(file_path)
         suffix = path.suffix.lower()
-        if suffix == ".csv":
+        if suffix in {".csv", ".txt"}:
             return self.read_orders_rows_from_csv(path)
         if suffix in {".xlsx", ".xlsm"}:
             return self.read_orders_rows_from_excel(path)
-        raise ValueError("Unsupported file type. Choose a CSV or Excel file.")
+        raise ValueError("Unsupported file type. Choose a TXT, CSV, or Excel file.")
+
+    def normalize_order_purchase_key(self, value):
+        text = self.clean_sales_import_field(value) if hasattr(self, "clean_sales_import_field") else str(value or "").strip()
+        text = str(text or "").replace("\u00A0", " ").strip().upper()
+        if not text:
+            return ""
+        text = re.sub(r"\s+", "", text)
+        text = text.rstrip("#")
+        return text
+
+    def get_order_todo_columns(self, headers):
+        normalized = {self.normalize_header(header): index for index, header in enumerate(headers)}
+        id_index = next(
+            (
+                normalized[key]
+                for key in (
+                    "idno",
+                    "idnumber",
+                    "purchaseno",
+                    "purchasenumber",
+                    "pono",
+                    "ponumber",
+                    "po",
+                )
+                if key in normalized
+            ),
+            None,
+        )
+        if id_index is None:
+            raise ValueError("Could not find the To Do List ID No. column.")
+
+        promised_index = next(
+            (
+                normalized[key]
+                for key in ("promiseddate", "shippingdate", "shipdate", "date", "duedate", "eta")
+                if key in normalized
+            ),
+            None,
+        )
+        name_index = next((normalized[key] for key in ("name", "supplier", "suppliername") if key in normalized), None)
+        return {"id_no": id_index, "promised_date": promised_index, "name": name_index}
+
+    def is_order_todo_header_row(self, values):
+        try:
+            self.get_order_todo_columns(["" if value is None else str(value) for value in values])
+            return True
+        except Exception:
+            return False
+
+    def read_order_todo_purchase_lookup(self, file_path):
+        path = Path(file_path)
+        suffix = path.suffix.lower()
+        if suffix in {".xlsx", ".xlsm"}:
+            return self.read_order_todo_lookup_from_excel(path)
+        if suffix in {".csv", ".txt"}:
+            return self.read_order_todo_lookup_from_text(path)
+        raise ValueError("Unsupported To Do List file type. Choose an Excel, TXT, or CSV file.")
+
+    def build_order_todo_lookup_from_rows(self, rows_with_numbers):
+        header_index = None
+        header_values = None
+        for index, (_line_number, values) in enumerate(rows_with_numbers):
+            if self.is_order_todo_header_row(values):
+                header_index = index
+                header_values = ["" if value is None else str(value) for value in values]
+                break
+
+        if header_index is None or header_values is None:
+            raise ValueError("Could not find the To Do List header row. Expected columns like Name, ID No., Promised Date.")
+
+        columns = self.get_order_todo_columns(header_values)
+        lookup = {}
+        for line_number, values in rows_with_numbers[header_index + 1 :]:
+            values = list(values or [])
+            max_index = max(index for index in columns.values() if index is not None)
+            if len(values) <= max_index:
+                values = values + [""] * (max_index + 1 - len(values))
+
+            raw_id = self.clean_sales_import_field(values[columns["id_no"]])
+            raw_id_text = str(raw_id or "").strip()
+            if not raw_id_text:
+                continue
+
+            normalized_id = self.normalize_header(raw_id_text)
+            if normalized_id in {"orderstoreceived", "orderstobereceived", "total", "subtotal"} or raw_id_text.casefold().startswith("total"):
+                continue
+
+            key = self.normalize_order_purchase_key(raw_id_text)
+            if not key:
+                continue
+
+            promised_date = ""
+            promised_index = columns.get("promised_date")
+            if promised_index is not None:
+                raw_date = values[promised_index] if promised_index < len(values) else ""
+                if str(raw_date or "").strip():
+                    try:
+                        promised_date = self.normalize_order_import_date(raw_date)
+                    except ValueError as exc:
+                        raise ValueError(f"To Do List line {line_number}: {exc}") from exc
+
+            supplier_name = ""
+            name_index = columns.get("name")
+            if name_index is not None and name_index < len(values):
+                supplier_name = self.clean_sales_import_field(values[name_index])
+
+            lookup[key] = {
+                "purchase_no": raw_id_text,
+                "promised_date": promised_date,
+                "supplier_name": str(supplier_name or "").strip(),
+                "line_number": line_number,
+            }
+
+        if not lookup:
+            raise ValueError("The To Do List report did not contain any purchase order ID No. values after the header row.")
+        return lookup
+
+    def read_order_todo_lookup_from_excel(self, path):
+        if load_workbook is None:
+            raise ValueError("Excel import is not available because openpyxl is not installed.")
+
+        workbook = load_workbook(filename=str(path), read_only=True, data_only=True)
+        try:
+            sheet = workbook.active
+            rows_with_numbers = []
+            for line_number, values in enumerate(sheet.iter_rows(values_only=True), start=1):
+                if values is None:
+                    continue
+                rows_with_numbers.append((line_number, list(values)))
+        finally:
+            workbook.close()
+        return self.build_order_todo_lookup_from_rows(rows_with_numbers)
+
+    def read_order_todo_lookup_from_text(self, path):
+        import csv
+
+        rows_with_numbers = []
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            for line_number, row in enumerate(csv.reader(handle), start=1):
+                if not any(str(value or "").strip() for value in row):
+                    continue
+                if len(row) == 1 and str(row[0] or "").strip() == "{}":
+                    continue
+                rows_with_numbers.append((line_number, row))
+        return self.build_order_todo_lookup_from_rows(rows_with_numbers)
+
+    def read_matched_order_purchase_rows(self, purchase_file_path, todo_lookup):
+        path = Path(purchase_file_path)
+        suffix = path.suffix.lower()
+        if suffix in {".csv", ".txt"}:
+            rows, stats = self.read_orders_rows_from_csv(path, todo_lookup=todo_lookup)
+        elif suffix in {".xlsx", ".xlsm"}:
+            rows, stats = self.read_orders_rows_from_excel(path, todo_lookup=todo_lookup)
+        else:
+            raise ValueError("Unsupported Item Purchases file type. Choose a TXT, CSV, or Excel file.")
+        stats.setdefault("todo_po_count", len(todo_lookup))
+        stats.setdefault("matched_po_count", 0)
+        stats.setdefault("unmatched_todo_po_count", len(todo_lookup))
+        return rows, stats
 
     def normalize_header(self, header):
         return re.sub(r"[^a-z0-9]+", "", str(header or "").strip().lower())
@@ -18250,60 +19140,159 @@ class MainWindow(QMainWindow):
             f"Invalid shipping date: {text_value}. Expected a date like 7/04/2026 or 2026-04-07."
         )
 
-    def read_orders_rows_from_csv(self, path):
+    def read_orders_rows_from_csv(self, path, todo_lookup=None):
         import csv
 
         with path.open("r", encoding="utf-8-sig", newline="") as handle:
-            reader = csv.DictReader(handle)
-            if not reader.fieldnames:
-                raise ValueError("The selected CSV file has no header row.")
-            column_map = self.get_required_order_columns(reader.fieldnames)
-            rows = []
-            for line_number, row in enumerate(reader, start=2):
-                normalized = self.build_order_import_tuple(row, column_map, line_number)
-                if normalized is not None:
-                    rows.append(normalized)
+            numbered_lines = list(enumerate(handle.readlines(), start=1))
+
+        while numbered_lines and not str(numbered_lines[0][1] or "").strip():
+            numbered_lines.pop(0)
+        if numbered_lines and str(numbered_lines[0][1] or "").strip() == "{}":
+            numbered_lines.pop(0)
+        while numbered_lines and not str(numbered_lines[0][1] or "").strip():
+            numbered_lines.pop(0)
+
+        if not numbered_lines:
+            raise ValueError("The selected orders file has no header row.")
+
+        header_line_index = None
+        headers = None
+        column_map = None
+        search_limit = min(len(numbered_lines), 50)
+        for candidate_index in range(search_limit):
+            line_number, line = numbered_lines[candidate_index]
+            if not str(line or "").strip():
+                continue
+            try:
+                candidate_headers = [self.clean_sales_import_field(value) for value in next(csv.reader([line]))]
+                candidate_column_map = self.get_required_order_columns(candidate_headers)
+            except Exception:
+                continue
+            header_line_index = candidate_index
+            headers = candidate_headers
+            column_map = candidate_column_map
+            break
+
+        if header_line_index is None or headers is None or column_map is None:
+            raise ValueError("Could not find the orders header row. Expected columns like Purchase No., Item Number, Quantity, Shipping Date.")
+
+        rows = []
+        stats = self.new_order_import_stats(todo_lookup)
+        for line_number, line in numbered_lines[header_line_index + 1 :]:
+            if not str(line or "").strip():
+                continue
+            try:
+                parsed = [self.clean_sales_import_field(value) for value in next(csv.reader([line]))]
+            except Exception as exc:
+                raise ValueError(f"Line {line_number}: could not read the orders row: {exc}") from exc
+            if len(parsed) < len(headers):
+                parsed = parsed + [""] * (len(headers) - len(parsed))
+            row = {headers[index]: parsed[index] if index < len(parsed) else "" for index in range(len(headers))}
+            normalized = self.build_order_import_tuple(row, column_map, line_number, todo_lookup=todo_lookup, stats=stats)
+            if normalized is not None:
+                rows.append(normalized)
+
+        self.finish_order_import_stats(stats, todo_lookup)
         if not rows:
             raise ValueError("The selected file did not contain any valid order rows.")
+        if todo_lookup is not None:
+            return rows, stats
         return rows
 
-    def read_orders_rows_from_excel(self, path):
+    def read_orders_rows_from_excel(self, path, todo_lookup=None):
         if load_workbook is None:
             raise ValueError("Excel import is not available because openpyxl is not installed.")
 
         workbook = load_workbook(filename=str(path), read_only=True, data_only=True)
         try:
             sheet = workbook.active
-            raw_headers = next(sheet.iter_rows(min_row=1, max_row=1, values_only=True), None)
-            if not raw_headers:
-                raise ValueError("The selected Excel file has no header row.")
-            headers = ["" if h is None else str(h) for h in raw_headers]
-            column_map = self.get_required_order_columns(headers)
+            all_rows = list(enumerate(sheet.iter_rows(values_only=True), start=1))
+            header_row_index = None
+            headers = None
+            column_map = None
+            for candidate_index, (line_number, values) in enumerate(all_rows[:50]):
+                candidate_headers = ["" if h is None else str(h) for h in (values or [])]
+                try:
+                    candidate_column_map = self.get_required_order_columns(candidate_headers)
+                except Exception:
+                    continue
+                header_row_index = candidate_index
+                headers = candidate_headers
+                column_map = candidate_column_map
+                break
+
+            if header_row_index is None or headers is None or column_map is None:
+                raise ValueError("Could not find the orders header row. Expected columns like Purchase No., Item Number, Quantity, Shipping Date.")
+
             rows = []
-            for line_number, values in enumerate(sheet.iter_rows(min_row=2, values_only=True), start=2):
+            stats = self.new_order_import_stats(todo_lookup)
+            for line_number, values in all_rows[header_row_index + 1 :]:
+                if values is None or not any(str(value or "").strip() for value in values):
+                    continue
                 row_dict = {headers[idx]: values[idx] if idx < len(values) else "" for idx in range(len(headers))}
-                normalized = self.build_order_import_tuple(row_dict, column_map, line_number)
+                normalized = self.build_order_import_tuple(row_dict, column_map, line_number, todo_lookup=todo_lookup, stats=stats)
                 if normalized is not None:
                     rows.append(normalized)
         finally:
             workbook.close()
 
+        self.finish_order_import_stats(stats, todo_lookup)
         if not rows:
             raise ValueError("The selected file did not contain any valid order rows.")
+        if todo_lookup is not None:
+            return rows, stats
         return rows
 
-    def build_order_import_tuple(self, row, column_map, line_number):
+    def new_order_import_stats(self, todo_lookup=None):
+        return {
+            "todo_po_count": len(todo_lookup or {}),
+            "matched_po_keys": set(),
+            "matched_po_count": 0,
+            "unmatched_todo_po_count": len(todo_lookup or {}),
+            "skipped_unmatched_purchase_rows": 0,
+            "skipped_backslash_rows": 0,
+            "skipped_blank_rows": 0,
+        }
+
+    def finish_order_import_stats(self, stats, todo_lookup=None):
+        if stats is None:
+            return
+        matched = stats.get("matched_po_keys") or set()
+        stats["matched_po_count"] = len(matched)
+        if todo_lookup is not None:
+            stats["unmatched_todo_po_count"] = max(0, len(todo_lookup) - len(matched))
+
+    def build_order_import_tuple(self, row, column_map, line_number, todo_lookup=None, stats=None):
         raw_item_number = str(row.get(column_map["item_number"], "") or "").strip()
         item_number = raw_item_number
         quantity_value = self.parse_float(row.get(column_map["quantity"], 0))
-        purchase_no = str(row.get(column_map["purchase_no"], "") or "").strip()
-        shipping_date = self.normalize_order_import_date(row.get(column_map["order_date"], ""))
+        purchase_no = self.clean_sales_import_field(row.get(column_map["purchase_no"], ""))
+        purchase_no = str(purchase_no or "").strip()
+        purchase_key = self.normalize_order_purchase_key(purchase_no)
+
+        if todo_lookup is not None:
+            if not purchase_key or purchase_key not in todo_lookup:
+                if stats is not None and (purchase_no or item_number or quantity_value):
+                    stats["skipped_unmatched_purchase_rows"] = int(stats.get("skipped_unmatched_purchase_rows") or 0) + 1
+                return None
+            if stats is not None:
+                stats.setdefault("matched_po_keys", set()).add(purchase_key)
+
+        raw_shipping_date = row.get(column_map["order_date"], "")
+        if (raw_shipping_date is None or not str(raw_shipping_date).strip()) and todo_lookup is not None and purchase_key in todo_lookup:
+            raw_shipping_date = todo_lookup[purchase_key].get("promised_date", "")
+        shipping_date = self.normalize_order_import_date(raw_shipping_date)
 
         if not item_number and quantity_value <= 0 and not purchase_no and not shipping_date:
+            if stats is not None:
+                stats["skipped_blank_rows"] = int(stats.get("skipped_blank_rows") or 0) + 1
             return None
         if not item_number:
             raise ValueError(f"Line {line_number}: item number is blank.")
         if item_number.startswith("\\"):
+            if stats is not None:
+                stats["skipped_backslash_rows"] = int(stats.get("skipped_backslash_rows") or 0) + 1
             return None
         if quantity_value <= 0:
             raise ValueError(f"Line {line_number}: quantity must be greater than 0.")
@@ -18494,6 +19483,9 @@ class MainWindow(QMainWindow):
         return added
 
     def import_sales_from_dialog(self):
+        if not self.show_import_instructions_dialog("sales", "Sales import instructions"):
+            return
+
         filters = "Sales files (*.txt *.csv *.xlsx *.xlsm);;Text files (*.txt);;CSV files (*.csv);;Excel files (*.xlsx *.xlsm);;All files (*.*)"
         file_path, _ = QFileDialog.getOpenFileName(
             self,
@@ -18507,8 +19499,10 @@ class MainWindow(QMainWindow):
         progress = self.create_import_progress_dialog("Importing sales...", file_path)
         try:
             self._last_sales_customers_added = 0
+            self._last_sales_customer_po_updated = 0
             imported_count = self.import_sales_file(file_path, progress=progress)
             customers_added = int(getattr(self, "_last_sales_customers_added", 0) or 0)
+            customer_po_updated = int(getattr(self, "_last_sales_customer_po_updated", 0) or 0)
             self.update_import_progress(progress, 92, "Refreshing sales and customer lists...")
         except Exception as exc:
             self.close_import_progress(progress)
@@ -18519,6 +19513,7 @@ class MainWindow(QMainWindow):
             f"Last import: {datetime.now().strftime('%d/%m/%Y %H:%M')}\n"
             f"File: {Path(file_path).name}\n"
             f"Rows added: {imported_count:,}\n"
+            f"Customer PO rows updated: {customer_po_updated:,}\n"
             f"New customers added: {customers_added:,}"
         )
         self.set_meta_value("sales_last_import_display", display_text)
@@ -18536,19 +19531,24 @@ class MainWindow(QMainWindow):
         self.rerun_item_if_ready()
 
         self.close_import_progress(progress)
-        customer_message = ""
+        message_parts = [f"Added {imported_count:,} new row(s) to the sales table."]
+        if customer_po_updated:
+            message_parts.append(f"Updated Customer PO on {customer_po_updated:,} existing row(s).")
         if customers_added:
-            customer_message = f"\n\nAdded {customers_added:,} new customer(s) to the customer list."
+            message_parts.append(f"Added {customers_added:,} new customer(s) to the customer list.")
         QMessageBox.information(
             self,
             "Sales imported",
-            f"Added {imported_count:,} new rows to the sales table.{customer_message}",
+            "\n\n".join(message_parts),
         )
 
     def import_sales_file(self, file_path, progress=None):
-        self.update_import_progress(progress, 5, "Reading sales file...")
+        self.update_import_progress(progress, 5, "Preparing sales table...")
+        self.ensure_sales_optional_columns()
+        self.update_import_progress(progress, 8, "Reading sales file...")
         rows = self.read_sales_import_rows(file_path)
         if not rows:
+            self._last_sales_customer_po_updated = 0
             return 0
 
         self.update_import_progress(progress, 28, "Checking customer list...")
@@ -18592,22 +19592,55 @@ class MainWindow(QMainWindow):
             incoming_counts[signature] += 1
             rows_to_insert.append(row)
 
+        customer_po_rows = [row for row in rows if str(row[10] if len(row) > 10 else "").strip()]
+        customer_po_updated = 0
+        cur = self.db_conn.cursor()
+
         if rows_to_insert:
-            cur = self.db_conn.cursor()
-            self.update_import_progress(progress, 75, f"Saving {len(rows_to_insert):,} sales rows...")
+            self.update_import_progress(progress, 72, f"Saving {len(rows_to_insert):,} sales rows...")
             cur.executemany(
                 """
                 INSERT INTO sales (
                     sale_date, customer_name, item_number, description,
-                    month_key, quantity, price, extended, invoice_no, freight_amount
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    month_key, quantity, price, extended, invoice_no, freight_amount, customer_po
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows_to_insert,
             )
+        else:
+            self.update_import_progress(progress, 72, "No new sales rows to save.")
+
+        if customer_po_rows:
+            self.update_import_progress(progress, 82, f"Updating Customer PO on existing sales rows...")
+            for row in customer_po_rows:
+                customer_po = str(row[10] or "").strip()
+                cur.execute(
+                    """
+                    UPDATE sales
+                    SET customer_po = ?
+                    WHERE sale_date = ?
+                      AND customer_name = ?
+                      AND item_number = ?
+                      AND ABS(quantity - ?) < 0.000001
+                      AND ABS(price - ?) < 0.000001
+                      AND invoice_no = ?
+                      AND (customer_po IS NULL OR LTRIM(RTRIM(customer_po)) = '' OR customer_po <> ?)
+                    """,
+                    (customer_po, row[0], row[1], row[2], row[5], row[6], row[8], customer_po),
+                )
+                try:
+                    if cur.rowcount and cur.rowcount > 0:
+                        customer_po_updated += int(cur.rowcount)
+                except Exception:
+                    pass
+
+        if rows_to_insert or customer_po_updated:
             self.update_import_progress(progress, 88, "Committing sales import...")
             self.db_conn.commit()
         else:
-            self.update_import_progress(progress, 88, "No new sales rows to save.")
+            self.update_import_progress(progress, 88, "No sales changes to save.")
+
+        self._last_sales_customer_po_updated = customer_po_updated
         return len(rows_to_insert)
 
     def read_sales_import_rows(self, file_path):
@@ -18625,12 +19658,24 @@ class MainWindow(QMainWindow):
             "sale_date": ["date", "saledate"],
             "customer_name": ["colastname", "customer", "customername", "companylastname", "lastname", "co lastname"],
             "item_number": ["itemnumber", "item", "itemno"],
+            "description": ["description", "itemdescription", "itemname", "name"],
             "quantity": ["quantity", "qty"],
             "price": ["price", "unitprice", "sellprice"],
-            "invoice_no": ["invoiceno", "invoice", "invno", "invoicenumber", "taxinvoice"],
-        }
-        optional_aliases = {
             "freight_amount": ["freightamount", "freight", "freightamt", "freightvalue", "shippingamount"],
+            "invoice_no": ["invoiceno", "invoice", "invno", "invoicenumber", "taxinvoice"],
+            "customer_po": [
+                "customerpo",
+                "customerpono",
+                "customerponumber",
+                "custpo",
+                "custpono",
+                "custponumber",
+                "customerpurchaseorder",
+                "purchaseordernumber",
+                "purchaseorder",
+                "ponumber",
+                "pono",
+            ],
         }
         resolved = {}
         missing = []
@@ -18641,15 +19686,21 @@ class MainWindow(QMainWindow):
             else:
                 resolved[field_name] = matched
         if missing:
-            missing_text = ", ".join(missing)
+            display_names = {
+                "sale_date": "Date",
+                "customer_name": "Co./Last Name",
+                "item_number": "Item Number",
+                "description": "Description",
+                "quantity": "Quantity",
+                "price": "Price",
+                "freight_amount": "Freight Amount",
+                "invoice_no": "Invoice No.",
+                "customer_po": "Customer PO",
+            }
+            missing_text = ", ".join(display_names.get(name, name) for name in missing)
             raise ValueError(
-                f"Missing required column(s): {missing_text}. Expected columns like Date, Co./Last Name, Item Number, Quantity, Price, Invoice No."
+                f"Missing required column(s): {missing_text}. Expected columns like Date, Co./Last Name, Item Number, Description, Quantity, Price, Freight Amount, Invoice No., Customer PO."
             )
-
-        for field_name, options in optional_aliases.items():
-            matched = next((normalized[key] for key in options if key in normalized), None)
-            if matched is not None:
-                resolved[field_name] = matched
         return resolved
 
     def normalize_sales_import_date(self, value):
@@ -18733,40 +19784,133 @@ class MainWindow(QMainWindow):
                     result[key] = str(item_name or "").strip()
         return result
 
-    def read_sales_rows_from_csv(self, path):
+    def clean_sales_import_field(self, value):
+        """Clean MYOB text fields without changing the real value.
+
+        MYOB AccountRight can export some fields with awkward doubled outer
+        quotes, for example ""Wise, C E"", and some descriptions with a
+        literal inch quote before the delimiter, for example 7"".  The normal
+        csv module can then shift the row so Invoice No. becomes Price or
+        Freight, which later causes SQL Server conversion errors.
+        """
+        text = "" if value is None else str(value).strip()
+        while len(text) >= 2 and text.startswith('"') and text.endswith('"'):
+            text = text[1:-1].strip()
+        return text.replace('""', '"').strip()
+
+    def is_standard_myob_sales_header(self, headers):
+        normalized = [self.normalize_header(header) for header in headers]
+        return normalized == [
+            "date",
+            "colastname",
+            "itemnumber",
+            "quantity",
+            "price",
+            "invoiceno",
+            "description",
+            "freightamount",
+            "customerpo",
+        ]
+
+    def parse_standard_myob_sales_line(self, line, line_number):
+        """Parse the standard MYOB sales export line using known column positions.
+
+        This is a fallback for MYOB's not-quite-CSV rows.  It keeps normal CSV
+        parsing for good lines, but recovers rows where a customer name contains
+        a comma or a description contains an unescaped quote.
+        """
+        text = str(line or "").rstrip("\r\n")
+        front_match = re.match(
+            r"^(?P<date>[^,]+),(?P<customer>.*),(?P<item>[^,]*),"
+            r"(?P<qty>-?\d+(?:\.\d+)?),(?P<price>\$?-?(?:\d+(?:,\d{3})*|\d*|\.\d+)(?:\.\d+)?),"
+            r"(?P<invoice>\d+),(?P<tail>.*)$",
+            text,
+        )
+        if not front_match:
+            raise ValueError(
+                f"Line {line_number}: could not read the MYOB sales row. "
+                "Check for a broken comma or quote in the customer/item/price/invoice fields."
+            )
+
+        tail = front_match.group("tail")
+        tail_match = re.match(
+            r"^(?P<description>.*),(?P<freight>\"?\$?-?(?:\d+(?:,\d{3})*|\d*|\.\d+)(?:\.\d+)?\"?),(?P<customer_po>.*)$",
+            tail,
+        )
+        if not tail_match:
+            raise ValueError(
+                f"Line {line_number}: could not read the MYOB sales description/freight/Customer PO fields."
+            )
+
+        values = [
+            front_match.group("date"),
+            front_match.group("customer"),
+            front_match.group("item"),
+            front_match.group("qty"),
+            front_match.group("price"),
+            front_match.group("invoice"),
+            tail_match.group("description"),
+            tail_match.group("freight"),
+            tail_match.group("customer_po"),
+        ]
+        return [self.clean_sales_import_field(value) for value in values]
+
+    def sales_import_row_from_text_line(self, line, headers, line_number, allow_myob_fallback):
         import csv
-        import io
 
-        with path.open("r", encoding="utf-8-sig", newline="") as handle:
-            raw_lines = handle.readlines()
+        try:
+            parsed = next(csv.reader([line]))
+        except Exception:
+            parsed = []
 
-        while raw_lines and not raw_lines[0].strip():
-            raw_lines.pop(0)
+        if len(parsed) == len(headers):
+            return {headers[index]: self.clean_sales_import_field(parsed[index]) for index in range(len(headers))}
 
-        if raw_lines and raw_lines[0].strip() == '{}':
-            raw_lines.pop(0)
+        if allow_myob_fallback:
+            parsed = self.parse_standard_myob_sales_line(line, line_number)
+            return {headers[index]: parsed[index] for index in range(len(headers))}
 
-        while raw_lines and not raw_lines[0].strip():
-            raw_lines.pop(0)
-
-        if not raw_lines:
-            raise ValueError("The selected sales file has no header row.")
-
-        reader = csv.DictReader(io.StringIO(''.join(raw_lines)))
-        if not reader.fieldnames:
-            raise ValueError("The selected sales file has no header row.")
-
-        column_map = self.get_required_sales_columns(reader.fieldnames)
-        raw_rows = list(reader)
-
-        item_map = self.fetch_item_name_map(
-            str(row.get(column_map["item_number"], "") or "").strip()
-            for row in raw_rows
+        raise ValueError(
+            f"Line {line_number}: expected {len(headers)} columns but found {len(parsed)}. "
+            "Check for an extra comma or broken quote in that row."
         )
 
+    def read_sales_rows_from_csv(self, path):
+        import csv
+
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            numbered_lines = list(enumerate(handle.readlines(), start=1))
+
+        while numbered_lines and not numbered_lines[0][1].strip():
+            numbered_lines.pop(0)
+
+        if numbered_lines and numbered_lines[0][1].strip() == '{}':
+            numbered_lines.pop(0)
+
+        while numbered_lines and not numbered_lines[0][1].strip():
+            numbered_lines.pop(0)
+
+        if not numbered_lines:
+            raise ValueError("The selected sales file has no header row.")
+
+        header_line_number, header_line = numbered_lines[0]
+        try:
+            headers = [self.clean_sales_import_field(value) for value in next(csv.reader([header_line]))]
+        except Exception as exc:
+            raise ValueError(f"Line {header_line_number}: could not read the sales header row: {exc}") from exc
+
+        if not headers:
+            raise ValueError("The selected sales file has no header row.")
+
+        column_map = self.get_required_sales_columns(headers)
+        allow_myob_fallback = self.is_standard_myob_sales_header(headers)
+
         rows = []
-        for line_number, row in enumerate(raw_rows, start=2):
-            normalized = self.build_sales_import_tuple(row, column_map, line_number, item_map)
+        for line_number, line in numbered_lines[1:]:
+            if not str(line or "").strip():
+                continue
+            row = self.sales_import_row_from_text_line(line, headers, line_number, allow_myob_fallback)
+            normalized = self.build_sales_import_tuple(row, column_map, line_number)
             if normalized is not None:
                 rows.append(normalized)
         return rows
@@ -18789,29 +19933,26 @@ class MainWindow(QMainWindow):
         finally:
             workbook.close()
 
-        item_map = self.fetch_item_name_map(
-            str(row.get(column_map["item_number"], "") or "").strip()
-            for row in raw_rows
-        )
-
         rows = []
         for line_number, row in enumerate(raw_rows, start=2):
-            normalized = self.build_sales_import_tuple(row, column_map, line_number, item_map)
+            normalized = self.build_sales_import_tuple(row, column_map, line_number)
             if normalized is not None:
                 rows.append(normalized)
         return rows
 
-    def build_sales_import_tuple(self, row, column_map, line_number, item_map):
+    def build_sales_import_tuple(self, row, column_map, line_number, item_map=None):
         sale_date = self.normalize_sales_import_date(row.get(column_map["sale_date"], ""))
         customer_name = str(row.get(column_map["customer_name"], "") or "").strip()
         raw_item_number = str(row.get(column_map["item_number"], "") or "").strip()
         item_number = raw_item_number
+        description = str(row.get(column_map["description"], "") or "").strip()
         quantity_value = self.parse_float(row.get(column_map["quantity"], 0))
         price_value = self.parse_float(row.get(column_map["price"], 0))
+        freight_amount = self.parse_float(row.get(column_map["freight_amount"], 0))
         invoice_no = str(row.get(column_map["invoice_no"], "") or "").strip()
-        freight_amount = self.parse_float(row.get(column_map.get("freight_amount", ""), 0)) if column_map.get("freight_amount") else 0.0
+        customer_po = str(row.get(column_map["customer_po"], "") or "").strip()
 
-        if not sale_date and not customer_name and not item_number and quantity_value == 0 and price_value == 0:
+        if not sale_date and not customer_name and not item_number and not description and quantity_value == 0 and price_value == 0:
             return None
         if not item_number:
             return None
@@ -18820,22 +19961,32 @@ class MainWindow(QMainWindow):
             raise ValueError(f"Line {line_number}: customer name is blank.")
         if not sale_date:
             raise ValueError(f"Line {line_number}: sale date is blank.")
+        if not description and raw_item_number != "\\":
+            raise ValueError(f"Line {line_number}: description is blank.")
         if not invoice_no:
             raise ValueError(f"Line {line_number}: invoice number is blank.")
 
-        description = item_map.get(str(raw_item_number or "").strip().upper(), "")
-        if not description:
-            description = item_map.get(str(item_number or "").strip().upper(), "")
-        if not description:
-            description = item_map.get(self.item_clean_key(item_number), "")
-        if not description:
-            description = item_number
         month_key = self.sales_month_key_from_date(sale_date)
         extended = quantity_value * price_value
-        return (sale_date, customer_name, item_number, description, month_key, quantity_value, price_value, extended, invoice_no, freight_amount)
+        return (
+            sale_date,
+            customer_name,
+            item_number,
+            description,
+            month_key,
+            quantity_value,
+            price_value,
+            extended,
+            invoice_no,
+            freight_amount,
+            customer_po,
+        )
 
     def import_cover_orders_from_dialog(self):
-        filters = "Cover order files (*.csv *.xlsx *.xlsm);;CSV files (*.csv);;Excel files (*.xlsx *.xlsm);;All files (*.*)"
+        if not self.show_import_instructions_dialog("cover_orders", "Cover orders import instructions"):
+            return
+
+        filters = "Cover order files (*.txt *.csv *.xlsx *.xlsm);;MYOB text files (*.txt);;CSV files (*.csv);;Excel files (*.xlsx *.xlsm);;All files (*.*)"
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Choose cover orders import file",
@@ -18857,7 +20008,7 @@ class MainWindow(QMainWindow):
         display_text = (
             f"Last import: {datetime.now().strftime('%d/%m/%Y %H:%M')}\n"
             f"File: {Path(file_path).name}\n"
-            f"Rows imported: {imported_count:,}"
+            f"COVER ORDER rows imported: {imported_count:,}"
         )
         self.set_meta_value("cover_orders_last_import_display", display_text)
         self.set_meta_value("cover_orders_last_import_iso", datetime.now().isoformat(timespec="seconds"))
@@ -18868,12 +20019,12 @@ class MainWindow(QMainWindow):
 
         self.rerun_search_if_ready()
         self.close_import_progress(progress)
-        QMessageBox.information(self, "Cover orders imported", f"Imported {imported_count:,} rows into the cover orders table.")
+        QMessageBox.information(self, "Cover orders imported", f"Imported {imported_count:,} COVER ORDER rows into the cover orders table.")
 
     def import_cover_orders_file(self, file_path, progress=None):
         self.update_import_progress(progress, 8, "Preparing cover order table...")
         self.ensure_cover_orders_table()
-        self.update_import_progress(progress, 25, "Reading cover order file...")
+        self.update_import_progress(progress, 25, "Reading and filtering cover order file...")
         rows = self.read_cover_order_import_rows(file_path)
         cur = self.db_conn.cursor()
         self.update_import_progress(progress, 55, "Clearing existing cover order rows...")
@@ -18895,20 +20046,20 @@ class MainWindow(QMainWindow):
     def read_cover_order_import_rows(self, file_path):
         path = Path(file_path)
         suffix = path.suffix.lower()
-        if suffix == ".csv":
+        if suffix in {".csv", ".txt"}:
             return self.read_cover_order_rows_from_csv(path)
         if suffix in {".xlsx", ".xlsm"}:
             return self.read_cover_order_rows_from_excel(path)
-        raise ValueError("Unsupported file type. Choose a CSV or Excel file.")
+        raise ValueError("Unsupported file type. Choose a TXT, CSV, or Excel cover order file.")
 
     def get_required_cover_order_columns(self, headers):
         normalized = {self.normalize_header(h): h for h in headers}
         aliases = {
-            "invoice_no": ["invoiceno", "invoice", "invno", "invoicenumber", "orderno", "order"],
+            "cover_date": ["date", "coverdate", "orderdate", "saledate"],
             "customer_name": ["colastname", "customer", "customername", "companylastname", "lastname"],
+            "invoice_no": ["invoiceno", "invoice", "invno", "invoicenumber", "orderno", "order"],
             "item_number": ["itemnumber", "item", "itemno"],
             "quantity": ["quantity", "qty"],
-            "cover_date": ["date", "coverdate", "orderdate", "saledate"],
             "journal_memo": ["journalmemo", "memo", "notes", "description"],
         }
         resolved = {}
@@ -18922,25 +20073,42 @@ class MainWindow(QMainWindow):
         if missing:
             missing_text = ", ".join(missing)
             raise ValueError(
-                f"Missing required column(s): {missing_text}. Expected columns like Invoice No., Co./Last Name, Item Number, Quantity, Date, Journal Memo."
+                f"Missing required column(s): {missing_text}. Expected columns like Date, Co./Last Name, Invoice No., Item Number, Quantity, Journal Memo."
             )
         return resolved
+
+    def locate_cover_order_header_row(self, rows, max_scan_rows=80):
+        scan_limit = min(len(rows), max_scan_rows)
+        for idx, row in enumerate(rows[:scan_limit]):
+            headers = [self.clean_sales_import_field(value) for value in row]
+            try:
+                column_map = self.get_required_cover_order_columns(headers)
+                return idx, headers, column_map
+            except ValueError:
+                continue
+        raise ValueError(
+            "Could not find the cover orders header row. Expected columns like Date, Co./Last Name, Invoice No., Item Number, Quantity, Journal Memo."
+        )
 
     def read_cover_order_rows_from_csv(self, path):
         import csv
 
         with path.open("r", encoding="utf-8-sig", newline="") as handle:
-            reader = csv.DictReader(handle)
-            if not reader.fieldnames:
-                raise ValueError("The selected cover orders file has no header row.")
-            column_map = self.get_required_cover_order_columns(reader.fieldnames)
-            rows = []
-            for line_number, row in enumerate(reader, start=2):
-                normalized = self.build_cover_order_import_tuple(row, column_map, line_number)
-                if normalized is not None:
-                    rows.append(normalized)
+            raw_rows = list(csv.reader(handle))
+        if not raw_rows:
+            raise ValueError("The selected cover orders file is empty.")
+
+        header_index, headers, column_map = self.locate_cover_order_header_row(raw_rows)
+        rows = []
+        for line_number, values in enumerate(raw_rows[header_index + 1 :], start=header_index + 2):
+            if not any(str(value or "").strip() for value in values):
+                continue
+            row_dict = {headers[idx]: values[idx] if idx < len(values) else "" for idx in range(len(headers))}
+            normalized = self.build_cover_order_import_tuple(row_dict, column_map, line_number)
+            if normalized is not None:
+                rows.append(normalized)
         if not rows:
-            raise ValueError("The selected file did not contain any valid cover order rows.")
+            raise ValueError("The selected file did not contain any rows where Journal Memo contains COVER ORDER.")
         return rows
 
     def read_cover_order_rows_from_excel(self, path):
@@ -18950,13 +20118,15 @@ class MainWindow(QMainWindow):
         workbook = load_workbook(filename=str(path), read_only=True, data_only=True)
         try:
             sheet = workbook.active
-            raw_headers = next(sheet.iter_rows(min_row=1, max_row=1, values_only=True), None)
-            if not raw_headers:
-                raise ValueError("The selected cover orders file has no header row.")
-            headers = ["" if h is None else str(h) for h in raw_headers]
-            column_map = self.get_required_cover_order_columns(headers)
+            header_scan_rows = [tuple(row) for row in sheet.iter_rows(min_row=1, max_row=80, values_only=True)]
+            if not header_scan_rows:
+                raise ValueError("The selected cover orders file is empty.")
+            header_index, headers, column_map = self.locate_cover_order_header_row(header_scan_rows)
             rows = []
-            for line_number, values in enumerate(sheet.iter_rows(min_row=2, values_only=True), start=2):
+            for line_number, values in enumerate(sheet.iter_rows(min_row=header_index + 2, values_only=True), start=header_index + 2):
+                values = list(values or [])
+                if not any(str(value or "").strip() for value in values):
+                    continue
                 row_dict = {headers[idx]: values[idx] if idx < len(values) else "" for idx in range(len(headers))}
                 normalized = self.build_cover_order_import_tuple(row_dict, column_map, line_number)
                 if normalized is not None:
@@ -18965,33 +20135,37 @@ class MainWindow(QMainWindow):
             workbook.close()
 
         if not rows:
-            raise ValueError("The selected file did not contain any valid cover order rows.")
+            raise ValueError("The selected file did not contain any rows where Journal Memo contains COVER ORDER.")
         return rows
 
     def build_cover_order_import_tuple(self, row, column_map, line_number):
+        journal_memo = str(row.get(column_map["journal_memo"], "") or "").strip()
+        if "COVER ORDER" not in journal_memo.upper():
+            return None
+
         invoice_no = str(row.get(column_map["invoice_no"], "") or "").strip()
         customer_name = str(row.get(column_map["customer_name"], "") or "").strip()
         raw_item_number = str(row.get(column_map["item_number"], "") or "").strip()
         item_number = raw_item_number
         quantity_value = self.parse_float(row.get(column_map["quantity"], 0))
         cover_date = self.normalize_sales_import_date(row.get(column_map["cover_date"], ""))
-        journal_memo = str(row.get(column_map["journal_memo"], "") or "").strip()
 
-        if not invoice_no and not customer_name and not item_number and quantity_value == 0 and not cover_date and not journal_memo:
-            return None
         if not invoice_no:
-            raise ValueError(f"Line {line_number}: invoice/order number is blank.")
+            raise ValueError(f"Line {line_number}: invoice/order number is blank on a COVER ORDER row.")
         if not customer_name:
-            raise ValueError(f"Line {line_number}: customer name is blank.")
+            raise ValueError(f"Line {line_number}: customer name is blank on a COVER ORDER row.")
         if not item_number:
-            raise ValueError(f"Line {line_number}: item number is blank.")
+            raise ValueError(f"Line {line_number}: item number is blank on a COVER ORDER row.")
         if not cover_date:
-            raise ValueError(f"Line {line_number}: date is blank or invalid.")
+            raise ValueError(f"Line {line_number}: date is blank or invalid on a COVER ORDER row.")
 
         item_number = self.canonicalize_import_item_number(raw_item_number)
         return (invoice_no, customer_name, item_number, quantity_value, cover_date, journal_memo)
 
     def import_stock_from_dialog(self):
+        if not self.show_import_instructions_dialog("stock", "Stock import instructions"):
+            return
+
         filters = "Stock files (*.xlsx *.xlsm *.csv *.txt);;Excel files (*.xlsx *.xlsm);;CSV files (*.csv *.txt);;All files (*.*)"
         file_path, _ = QFileDialog.getOpenFileName(
             self,
@@ -23111,6 +24285,31 @@ $mail.Display()
         expr = f"COALESCE({', '.join(parts)}, 0)" if parts else "0"
         return f"{expr} AS freight_amount" if alias else expr
 
+    def sales_customer_po_column_names(self):
+        candidates = [
+            "Customer PO", "customer_po", "customer po", "Customer P.O.", "customer_p_o",
+            "Customer Purchase Order", "customer_purchase_order", "Purchase Order", "purchase_order",
+            "PO", "po", "P/O", "p_o", "Cust PO", "cust_po",
+        ]
+        columns = {name.lower(): name for name in self.get_table_columns("sales")}
+        resolved = []
+        seen = set()
+        for candidate in candidates:
+            actual = columns.get(candidate.lower())
+            if not actual:
+                continue
+            key = actual.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            resolved.append(actual)
+        return resolved
+
+    def build_sales_customer_po_expression(self, alias=False):
+        parts = [f"NULLIF(TRIM(CAST({self.db_identifier(column_name)} AS TEXT)), '')" for column_name in self.sales_customer_po_column_names()]
+        expr = f"COALESCE({', '.join(parts)}, '')" if parts else "''"
+        return f"{expr} AS customer_po" if alias else expr
+
     def fetch_sales_invoice_lines(self, customer_name, item_numbers, month_start, combine_accounts=False):
         month_start = self.parse_date_value(month_start)
         if month_start is None:
@@ -23128,6 +24327,7 @@ $mail.Display()
             item_clause, item_params = self.build_sales_item_filter_clause(item_numbers)
 
         invoice_expr = self.build_sales_invoice_expression(alias=True)
+        customer_po_expr = self.build_sales_customer_po_expression(alias=True)
         freight_expr = self.build_sales_freight_expression(alias=True)
 
         rows = self.db_all(
@@ -23137,6 +24337,7 @@ $mail.Display()
                 TRIM(customer_name) AS customer_name,
                 TRIM(item_number) AS item_number,
                 {invoice_expr},
+                {customer_po_expr},
                 COALESCE(NULLIF(TRIM(description), ''), TRIM(item_number)) AS description,
                 COALESCE(quantity, 0) AS quantity,
                 COALESCE(price, 0) AS price,
@@ -23213,11 +24414,12 @@ $mail.Display()
         layout.addWidget(summary)
 
         detail_table = QTableWidget(dialog)
-        detail_table.setColumnCount(8)
+        detail_table.setColumnCount(9)
         detail_table.setHorizontalHeaderLabels([
             "Sale Date",
             "Customer",
             "Invoice No",
+            "Customer PO",
             "Description / Invoice Line",
             "Qty",
             "Price",
@@ -23245,6 +24447,7 @@ $mail.Display()
             sale_date_text = self.format_short_date(line.get("sale_date"))
             customer_text = (line.get("customer_name") or "").strip()
             invoice_text = (line.get("invoice_no") or "").strip()
+            customer_po_text = (line.get("customer_po") or "").strip()
             description_text = (line.get("description") or "").strip()
             qty_value = self.parse_float(line.get("quantity", 0))
             price_value = self.parse_float(line.get("price", 0))
@@ -23258,6 +24461,7 @@ $mail.Display()
                 sale_date_text,
                 customer_text,
                 invoice_text,
+                customer_po_text,
                 description_text,
                 self.format_value(qty_value),
                 self.format_price(price_value),
@@ -23268,6 +24472,7 @@ $mail.Display()
                 self.sort_date_value(line.get("sale_date")),
                 self.sort_text_value(customer_text),
                 self.sort_text_value(invoice_text),
+                self.sort_text_value(customer_po_text),
                 self.sort_text_value(description_text),
                 qty_value,
                 price_value,
@@ -23281,7 +24486,7 @@ $mail.Display()
                     item.setData(Qt.UserRole, invoice_text)
                     if invoice_text:
                         item.setToolTip("Double-click the invoice number to show all lines on this invoice.")
-                if col_index in (4, 5, 6, 7):
+                if col_index in (5, 6, 7, 8):
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 detail_table.setItem(row_index, col_index, item)
 
@@ -23290,8 +24495,9 @@ $mail.Display()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.Stretch)
-        for col in range(4, 8):
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.Stretch)
+        for col in range(5, 9):
             header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
         detail_table.resizeRowsToContents()
 
@@ -23332,6 +24538,7 @@ $mail.Display()
             return []
 
         invoice_expr = self.build_sales_invoice_expression(alias=False)
+        customer_po_expr = self.build_sales_customer_po_expression(alias=True)
         freight_expr = self.build_sales_freight_expression(alias=True)
         rows = self.db_all(
             f"""
@@ -23340,6 +24547,7 @@ $mail.Display()
                 TRIM(customer_name) AS customer_name,
                 TRIM(item_number) AS item_number,
                 {invoice_expr} AS invoice_no,
+                {customer_po_expr},
                 COALESCE(NULLIF(TRIM(description), ''), TRIM(item_number)) AS description,
                 COALESCE(quantity, 0) AS quantity,
                 COALESCE(price, 0) AS price,
@@ -23364,15 +24572,24 @@ $mail.Display()
         dialog.resize(1120, 650)
         layout = QVBoxLayout(dialog)
 
-        summary = QLabel(f"Invoice: {invoice_no}\nAll sales lines found for this invoice.")
+        customer_pos = sorted({str(row.get("customer_po") or "").strip() for row in rows if str(row.get("customer_po") or "").strip()})
+        po_summary = ""
+        if len(customer_pos) == 1:
+            po_summary = f"\nCustomer PO: {customer_pos[0]}"
+        elif len(customer_pos) > 1:
+            preview = ", ".join(customer_pos[:6])
+            extra = f" +{len(customer_pos) - 6} more" if len(customer_pos) > 6 else ""
+            po_summary = f"\nCustomer POs: {preview}{extra}"
+        summary = QLabel(f"Invoice: {invoice_no}{po_summary}\nAll sales lines found for this invoice.")
         summary.setWordWrap(True)
         layout.addWidget(summary)
 
         table = QTableWidget(dialog)
-        table.setColumnCount(8)
+        table.setColumnCount(9)
         table.setHorizontalHeaderLabels([
             "Sale Date",
             "Customer",
+            "Customer PO",
             "Item Number",
             "Description",
             "Qty",
@@ -23406,6 +24623,7 @@ $mail.Display()
             values = [
                 self.format_short_date(line.get("sale_date")),
                 (line.get("customer_name") or "").strip(),
+                (line.get("customer_po") or "").strip(),
                 (line.get("item_number") or "").strip(),
                 (line.get("description") or "").strip(),
                 self.format_value(qty_value),
@@ -23416,6 +24634,7 @@ $mail.Display()
             sort_values = [
                 self.sort_date_value(line.get("sale_date")),
                 self.sort_text_value(line.get("customer_name")),
+                self.sort_text_value(line.get("customer_po")),
                 self.sort_text_value(line.get("item_number")),
                 self.sort_text_value(line.get("description")),
                 qty_value,
@@ -23426,7 +24645,7 @@ $mail.Display()
             for col_index, value in enumerate(values):
                 item = SortableTableWidgetItem(value)
                 item.setData(TABLE_SORT_ROLE, sort_values[col_index])
-                if col_index in (4, 5, 6, 7):
+                if col_index in (5, 6, 7, 8):
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 table.setItem(row_index, col_index, item)
 
@@ -23435,8 +24654,9 @@ $mail.Display()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.Stretch)
-        for col in range(4, 8):
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.Stretch)
+        for col in range(5, 9):
             header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
         table.resizeRowsToContents()
 
@@ -24154,11 +25374,14 @@ $mail.Display()
                 suggested_qty = self.parse_float(suggested_result["rounded"])
                 at_risk_qty = self.parse_float(at_risk_result["rounded"])
                 filter_value = (item_row["filter_value"] or "").strip()
+                planning_status = self.normalise_planning_status(item_row.get("planning_status"))
+                manual_critical = planning_status == PLANNING_STATUS_CRITICAL
                 row_data = {
                     "item_number": item_number,
                     "item_name": (item_row["item_name"] or "").strip(),
                     "filter_value": filter_value,
-                    "planning_status": self.normalise_planning_status(item_row.get("planning_status")),
+                    "planning_status": planning_status,
+                    "manual_critical": manual_critical,
                     "sales_for_period": total_qty,
                     "avg_monthly_sales": avg_monthly_qty,
                     "soh": on_hand,
@@ -24170,15 +25393,21 @@ $mail.Display()
                     "at_risk": at_risk_qty,
                 }
                 is_critical, critical_reason = self.order_analysis_critical_status(row_data)
+                if manual_critical:
+                    manual_reason = "Planning Status: Critical. This item is marked as cannot run out."
+                    if is_critical:
+                        critical_reason = f"{manual_reason} {critical_reason}"
+                    else:
+                        critical_reason = manual_reason
                 if critical_only and filter_value:
                     critical_reason = f"Supplier: {filter_value}. {critical_reason}"
                 row_data["critical"] = is_critical
                 row_data["critical_reason"] = critical_reason
 
                 if critical_only:
-                    if is_critical:
+                    if is_critical or manual_critical:
                         rows_to_show.append(row_data)
-                elif suggested_qty > 0 or at_risk_qty > 0:
+                elif suggested_qty > 0 or at_risk_qty > 0 or manual_critical:
                     rows_to_show.append(row_data)
 
                 self.update_order_analysis_progress(progress, index, len(item_rows), progress_target)
@@ -24278,12 +25507,16 @@ $mail.Display()
                 self.parse_float(row_data.get("at_risk", 0)),
             ]
             critical_reason = str(row_data.get("critical_reason", "") or "").strip()
+            planning_status_tooltip = ""
+            if planning_status == PLANNING_STATUS_CRITICAL:
+                planning_status_tooltip = "Planning Status: Critical. This item is marked as cannot run out."
+            row_tooltip = "; ".join(part for part in (planning_status_tooltip, critical_reason) if part)
             for col, value in enumerate(values):
                 item = SortableTableWidgetItem(str(value))
                 item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
                 item.setData(Qt.UserRole, raw_sort_values[col])
-                if critical_reason:
-                    item.setToolTip(critical_reason)
+                if row_tooltip:
+                    item.setToolTip(row_tooltip)
                 if col in numeric_columns:
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 table.setItem(row, col, item)
@@ -24307,12 +25540,21 @@ $mail.Display()
         colors = self.planning_status_colors(planning_status)
         bg = QColor(colors["bg"])
         fg = QColor(colors["fg"])
+        tooltip = ""
+        if planning_status == PLANNING_STATUS_CRITICAL:
+            tooltip = "Planning Status: Critical. This item is marked as cannot run out."
         for col in range(table.columnCount()):
             item = table.item(row, col)
             if item is None:
                 continue
             item.setBackground(QBrush(bg))
             item.setForeground(QBrush(fg))
+            if planning_status == PLANNING_STATUS_CRITICAL:
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
+                if not item.toolTip():
+                    item.setToolTip(tooltip)
 
     def apply_order_analysis_critical_row_style(self, row, reason=""):
         table = self.get_order_analysis_table()
