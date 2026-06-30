@@ -116,7 +116,7 @@ from yu_order_workflow import YUOrderEntryDialog, load_yu_review_module
 TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
 TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
 TABLE_FORMAT_SETTINGS_PREFIX = "table_format"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.5"
 APP_DESIGNER = "Bradley Mayze"
 # After the one-time no-space item-number migration, sales/order/stock tables
 # store canonical item numbers.  Keep runtime item-number resolution for entry/import,
@@ -5737,12 +5737,12 @@ class Ui_MainWindow(object):
     def _on_order_guide_html(self):
         return self._guide_page_html(
             "On Order",
-            "Use On Order to review incoming purchase order lines and readiness details.",
+            "Use On Order to review incoming purchase order lines and order-date details.",
             [
                 "Review open order lines in the incoming order table.",
                 "Use the entry fields to add or update order-related information.",
-                "Use ready dates and comments to track what needs follow-up.",
-                "Sort the table by item, order number, ready date, or comments as required.",
+                "Use order dates and comments to track what needs follow-up.",
+                "Sort the table by item, order number, order date, or comments as required.",
             ],
         )
 
@@ -6542,7 +6542,7 @@ class Ui_MainWindow(object):
     def _build_on_order_page(self):
         self.onOrder_page, layout = self._page("onOrder_page", "On Order")
         self.onOrderSubtitle_label = QLabel(
-            "Track incoming supplier orders, ready dates, comments, and container allocation status.",
+            "Track incoming supplier orders, order dates, comments, and container allocation status.",
             self.onOrder_page,
         )
         self.onOrderSubtitle_label.setObjectName("onOrderSubtitle_label")
@@ -10921,7 +10921,7 @@ class MainWindow(QMainWindow):
         self.onOrderOrderNumber_label = QLabel("Order No", entry_frame)
         self.onOrderItem_label = QLabel("Item", entry_frame)
         self.onOrderQty_label = QLabel("Qty", entry_frame)
-        self.onOrderReadyDate_label = QLabel("Ready Date", entry_frame)
+        self.onOrderReadyDate_label = QLabel("Order Date", entry_frame)
         self.onOrderComments_label = QLabel("Comments", entry_frame)
         for label in (
             self.onOrderOrderNumber_label,
@@ -11115,7 +11115,7 @@ class MainWindow(QMainWindow):
         if table is None:
             return
 
-        headers = ["Order No", "Item Number", "Description", "Qty", "Supplier", "Ready Date", "Comments", "Status", "Add To Container", "Remove", "Edit"]
+        headers = ["Order No", "Item Number", "Description", "Qty", "Supplier", "Order Date", "Comments", "Status", "Add To Container", "Remove", "Edit"]
         self.on_order_order_number_column = 0
         self.on_order_item_column = 1
         self.on_order_description_column = 2
@@ -11168,25 +11168,16 @@ class MainWindow(QMainWindow):
         if table is None or row < 0 or row >= table.rowCount():
             return
 
-        ready_item = table.item(row, self.on_order_ready_date_column)
-        ready_text = ready_item.text().strip() if ready_item is not None and ready_item.text() else ""
-        is_ready = self.on_order_ready_date_is_ready(ready_text)
-
-        ready_bg = QColor("#d9f2d9")
-        ready_fg = QColor("#006400")
-
+        # The On Order date is now an order date, not a readiness signal.
+        # Keep normal cells uncoloured; status/action columns keep their own button/status styling.
         for col in range(table.columnCount()):
             item = table.item(row, col)
             if item is None:
                 continue
             if col in {self.on_order_status_column, self.on_order_add_column, self.on_order_remove_column, getattr(self, "on_order_edit_column", -1)}:
                 continue
-            if is_ready:
-                item.setBackground(QBrush(ready_bg))
-                item.setForeground(QBrush(ready_fg if col == self.on_order_ready_date_column else QColor(Qt.black)))
-            else:
-                item.setBackground(QBrush())
-                item.setForeground(QBrush())
+            item.setBackground(QBrush())
+            item.setForeground(QBrush())
 
     def build_on_order_status_item(self, status_text):
         status_text = (status_text or "").strip().upper()
@@ -11886,7 +11877,7 @@ class MainWindow(QMainWindow):
         if item.column() == self.on_order_ready_date_column:
             parsed = self.parse_date_value(item.text())
             if parsed is None and (item.text() or "").strip():
-                QMessageBox.warning(self, "Invalid ready date", "Ready Date must be a valid date like 13/04/26 or 13/04/2026.")
+                QMessageBox.warning(self, "Invalid order date", "Order Date must be a valid date like 13/04/26 or 13/04/2026.")
                 self._updating_on_order_table = True
                 item.setText("")
                 self._updating_on_order_table = False
