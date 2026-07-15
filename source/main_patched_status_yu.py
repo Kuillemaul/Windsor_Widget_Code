@@ -1,4 +1,5 @@
 import sys
+import csv
 import re
 import math
 import difflib
@@ -37,8 +38,8 @@ except Exception:
     certifi = None
 from pathlib import Path
 from datetime import datetime, date, timedelta, timezone
-from decimal import Decimal, InvalidOperation
-from collections import Counter
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from collections import Counter, OrderedDict
 
 from PySide6.QtCore import Qt, QDate, QSettings, QMargins, QUrl, QEvent, QSignalBlocker, QTimer, QObject, Signal, QCoreApplication, QMetaObject, QSize
 from PySide6.QtGui import (
@@ -117,7 +118,7 @@ from yu_order_workflow import YUOrderEntryDialog, load_yu_review_module
 TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
 TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
 TABLE_FORMAT_SETTINGS_PREFIX = "table_format"
-APP_VERSION = "1.5.3"
+APP_VERSION = "1.5.4"
 APP_DESIGNER = "Bradley Mayze"
 YU_SUPPLIER_DISPLAY_NAME = "Yuchang Textile Factory"
 # Generic latest purchase-cost fields. These apply to every item in the item master.
@@ -126,6 +127,57 @@ ITEM_COST_DATE_COLUMN = "last_purchase_cost_date"
 # Legacy YU-specific fields are retained because the YU MYOB PO exporter uses them.
 YU_COST_VALUE_COLUMN = "yu_last_cost"
 YU_COST_DATE_COLUMN = "yu_last_cost_date"
+
+MYOB_CONTAINER_PO_HEADERS = [
+    "Co./Last Name",
+    "First Name",
+    "Addr 1 - Line 1",
+    "Addr 1 - Line 2",
+    "Addr 1 - Line 3",
+    "Addr 1 - Line 4",
+    "Inclusive",
+    "Purchase No.",
+    "Date",
+    "Supplier Invoice No.",
+    "Ship Via",
+    "Delivery Status",
+    "Item Number",
+    "Quantity",
+    "Description",
+    "Price",
+    "Discount",
+    "Total",
+    "Job",
+    "Comment",
+    "Journal Memo",
+    "Shipping Date",
+    "Tax Code",
+    "Tax Amount",
+    "Freight Amount",
+    "Freight Tax Code",
+    "Freight Tax Amount",
+    "Purchase Status",
+    "Currency Code",
+    "Exchange Rate",
+    "Terms - Payment is Due",
+    "           - Discount Days",
+    "           - Balance Due Days",
+    "           - % Discount",
+    "Amount Paid",
+    "Category",
+    "Order",
+    "Received",
+    "Billed",
+    "Location ID",
+    "Card ID",
+    "Record ID",
+]
+MYOB_CONTAINER_SUPPLIER = "Yuchang Textile Factory"
+MYOB_CONTAINER_SHIP_VIA = "SEA"
+MYOB_CONTAINER_DELIVERY_STATUS = "P"
+MYOB_CONTAINER_TAX_CODE = "OSP"
+MYOB_CONTAINER_PURCHASE_STATUS = "O"
+MYOB_CONTAINER_LOCATION_ID = "Location1"
 
 
 def _normalise_yu_supplier_key(value):
@@ -2983,7 +3035,7 @@ class ShipmentsWindow(QMainWindow):
                     INSERT INTO {SHIPMENT_TABLE_NAME} (
                         entry_date, shipment_type, order_no, shipment_ref, supplier_name, container_no, product, qty,
                         ready_date, shipment_date, due_date, status, vessel, notes, updated_on
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         values["entry_date"], values["shipment_type"], values["order_no"], values["shipment_ref"],
@@ -3097,7 +3149,7 @@ class ShipmentsWindow(QMainWindow):
             INSERT INTO {SHIPMENT_TABLE_NAME} (
                 entry_date, shipment_type, order_no, shipment_ref, supplier_name, container_no, product, qty,
                 ready_date, shipment_date, due_date, status, vessel, notes, updated_on
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (today_display, shipment_type, order_number, "", supplier_name, "", "", "", "", "", "", "", "", "", today_iso),
         )
@@ -7057,6 +7109,12 @@ class Ui_MainWindow(object):
         self.exportEmail_pushButton.setObjectName("exportEmail_pushButton")
         self.emailContainer_pushButton = QPushButton("Email", self.container_management_panel)
         self.emailContainer_pushButton.setObjectName("emailContainer_pushButton")
+        self.exportMYOBContainer_pushButton = QPushButton("Export MYOB Container PO", self.container_management_panel)
+        self.exportMYOBContainer_pushButton.setObjectName("exportMYOBContainer_pushButton")
+        self.exportMYOBContainer_pushButton.setToolTip(
+            "Create one MYOB purchase-order import file grouped by the original order numbers, "
+            "plus an Excel cheat sheet for the existing MYOB orders that must be changed manually."
+        )
         self.pushButton_8 = QPushButton("Edit Notes", self.container_management_panel)
         self.pushButton_8.setObjectName("pushButton_8")
 
@@ -7065,6 +7123,7 @@ class Ui_MainWindow(object):
             self.closeContainer_pushButton,
             self.exportEmail_pushButton,
             self.emailContainer_pushButton,
+            self.exportMYOBContainer_pushButton,
             self.pushButton_8,
         )
         for button in action_buttons:
@@ -7075,9 +7134,10 @@ class Ui_MainWindow(object):
         actions_layout.addWidget(self.closeContainer_pushButton, 1, 1)
         actions_layout.addWidget(self.exportEmail_pushButton, 2, 0)
         actions_layout.addWidget(self.emailContainer_pushButton, 2, 1)
-        # Refresh is added during live-refresh setup.  Keep Edit Notes beside it
-        # instead of using a full-width row so the action block stays compact.
-        actions_layout.addWidget(self.pushButton_8, 3, 1)
+        actions_layout.addWidget(self.exportMYOBContainer_pushButton, 3, 0, 1, 2)
+        # Refresh is added during live-refresh setup. Keep Edit Notes beside it
+        # on the final compact row.
+        actions_layout.addWidget(self.pushButton_8, 4, 1)
         actions_layout.setColumnStretch(0, 1)
         actions_layout.setColumnStretch(1, 1)
 
@@ -7132,8 +7192,9 @@ class Ui_MainWindow(object):
             "- Enter or load a container before adding lines.\n"
             "- Press Enter in Qty to add the current line.\n"
             "- Double-click Urgent or Additional to flag a row.\n"
+            "- Double-click Comments to add an order/item note.\n"
             "- Double-click Remove to remove a line.\n"
-            "- Notes and dog leads are pinned to the bottom."
+            "- Export MYOB Container PO also creates a manual-change cheat sheet."
         )
         side_layout.addWidget(self.buildContainerTips_textBrowser, 0)
 
@@ -7514,13 +7575,14 @@ class MainWindow(QMainWindow):
             "order": 0,
             "item": 1,
             "description": 2,
-            "qty": 3,
-            "cartons": 4,
-            "additional_cartons": 5,
-            "urgent": 6,
-            "additional": 7,
-            "remove": 8,
-            "edit": 9,
+            "comments": 3,
+            "qty": 4,
+            "cartons": 5,
+            "additional_cartons": 6,
+            "urgent": 7,
+            "additional": 8,
+            "remove": 9,
+            "edit": 10,
         }
         self.container_sort_column = None
         self.container_sort_descending = False
@@ -7569,6 +7631,7 @@ class MainWindow(QMainWindow):
         self.ensure_shipment_tables()
         self.ensure_item_planning_status_column()
         self.ensure_item_cost_columns()
+        self.ensure_container_line_comments_column()
         self.load_reference_lists()
 
         self.setup_customer_autocomplete()
@@ -8100,10 +8163,10 @@ class MainWindow(QMainWindow):
                     edit_notes_button.setMinimumHeight(30)
                     edit_notes_button.setMaximumHeight(32)
                     edit_notes_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-                    layout.addWidget(button, 3, 0)
-                    layout.addWidget(edit_notes_button, 3, 1)
+                    layout.addWidget(button, 4, 0)
+                    layout.addWidget(edit_notes_button, 4, 1)
                 else:
-                    layout.addWidget(button, 3, 0)
+                    layout.addWidget(button, 4, 0)
                 layout.setColumnStretch(0, 1)
                 layout.setColumnStretch(1, 1)
             except Exception:
@@ -9305,6 +9368,10 @@ class MainWindow(QMainWindow):
         export_button = getattr(self.ui, "exportEmail_pushButton", None)
         if export_button is not None:
             export_button.clicked.connect(self.export_container_to_excel)
+
+        myob_container_button = getattr(self.ui, "exportMYOBContainer_pushButton", None)
+        if myob_container_button is not None:
+            myob_container_button.clicked.connect(self.export_myob_container_po)
 
         email_button = getattr(self, "email_container_button", None)
         if email_button is not None:
@@ -11660,6 +11727,7 @@ class MainWindow(QMainWindow):
                 "order_number": row.get("order_number") or "",
                 "item_number": row["item_number"] or "",
                 "description": row["description"] or "",
+                "comments": row.get("comments") or "",
                 "qty": self.parse_float(row["qty"]),
                 "supplier_name": row["supplier_name"] or "",
                 "ready_date": row.get("ready_date") or "",
@@ -12052,6 +12120,7 @@ class MainWindow(QMainWindow):
                 item_number=row_data.get("item_number", ""),
                 qty_value=row_data.get("qty", 0),
                 is_urgent=False,
+                comments=row_data.get("comments", ""),
             )
         except Exception as exc:
             QMessageBox.warning(self, "Add to Container", str(exc))
@@ -12899,6 +12968,25 @@ class MainWindow(QMainWindow):
         cur.execute("CREATE INDEX IF NOT EXISTS idx_stock_item_number ON stock(item_number)")
         self.db_conn.commit()
 
+
+    def ensure_container_line_comments_column(self):
+        """Add the optional per-line container comment field without rebuilding tables."""
+        if self.db_conn is None or not self.has_table("container_lines"):
+            return
+        cur = self.db_conn.cursor()
+        if self.db_engine == "sqlserver":
+            cur.execute(
+                """
+                IF COL_LENGTH('dbo.container_lines', 'comments') IS NULL
+                    ALTER TABLE dbo.container_lines ADD comments NVARCHAR(1000) NULL
+                """
+            )
+        else:
+            existing = {row[1] for row in cur.execute("PRAGMA table_info(container_lines)").fetchall()}
+            if "comments" not in existing:
+                cur.execute("ALTER TABLE container_lines ADD COLUMN comments TEXT")
+        self.db_conn.commit()
+
     def ensure_container_tables(self):
         if self.db_engine == "sqlserver":
             return
@@ -12924,6 +13012,7 @@ class MainWindow(QMainWindow):
             ("order_number", "TEXT"),
             ("item_number", "TEXT"),
             ("description", "TEXT"),
+            ("comments", "TEXT"),
             ("qty", "REAL DEFAULT 0"),
             ("cartons", "INTEGER DEFAULT 0"),
             ("additional_cartons", "INTEGER DEFAULT 0"),
@@ -12946,6 +13035,7 @@ class MainWindow(QMainWindow):
                     order_number TEXT,
                     item_number TEXT,
                     description TEXT,
+                    comments TEXT,
                     qty REAL DEFAULT 0,
                     cartons INTEGER DEFAULT 0,
                     additional_cartons INTEGER DEFAULT 0,
@@ -16539,10 +16629,10 @@ class MainWindow(QMainWindow):
             cur.execute(
                 """
                 INSERT INTO container_lines (
-                    container_ref, line_no, order_number, item_number, description, qty, cartons,
+                    container_ref, line_no, order_number, item_number, description, comments, qty, cartons,
                     additional_cartons, urgent, additional,
                     edit_user_id, edit_display_name, edit_machine_name, edit_color, edit_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     ref,
@@ -16550,6 +16640,7 @@ class MainWindow(QMainWindow):
                     line.get("order_number", ""),
                     line.get("item_number", ""),
                     line.get("description", ""),
+                    line.get("comments", ""),
                     float(line.get("qty", 0) or 0),
                     int(line.get("cartons", 0) or 0),
                     int(line.get("additional_cartons", 0) or 0),
@@ -16579,7 +16670,7 @@ class MainWindow(QMainWindow):
             item_number=line.get("item_number", ""),
             qty_value=line.get("qty", 0),
             description=line.get("description", ""),
-            comments="",
+            comments=line.get("comments", ""),
             status_text="URGENT" if mark_urgent else "",
         )
         if not added:
@@ -16692,7 +16783,7 @@ class MainWindow(QMainWindow):
             return []
         rows = self.db_all(
             """
-            SELECT order_number, item_number, description, qty, cartons, additional_cartons, urgent, additional,
+            SELECT order_number, item_number, description, comments, qty, cartons, additional_cartons, urgent, additional,
                    edit_user_id, edit_display_name, edit_machine_name, edit_color, edit_at
             FROM container_lines
             WHERE UPPER(TRIM(container_ref)) = UPPER(TRIM(?))
@@ -16705,6 +16796,7 @@ class MainWindow(QMainWindow):
                 "order_number": row["order_number"] or "",
                 "item_number": row["item_number"] or "",
                 "description": row["description"] or "",
+                "comments": row.get("comments") or "",
                 "qty": self.parse_float(row["qty"]),
                 "cartons": int(round(self.parse_float(row["cartons"]))),
                 "additional_cartons": int(round(self.parse_float(row["additional_cartons"]))),
@@ -16720,10 +16812,11 @@ class MainWindow(QMainWindow):
             if str(row["item_number"] or "").strip()
         ]
 
-    def append_line_to_container_ref(self, container_ref, order_number, item_number, qty_value, is_urgent=False):
+    def append_line_to_container_ref(self, container_ref, order_number, item_number, qty_value, is_urgent=False, comments=""):
         ref = (container_ref or "").strip()
         order_number = (order_number or "").strip()
         item_number = (item_number or "").strip()
+        comments = str(comments or "").strip()
         if not ref:
             raise ValueError("Container reference is required.")
         if not order_number:
@@ -16771,6 +16864,7 @@ class MainWindow(QMainWindow):
             "order_number": order_number,
             "item_number": item_number,
             "description": description,
+            "comments": comments,
             "qty": rounded_qty,
             "cartons": cartons,
             "additional_cartons": 0,
@@ -16788,10 +16882,10 @@ class MainWindow(QMainWindow):
             cur.execute(
                 """
                 INSERT INTO container_lines (
-                    container_ref, line_no, order_number, item_number, description, qty, cartons,
+                    container_ref, line_no, order_number, item_number, description, comments, qty, cartons,
                     additional_cartons, urgent, additional,
                     edit_user_id, edit_display_name, edit_machine_name, edit_color, edit_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     ref,
@@ -16799,6 +16893,7 @@ class MainWindow(QMainWindow):
                     line.get("order_number", ""),
                     line.get("item_number", ""),
                     line.get("description", ""),
+                    line.get("comments", ""),
                     float(line.get("qty", 0) or 0),
                     int(line.get("cartons", 0) or 0),
                     int(line.get("additional_cartons", 0) or 0),
@@ -17482,9 +17577,9 @@ class MainWindow(QMainWindow):
         self._updating_container_table = True
         table.clearSpans()
         table.clear()
-        table.setColumnCount(10)
+        table.setColumnCount(11)
         table.setHorizontalHeaderLabels([
-            "Order Number", "Item Number", "Description", "Qty", "Cartons",
+            "Order Number", "Item Number", "Description", "Comments", "Qty", "Cartons",
             "Additional Cartons", "Urgent", "Additional", "Remove", "Edit"
         ])
         table.setRowCount(0)
@@ -17497,16 +17592,15 @@ class MainWindow(QMainWindow):
         table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
         table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
         table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Fixed)
-        table.setColumnWidth(7, 34)
         table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeToContents)
         table.horizontalHeader().setSectionResizeMode(8, QHeaderView.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(9, QHeaderView.Fixed)
-        table.setColumnWidth(9, 34)
+        table.horizontalHeader().setSectionResizeMode(9, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(10, QHeaderView.Fixed)
+        table.setColumnWidth(10, 34)
         if not bool(table.property("_container_header_sort_connected")):
             table.horizontalHeader().sectionClicked.connect(self.handle_container_header_sort_clicked)
             table.horizontalHeader().sectionDoubleClicked.connect(self.handle_container_header_sort_clicked)
@@ -17528,6 +17622,8 @@ class MainWindow(QMainWindow):
             return (line.get("item_number", "") or "").strip().upper()
         if column == cols["description"]:
             return (line.get("description", "") or "").strip().upper()
+        if column == cols["comments"]:
+            return (line.get("comments", "") or "").strip().upper()
         if column == cols["qty"]:
             return self.parse_float(line.get("qty", 0))
         if column == cols["cartons"]:
@@ -18118,6 +18214,7 @@ class MainWindow(QMainWindow):
                 "order_number": first_item.text().strip() if first_item is not None and first_item.text() else "",
                 "item_number": table.item(row, cols["item"]).text().strip() if table.item(row, cols["item"]) is not None and table.item(row, cols["item"]).text() else "",
                 "description": table.item(row, cols["description"]).text().strip() if table.item(row, cols["description"]) is not None and table.item(row, cols["description"]).text() else "",
+                "comments": table.item(row, cols["comments"]).text().strip() if table.item(row, cols["comments"]) is not None and table.item(row, cols["comments"]).text() else "",
                 "qty": self.parse_float(table.item(row, cols["qty"]).text() if table.item(row, cols["qty"]) is not None else 0),
                 "cartons": int(round(self.parse_float(table.item(row, cols["cartons"]).text() if table.item(row, cols["cartons"]) is not None else 0))),
                 "additional_cartons": int(round(self.parse_float(table.item(row, cols["additional_cartons"]).text() if table.item(row, cols["additional_cartons"]) is not None else 0))),
@@ -18149,6 +18246,7 @@ class MainWindow(QMainWindow):
             table.setItem(row, cols["order"], self.make_container_table_item(line.get("order_number", ""), data=meta))
             table.setItem(row, cols["item"], self.make_container_table_item(line.get("item_number", "")))
             table.setItem(row, cols["description"], self.make_container_table_item(line.get("description", "")))
+            table.setItem(row, cols["comments"], self.make_container_table_item(line.get("comments", "")))
             table.setItem(row, cols["qty"], self.make_container_table_item(self.format_value(line.get("qty", 0)), align=Qt.AlignRight | Qt.AlignVCenter))
             table.setItem(row, cols["cartons"], self.make_container_table_item(self.format_value(line.get("cartons", 0)), align=Qt.AlignRight | Qt.AlignVCenter))
             table.setItem(row, cols["additional_cartons"], self.make_container_table_item(self.format_value(line.get("additional_cartons", 0)), align=Qt.AlignRight | Qt.AlignVCenter))
@@ -18440,6 +18538,7 @@ class MainWindow(QMainWindow):
             "order_number": order_number,
             "item_number": item_number,
             "description": description,
+            "comments": "",
             "qty": rounded_qty,
             "cartons": cartons,
             "additional_cartons": 0,
@@ -18475,6 +18574,23 @@ class MainWindow(QMainWindow):
             item_number = (line.get("item_number") or "").strip()
             if item_number:
                 self.open_item_summary_from_order_analysis(item_number)
+            return
+
+        if column == self.container_columns["comments"]:
+            new_comment, accepted = QInputDialog.getMultiLineText(
+                self,
+                "Edit Container Comment",
+                f"Comment for {line.get('order_number', '')} / {line.get('item_number', '')}:",
+                str(line.get("comments") or ""),
+            )
+            if not accepted:
+                return
+            line["comments"] = str(new_comment or "").strip()
+            line.update(self.current_edit_audit_metadata())
+            lines[row] = line
+            self.populate_container_table(lines)
+            self.set_updated_box_today()
+            self.save_current_container_state()
             return
 
         if column == self.container_columns["qty"]:
@@ -18650,14 +18766,14 @@ class MainWindow(QMainWindow):
             cur.execute(
                 """
                 INSERT INTO container_lines (
-                    container_ref, line_no, order_number, item_number, description, qty, cartons,
+                    container_ref, line_no, order_number, item_number, description, comments, qty, cartons,
                     additional_cartons, urgent, additional,
                     edit_user_id, edit_display_name, edit_machine_name, edit_color, edit_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     ref, idx, line.get("order_number", ""), line.get("item_number", ""), line.get("description", ""),
-                    float(line.get("qty", 0) or 0), int(line.get("cartons", 0) or 0),
+                    line.get("comments", ""), float(line.get("qty", 0) or 0), int(line.get("cartons", 0) or 0),
                     int(line.get("additional_cartons", 0) or 0), 1 if line.get("urgent") else 0, 1 if line.get("additional") else 0,
                     line.get("edit_user_id", ""), line.get("edit_display_name", ""), line.get("edit_machine_name", ""),
                     line.get("edit_color", ""), line.get("edit_at", ""),
@@ -18721,7 +18837,7 @@ class MainWindow(QMainWindow):
         )
         lines = self.db_all(
             """
-            SELECT order_number, item_number, description, qty, cartons, additional_cartons, urgent, additional,
+            SELECT order_number, item_number, description, comments, qty, cartons, additional_cartons, urgent, additional,
                    edit_user_id, edit_display_name, edit_machine_name, edit_color, edit_at
             FROM container_lines
             WHERE container_ref = ?
@@ -18734,6 +18850,7 @@ class MainWindow(QMainWindow):
                 "order_number": r["order_number"] or "",
                 "item_number": r["item_number"] or "",
                 "description": r["description"] or "",
+                "comments": r.get("comments") or "",
                 "qty": self.parse_float(r["qty"]),
                 "cartons": int(self.parse_float(r["cartons"])),
                 "additional_cartons": int(self.parse_float(r["additional_cartons"])),
@@ -21555,6 +21672,7 @@ class MainWindow(QMainWindow):
             {
                 "item_number": row["item_number"] or "",
                 "description": row["description"] or "",
+                "comments": row.get("comments") or "",
                 "qty": self.parse_float(row["qty"]),
                 "supplier_name": row["supplier_name"] or "",
                 "urgent": bool(row["urgent"]),
@@ -22240,11 +22358,12 @@ class MainWindow(QMainWindow):
         thin_side = Side(style="thin", color="000000") if Side is not None else None
         cell_border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side) if Border is not None and thin_side is not None else None
 
-        export_headers = ["Order Number", "Item Number", "Description", "Qty", "Cartons"]
+        export_headers = ["Order Number", "Item Number", "Description", "Comments", "Qty", "Cartons"]
         export_column_map = [
             self.container_columns["order"],
             self.container_columns["item"],
             self.container_columns["description"],
+            self.container_columns["comments"],
             self.container_columns["qty"],
             self.container_columns["cartons"],
         ]
@@ -22318,7 +22437,7 @@ class MainWindow(QMainWindow):
                 if row_fill is not None:
                     worksheet.cell(row=row_index, column=export_col).fill = row_fill
                 if Alignment is not None:
-                    align_horizontal = "right" if export_col in (4, 5) else "left"
+                    align_horizontal = "right" if export_col in (5, 6) else "left"
                     worksheet.cell(row=row_index, column=export_col).alignment = Alignment(horizontal=align_horizontal, vertical="center")
                 if cell_border is not None:
                     worksheet.cell(row=row_index, column=export_col).border = cell_border
@@ -22343,8 +22462,8 @@ class MainWindow(QMainWindow):
         ]
         total_row = row_index + 1
         for offset, (label_text, value) in enumerate(total_rows):
-            label_cell = worksheet.cell(row=total_row + offset, column=4, value=label_text)
-            value_cell = worksheet.cell(row=total_row + offset, column=5, value=value)
+            label_cell = worksheet.cell(row=total_row + offset, column=5, value=label_text)
+            value_cell = worksheet.cell(row=total_row + offset, column=6, value=value)
             if bold_font is not None:
                 label_cell.font = bold_font
                 value_cell.font = bold_font
@@ -22373,6 +22492,482 @@ class MainWindow(QMainWindow):
 
         worksheet.freeze_panes = f"A{start_table_row + 1}"
         workbook.save(str(export_path))
+
+
+    def prompt_for_myob_container_export_details(self):
+        container_ref = self.get_container_ref_text() or (self.current_container_ref or "")
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Export MYOB Container PO")
+        dialog.resize(520, 250)
+
+        layout = QVBoxLayout(dialog)
+        intro = QLabel(
+            "This creates one new MYOB purchase order plus an Excel cheat sheet "
+            "for the original MYOB orders that must be changed manually.",
+            dialog,
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        form = QFormLayout()
+        purchase_edit = QLineEdit(dialog)
+        purchase_edit.setText(str(container_ref or "").strip())
+        purchase_edit.setPlaceholderText("New MYOB purchase order number")
+        form.addRow("New MYOB Purchase No.", purchase_edit)
+
+        date_edit = QDateEdit(dialog)
+        date_edit.setCalendarPopup(True)
+        date_edit.setDisplayFormat("dd/MM/yyyy")
+        date_edit.setDate(QDate.currentDate())
+        form.addRow("Purchase Date", date_edit)
+
+        supplier_label = QLabel(MYOB_CONTAINER_SUPPLIER, dialog)
+        form.addRow("Supplier", supplier_label)
+        layout.addLayout(form)
+
+        warning = QLabel(
+            "Original order numbers are inserted as \\\\ON rows. "
+            "Container-line and container notes are inserted as \\\\COMMENT rows.",
+            dialog,
+        )
+        warning.setWordWrap(True)
+        layout.addWidget(warning)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=dialog)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        purchase_edit.setFocus()
+        purchase_edit.selectAll()
+        if dialog.exec() != QDialog.Accepted:
+            return None
+
+        purchase_no = purchase_edit.text().strip()
+        if not purchase_no:
+            QMessageBox.warning(self, "Export MYOB Container PO", "Enter a new MYOB purchase order number.")
+            return None
+
+        return {
+            "purchase_no": purchase_no,
+            "purchase_date": date_edit.date().toString("dd/MM/yyyy"),
+        }
+
+    def _myob_container_format_number(self, value, places=6):
+        try:
+            number = Decimal(str(value if value is not None else "0").replace("$", "").replace(",", "").strip())
+        except (InvalidOperation, ValueError):
+            raise ValueError(f"Invalid MYOB number: {value!r}")
+        quantum = Decimal(1).scaleb(-int(places))
+        number = number.quantize(quantum)
+        result = format(number, "f")
+        if "." in result:
+            result = result.rstrip("0").rstrip(".")
+        return result or "0"
+
+    def _myob_container_base_row(self, purchase_no, purchase_date):
+        row = {header: "" for header in MYOB_CONTAINER_PO_HEADERS}
+        row.update({
+            "Co./Last Name": MYOB_CONTAINER_SUPPLIER,
+            "Purchase No.": purchase_no,
+            "Date": purchase_date,
+            "Supplier Invoice No.": "",
+            "Ship Via": MYOB_CONTAINER_SHIP_VIA,
+            "Delivery Status": MYOB_CONTAINER_DELIVERY_STATUS,
+            "Discount": "0%",
+            "Journal Memo": f"Purchase; {MYOB_CONTAINER_SUPPLIER}",
+            "Tax Code": MYOB_CONTAINER_TAX_CODE,
+            "Tax Amount": "0.00",
+            "Freight Amount": "0.00",
+            "Freight Tax Code": MYOB_CONTAINER_TAX_CODE,
+            "Freight Tax Amount": "0.00",
+            "Purchase Status": MYOB_CONTAINER_PURCHASE_STATUS,
+            "Amount Paid": "0.00",
+            "Received": "0.000",
+            "Billed": "0.000",
+            "Location ID": MYOB_CONTAINER_LOCATION_ID,
+        })
+        return row
+
+    def _myob_container_text_row(self, purchase_no, purchase_date, marker, description):
+        row = self._myob_container_base_row(purchase_no, purchase_date)
+        row.update({
+            "Item Number": marker,
+            "Quantity": "0.000",
+            "Description": re.sub(r"\s+", " ", str(description or "").strip()),
+            "Price": "0",
+            "Total": "0.00",
+            "Order": "0.000",
+        })
+        return row
+
+    def _myob_container_item_row(self, purchase_no, purchase_date, line):
+        item_number = self.canonicalize_import_item_number(line.get("item_number", ""))
+        if not item_number:
+            raise ValueError("A container line has no item number.")
+
+        item_master = self.get_item_master_row(item_number) or {}
+        description = str(
+            line.get("description")
+            or self.get_first(item_master, "item_name", "Item Name", "description", "Description", default="")
+            or ""
+        ).strip()
+        description = re.sub(r"\s+", " ", description)
+        if not description:
+            raise ValueError(f"{item_number} has no item description.")
+
+        qty = Decimal(str(self.parse_float(line.get("qty", 0))))
+        if qty <= 0:
+            raise ValueError(f"{item_number} has a non-positive container quantity.")
+
+        yu_cost = self.parse_float(self.get_first(item_master, YU_COST_VALUE_COLUMN, default=0))
+        generic_cost = self.parse_float(self.get_first(item_master, ITEM_COST_VALUE_COLUMN, default=0))
+        price_value = yu_cost if yu_cost > 0 else generic_cost
+        if price_value <= 0:
+            raise ValueError(f"{item_number} has no positive purchase cost.")
+
+        price = Decimal(str(price_value))
+        line_total = (qty * price).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        qty_text = f"{qty.quantize(Decimal('0.001')):.3f}"
+
+        row = self._myob_container_base_row(purchase_no, purchase_date)
+        row.update({
+            "Item Number": item_number,
+            "Quantity": qty_text,
+            "Description": description,
+            "Price": self._myob_container_format_number(price, 6),
+            "Total": f"{line_total:.2f}",
+            "Order": qty_text,
+        })
+        return row, float(line_total), bool(yu_cost <= 0 < generic_cost)
+
+    def group_container_lines_for_myob(self):
+        lines = self.get_container_line_dicts()
+        if not lines:
+            raise ValueError("There are no container item lines to export.")
+
+        groups = OrderedDict()
+        for line in lines:
+            order_no = str(line.get("order_number") or "").strip() or "NO ORDER NUMBER"
+            groups.setdefault(order_no, []).append(dict(line))
+        return groups
+
+    def write_myob_container_po_txt(self, output_path, purchase_no, purchase_date, groups):
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        rows = []
+        total_value = 0.0
+        generic_cost_fallbacks = []
+        for order_no, order_lines in groups.items():
+            rows.append(
+                self._myob_container_text_row(
+                    purchase_no,
+                    purchase_date,
+                    "\\ON",
+                    f"O/NO {order_no}",
+                )
+            )
+            for line in order_lines:
+                comment = re.sub(r"\s+", " ", str(line.get("comments") or "").strip())
+                if comment:
+                    rows.append(
+                        self._myob_container_text_row(
+                            purchase_no,
+                            purchase_date,
+                            "\\COMMENT",
+                            comment,
+                        )
+                    )
+                item_row, line_value, used_generic_cost = self._myob_container_item_row(
+                    purchase_no,
+                    purchase_date,
+                    line,
+                )
+                rows.append(item_row)
+                total_value += line_value
+                if used_generic_cost:
+                    generic_cost_fallbacks.append(item_row["Item Number"])
+
+        global_notes = []
+        if getattr(self.ui, "checkBox", None) is not None and self.ui.checkBox.isChecked():
+            global_notes.append("ADD ALL DOG LEADS")
+        global_notes.extend(
+            note.strip()
+            for note in str(self.current_container_notes or "").splitlines()
+            if note.strip()
+        )
+        for note in global_notes:
+            rows.append(
+                self._myob_container_text_row(
+                    purchase_no,
+                    purchase_date,
+                    "\\COMMENT",
+                    note,
+                )
+            )
+
+        with output_path.open("w", encoding="cp1252", errors="replace", newline="") as handle:
+            handle.write("{}\r\n")
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=MYOB_CONTAINER_PO_HEADERS,
+                delimiter=",",
+                lineterminator="\r\n",
+                quoting=csv.QUOTE_MINIMAL,
+                extrasaction="raise",
+            )
+            writer.writeheader()
+            writer.writerows(rows)
+            handle.write("\r\n")
+
+        return {
+            "path": output_path,
+            "row_count": len(rows),
+            "item_count": sum(len(lines) for lines in groups.values()),
+            "order_count": len(groups),
+            "total_value": total_value,
+            "generic_cost_fallbacks": sorted(set(generic_cost_fallbacks)),
+        }
+
+    def write_myob_manual_change_cheat_sheet(self, output_path, purchase_no, purchase_date, groups):
+        if Workbook is None:
+            raise RuntimeError("Excel cheat-sheet export is unavailable because openpyxl is not installed.")
+
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        container_ref = self.get_container_ref_text() or (self.current_container_ref or "")
+
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "MYOB Manual Changes"
+
+        title_fill = PatternFill("solid", fgColor="1F4E78") if PatternFill is not None else None
+        header_fill = PatternFill("solid", fgColor="D9EAF7") if PatternFill is not None else None
+        group_fill = PatternFill("solid", fgColor="FFF2CC") if PatternFill is not None else None
+        border_side = Side(style="thin", color="B7B7B7") if Side is not None else None
+        border = Border(left=border_side, right=border_side, top=border_side, bottom=border_side) if Border is not None and border_side is not None else None
+
+        sheet.merge_cells("A1:H1")
+        sheet["A1"] = "MYOB MANUAL PURCHASE ORDER CHANGES"
+        if title_fill is not None:
+            sheet["A1"].fill = title_fill
+        if Font is not None:
+            sheet["A1"].font = Font(bold=True, color="FFFFFF", size=14)
+        if Alignment is not None:
+            sheet["A1"].alignment = Alignment(horizontal="center")
+
+        sheet["A3"] = "New MYOB PO"
+        sheet["B3"] = purchase_no
+        sheet["D3"] = "Container"
+        sheet["E3"] = container_ref
+        sheet["G3"] = "Date"
+        sheet["H3"] = purchase_date
+
+        sheet.merge_cells("A5:H5")
+        sheet["A5"] = (
+            "After importing the new PO, manually reduce or remove the listed item quantities "
+            "from each existing MYOB purchase order. Tick Done as each original PO is corrected."
+        )
+        if Alignment is not None:
+            sheet["A5"].alignment = Alignment(wrap_text=True)
+
+        headers = [
+            "Done",
+            "Existing MYOB PO",
+            "Item Number",
+            "Description",
+            "Qty moved to new PO",
+            "Comment",
+            "New MYOB PO",
+            "Required action",
+        ]
+        header_row = 7
+        for col, heading in enumerate(headers, start=1):
+            cell = sheet.cell(row=header_row, column=col, value=heading)
+            if header_fill is not None:
+                cell.fill = header_fill
+            if Font is not None:
+                cell.font = Font(bold=True)
+            if Alignment is not None:
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            if border is not None:
+                cell.border = border
+
+        row_index = header_row + 1
+        for order_no, order_lines in groups.items():
+            sheet.merge_cells(start_row=row_index, start_column=1, end_row=row_index, end_column=8)
+            group_cell = sheet.cell(row=row_index, column=1, value=f"Existing MYOB PO: {order_no}")
+            if group_fill is not None:
+                group_cell.fill = group_fill
+            if Font is not None:
+                group_cell.font = Font(bold=True)
+            if border is not None:
+                for col in range(1, 9):
+                    sheet.cell(row=row_index, column=col).border = border
+            row_index += 1
+
+            for line in order_lines:
+                item_number = self.canonicalize_import_item_number(line.get("item_number", ""))
+                item_master = self.get_item_master_row(item_number) or {}
+                description = str(
+                    line.get("description")
+                    or self.get_first(item_master, "item_name", "Item Name", "description", "Description", default="")
+                    or ""
+                ).strip()
+                values = [
+                    "☐",
+                    order_no,
+                    item_number,
+                    description,
+                    self.parse_float(line.get("qty", 0)),
+                    str(line.get("comments") or "").strip(),
+                    purchase_no,
+                    "Reduce this item on the existing PO by the quantity shown; remove the line if none remains.",
+                ]
+                for col, value in enumerate(values, start=1):
+                    cell = sheet.cell(row=row_index, column=col, value=value)
+                    if border is not None:
+                        cell.border = border
+                    if Alignment is not None:
+                        cell.alignment = Alignment(
+                            horizontal="center" if col in (1, 2, 5, 7) else "left",
+                            vertical="top",
+                            wrap_text=True,
+                        )
+                sheet.cell(row=row_index, column=5).number_format = "#,##0.000"
+                row_index += 1
+
+        global_notes = []
+        if getattr(self.ui, "checkBox", None) is not None and self.ui.checkBox.isChecked():
+            global_notes.append("ADD ALL DOG LEADS")
+        global_notes.extend(
+            note.strip()
+            for note in str(self.current_container_notes or "").splitlines()
+            if note.strip()
+        )
+        if global_notes:
+            row_index += 1
+            sheet.merge_cells(start_row=row_index, start_column=1, end_row=row_index, end_column=8)
+            note_cell = sheet.cell(row=row_index, column=1, value="Container comments: " + " | ".join(global_notes))
+            if group_fill is not None:
+                note_cell.fill = group_fill
+            if Alignment is not None:
+                note_cell.alignment = Alignment(wrap_text=True)
+
+        widths = {
+            "A": 9,
+            "B": 20,
+            "C": 22,
+            "D": 42,
+            "E": 20,
+            "F": 38,
+            "G": 20,
+            "H": 50,
+        }
+        for column, width in widths.items():
+            sheet.column_dimensions[column].width = width
+        sheet.freeze_panes = "A8"
+        sheet.auto_filter.ref = f"A7:H{max(header_row, row_index - 1)}"
+        sheet.page_setup.orientation = "landscape"
+        sheet.page_setup.fitToWidth = 1
+        sheet.sheet_properties.pageSetUpPr.fitToPage = True
+        sheet.print_title_rows = "1:7"
+
+        workbook.save(str(output_path))
+        return output_path
+
+    def export_myob_container_po(self):
+        try:
+            container_ref = self.get_container_ref_text() or (self.current_container_ref or "")
+            if not container_ref:
+                QMessageBox.warning(
+                    self,
+                    "Export MYOB Container PO",
+                    "Enter or load a container reference first.",
+                )
+                return
+
+            self.save_current_container_state()
+            groups = self.group_container_lines_for_myob()
+            details = self.prompt_for_myob_container_export_details()
+            if not details:
+                return
+
+            purchase_no = details["purchase_no"]
+            purchase_date = details["purchase_date"]
+            default_dir = str(self.get_container_export_directory())
+            output_dir = QFileDialog.getExistingDirectory(
+                self,
+                "Choose MYOB Container PO export folder",
+                default_dir,
+            )
+            if not output_dir:
+                return
+
+            safe_po = self.sanitize_filename_component(purchase_no)
+            myob_path = Path(output_dir) / f"MYOB_CONTAINER_PO_{safe_po}.txt"
+            cheat_path = Path(output_dir) / f"MYOB_MANUAL_CHANGES_{safe_po}.xlsx"
+
+            existing = [path for path in (myob_path, cheat_path) if path.exists()]
+            if existing:
+                result = QMessageBox.question(
+                    self,
+                    "Overwrite existing files",
+                    "One or more export files already exist.\n\n"
+                    + "\n".join(str(path) for path in existing)
+                    + "\n\nOverwrite them?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if result != QMessageBox.Yes:
+                    return
+
+            export_result = self.write_myob_container_po_txt(
+                myob_path,
+                purchase_no,
+                purchase_date,
+                groups,
+            )
+            self.write_myob_manual_change_cheat_sheet(
+                cheat_path,
+                purchase_no,
+                purchase_date,
+                groups,
+            )
+
+            fallback_note = ""
+            if export_result["generic_cost_fallbacks"]:
+                fallback_note = (
+                    "\n\nGeneric last-purchase cost was used because no YU-specific cost was saved for:\n"
+                    + ", ".join(export_result["generic_cost_fallbacks"][:20])
+                )
+                if len(export_result["generic_cost_fallbacks"]) > 20:
+                    fallback_note += f"\n...and {len(export_result['generic_cost_fallbacks']) - 20} more."
+
+            QMessageBox.information(
+                self,
+                "Export MYOB Container PO",
+                "Export complete.\n\n"
+                f"MYOB import:\n{myob_path}\n\n"
+                f"Manual-change cheat sheet:\n{cheat_path}\n\n"
+                f"Original orders grouped: {export_result['order_count']}\n"
+                f"Item lines: {export_result['item_count']}\n"
+                f"Calculated PO value: ${export_result['total_value']:,.2f}\n\n"
+                "The import creates a new MYOB purchase order. It does not update the original orders; "
+                "use the cheat sheet to change them manually."
+                + fallback_note,
+            )
+            try:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(output_dir))))
+            except Exception:
+                pass
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Export MYOB Container PO",
+                f"The MYOB container export failed.\n\n{exc}",
+            )
 
     def create_outlook_container_email(self, attachment_path, container_ref, eta_display):
         body_text = f"Container Ref: {container_ref}\r\nDate: {eta_display}\r\n"
