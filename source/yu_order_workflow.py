@@ -69,11 +69,12 @@ class AddToOnOrderDialog(QDialog):
 
 
 class YUOrderEntryDialog(QDialog):
-    def __init__(self, main_window, parent=None, initial_order_number="", initial_lines=None):
+    def __init__(self, main_window, parent=None, initial_order_number="", initial_lines=None, source_to_order_lines=None):
         super().__init__(parent or main_window)
         self.main_window = main_window
         self._loaded_draft_order_no = ""
         self._initial_lines = list(initial_lines or [])
+        self._source_to_order_lines = [dict(line) for line in (source_to_order_lines or [])]
         self.setWindowTitle("Create Order from YU")
         self.resize(860, 620)
         self.build_ui()
@@ -157,24 +158,28 @@ class YUOrderEntryDialog(QDialog):
             if not item_number or qty_value <= 0:
                 continue
 
+            merged = False
             for row in range(self.lines_table.rowCount()):
                 existing_item = self.lines_table.item(row, 0)
                 if existing_item is not None and self.items_match((existing_item.text() or "").strip(), item_number):
                     qty_item = self.lines_table.item(row, 2)
-                    current_qty = float((qty_item.text() or '0').replace(',', '')) if qty_item is not None else 0.0
+                    current_qty = float((qty_item.text() or "0").replace(",", "")) if qty_item is not None else 0.0
                     new_qty = current_qty + qty_value
                     self.lines_table.setItem(row, 2, QTableWidgetItem(self.format_qty(new_qty)))
-                    return
+                    merged = True
+                    break
+            if merged:
+                continue
 
             row = self.lines_table.rowCount()
             self.lines_table.insertRow(row)
             self.lines_table.setItem(row, 0, QTableWidgetItem(item_number))
             self.lines_table.setItem(row, 1, QTableWidgetItem(self.description_for_item(item_number)))
             self.lines_table.setItem(row, 2, QTableWidgetItem(self.format_qty(qty_value)))
-            add_on_order_item = QTableWidgetItem('Add To On Order')
+            add_on_order_item = QTableWidgetItem("Add To On Order")
             add_on_order_item.setTextAlignment(Qt.AlignCenter)
             self.lines_table.setItem(row, 3, add_on_order_item)
-            remove_item = QTableWidgetItem('Remove')
+            remove_item = QTableWidgetItem("Remove")
             remove_item.setTextAlignment(Qt.AlignCenter)
             self.lines_table.setItem(row, 4, remove_item)
 
@@ -530,7 +535,10 @@ class YUOrderEntryDialog(QDialog):
         temp_dir = Path(self.main_window.get_yu_order_temp_dir())
         temp_path = temp_dir / f'YU_{order_no}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
         self.write_csv(temp_path)
-        opened = self.main_window.open_yu_order_review_window(str(temp_path))
+        opened = self.main_window.open_yu_order_review_window(
+            str(temp_path),
+            source_to_order_lines=self._source_to_order_lines,
+        )
         if opened:
             self.accept()
 

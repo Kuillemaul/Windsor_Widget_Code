@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import re
 import sys
@@ -15,6 +16,7 @@ from collections import defaultdict
 from copy import copy, deepcopy
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
@@ -29,7 +31,7 @@ from openpyxl.drawing.image import Image as XLImage
 from openpyxl.formula.translate import Translator
 from openpyxl.utils import column_index_from_string, get_column_letter
 
-from PySide6.QtCore import Qt, QSettings, QSize, QUrl
+from PySide6.QtCore import Qt, QSettings, QSize, QUrl, Signal
 from PySide6.QtGui import QColor, QBrush, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
@@ -62,6 +64,208 @@ DEFAULT_PREFIX = "yu_test"
 DEFAULT_ORDER_CSV = ""
 DEFAULT_TEMPLATE = ""
 DEFAULT_OUTPUT_DIR = "yu_exports"
+
+MYOB_PO_HEADERS = [
+    "Co./Last Name",
+    "First Name",
+    "Addr 1 - Line 1",
+    "Addr 1 - Line 2",
+    "Addr 1 - Line 3",
+    "Addr 1 - Line 4",
+    "Inclusive",
+    "Purchase No.",
+    "Date",
+    "Supplier Invoice No.",
+    "Ship Via",
+    "Delivery Status",
+    "Item Number",
+    "Quantity",
+    "Description",
+    "Price",
+    "Discount",
+    "Total",
+    "Job",
+    "Comment",
+    "Journal Memo",
+    "Shipping Date",
+    "Tax Code",
+    "Tax Amount",
+    "Freight Amount",
+    "Freight Tax Code",
+    "Freight Tax Amount",
+    "Purchase Status",
+    "Currency Code",
+    "Exchange Rate",
+    "Terms - Payment is Due",
+    "           - Discount Days",
+    "           - Balance Due Days",
+    "           - % Discount",
+    "Amount Paid",
+    "Category",
+    "Order",
+    "Received",
+    "Billed",
+    "Location ID",
+    "Card ID",
+    "Record ID",
+]
+MYOB_YU_SUPPLIER = "Yuchang Textile Factory"
+MYOB_YU_SHIP_VIA = "SEA"
+MYOB_YU_DELIVERY_STATUS = "P"
+MYOB_YU_TAX_CODE = "OSP"
+MYOB_YU_PURCHASE_STATUS = "O"
+MYOB_YU_LOCATION_ID = "Location1"
+
+
+def _decimal_value(value: Any, field_name: str = "value") -> Decimal:
+    if isinstance(value, Decimal):
+        result = value
+    else:
+        text = str(value if value is not None else "").strip()
+        text = text.replace("$", "").replace(",", "")
+        if not text:
+            raise ValueError(f"{field_name} is blank")
+        try:
+            result = Decimal(text)
+        except InvalidOperation as exc:
+            raise ValueError(f"Invalid {field_name}: {value!r}") from exc
+    if not result.is_finite():
+        raise ValueError(f"Invalid {field_name}: {value!r}")
+    return result
+
+
+def _format_myob_number(value: Any, max_places: int = 6) -> str:
+    number = _decimal_value(value)
+    quantum = Decimal(1).scaleb(-max_places)
+    number = number.quantize(quantum)
+    text = format(number, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _format_myob_quantity(value: Any) -> str:
+    number = _decimal_value(value, "quantity")
+    return f"{number.quantize(Decimal('0.001')):.3f}"
+
+
+def _normalise_myob_date(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("Order date is blank")
+    for fmt in ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d", "%d-%m-%Y", "%d-%m-%y"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%d/%m/%Y")
+        except ValueError:
+            continue
+    raise ValueError(f"Invalid order date: {value!r}")
+
+
+def _single_line_description(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def write_myob_po_import_txt(
+    output_path: str | Path,
+    order_date: str,
+    order_number: str,
+    lines: Iterable[dict[str, Any]],
+) -> str:
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    normalised_date = _normalise_myob_date(order_date)
+    order_number = str(order_number or "").strip()
+    if not order_number:
+        raise ValueError("Purchase order number is blank")
+
+    prepared_rows = []
+    for line in lines:
+        item_number = str(line.get("item_number") or "").strip()
+        description = _single_line_description(line.get("description"))
+        quantity = _decimal_value(line.get("quantity"), f"quantity for {item_number}")
+        price = _decimal_value(line.get("price"), f"price for {item_number}")
+        if not item_number:
+            raise ValueError("A MYOB export line has a blank item number")
+        if not description:
+            raise ValueError(f"{item_number} has no description")
+        if quantity <= 0:
+            raise ValueError(f"{item_number} has a non-positive quantity")
+        if price <= 0:
+            raise ValueError(f"{item_number} has a non-positive YU cost")
+        qty_text = _format_myob_quantity(quantity)
+        # AccountRight validates the transaction-level total even when importing
+        # an Order.  Omitting Total while supplying a non-zero Price can produce
+        # error -4317 ("An unbalanced transaction may not be recorded").
+        # Match the native AccountRight export format and round the line total
+        # to currency precision.
+        line_total = (quantity * price).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        prepared_rows.append({
+            "Co./Last Name": MYOB_YU_SUPPLIER,
+            "First Name": "",
+            "Addr 1 - Line 1": "",
+            "Addr 1 - Line 2": "",
+            "Addr 1 - Line 3": "",
+            "Addr 1 - Line 4": "",
+            "Inclusive": "",
+            "Purchase No.": order_number,
+            "Date": normalised_date,
+            # The Widget order number belongs in Purchase No. only.
+            # Supplier Invoice No. is the supplier's own invoice/reference and
+            # must remain blank when creating a new purchase order.
+            "Supplier Invoice No.": "",
+            "Ship Via": MYOB_YU_SHIP_VIA,
+            "Delivery Status": MYOB_YU_DELIVERY_STATUS,
+            "Item Number": item_number,
+            "Quantity": qty_text,
+            "Description": description,
+            "Price": _format_myob_number(price, 6),
+            "Discount": "0%",
+            "Total": f"{line_total:.2f}",
+            "Job": "",
+            "Comment": "",
+            "Journal Memo": f"Purchase; {MYOB_YU_SUPPLIER}",
+            "Shipping Date": "",
+            "Tax Code": MYOB_YU_TAX_CODE,
+            "Tax Amount": "0.00",
+            "Freight Amount": "0.00",
+            "Freight Tax Code": MYOB_YU_TAX_CODE,
+            "Freight Tax Amount": "0.00",
+            "Purchase Status": MYOB_YU_PURCHASE_STATUS,
+            "Currency Code": "",
+            "Exchange Rate": "",
+            "Terms - Payment is Due": "",
+            "           - Discount Days": "",
+            "           - Balance Due Days": "",
+            "           - % Discount": "",
+            "Amount Paid": "0.00",
+            "Category": "",
+            "Order": qty_text,
+            "Received": "0.000",
+            "Billed": "0.000",
+            "Location ID": MYOB_YU_LOCATION_ID,
+            "Card ID": "",
+            "Record ID": "",
+        })
+
+    if not prepared_rows:
+        raise ValueError("There are no MYOB purchase-order lines to export")
+
+    # AccountRight recognises the first-line {} marker as the modern format.
+    # cp1252 is safer than UTF-8 with BOM for the legacy Import/Export Assistant.
+    with output_path.open("w", encoding="cp1252", errors="replace", newline="") as handle:
+        handle.write("{}\r\n")
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=MYOB_PO_HEADERS,
+            delimiter=",",
+            lineterminator="\r\n",
+            quoting=csv.QUOTE_MINIMAL,
+            extrasaction="raise",
+        )
+        writer.writeheader()
+        writer.writerows(prepared_rows)
+        handle.write("\r\n")
+    return str(output_path)
 
 
 # ------------------------------------------------------------
@@ -460,6 +664,261 @@ def clean_item_sql_expr(expression: str) -> str:
         "' ', ''), CHAR(9), ''), CHAR(160), ''))"
     )
 
+
+def _normalise_workbook_text(value: Any) -> str:
+    """Return a stable comparison value for supplier-line workbook fields."""
+    if value in (None, ""):
+        return ""
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return format(value, ".12g").upper()
+        return str(value).upper()
+    return re.sub(r"[\s\u00A0]+", " ", str(value).strip()).upper()
+
+
+def _workbook_row_signature_from_values(values: Iterable[Any]) -> tuple[str, ...]:
+    return tuple(_normalise_workbook_text(value) for value in values)
+
+
+def _workbook_row_is_detail_values(values: list[Any] | tuple[Any, ...]) -> bool:
+    """Mirror the YU template's detail-row rule using columns B:H."""
+    if not values:
+        return False
+    description = values[0] if len(values) > 0 else None
+    if description in (None, ""):
+        return False
+    return any(value not in (None, "") for value in values[1:7])
+
+
+def detect_yuchang_footer_rows(
+    worksheet,
+    *,
+    header_end_row: int = 14,
+    export_min_col: int = 1,
+    export_max_col: int = 14,
+) -> tuple[int, int]:
+    """Locate the movable YU footer from its labels instead of fixed row numbers."""
+    transport_row: int | None = None
+    total_row: int | None = None
+
+    for row in range(max(header_end_row + 1, 1), int(worksheet.max_row or 0) + 1):
+        values = [
+            _normalise_workbook_text(worksheet.cell(row, col).value)
+            for col in range(export_min_col, export_max_col + 1)
+        ]
+        if total_row is None and any("ORDER TOTAL" == value or value.startswith("ORDER TOTAL ") for value in values):
+            total_row = row
+        if transport_row is None and any("METHOD OF TRANSPORT" in value for value in values):
+            transport_row = row
+
+    if total_row is None:
+        total_row = int(worksheet.max_row or header_end_row)
+
+    if transport_row is None or transport_row > total_row:
+        transport_row = max(header_end_row + 1, total_row - 5)
+
+    footer_start = transport_row
+    previous_row = transport_row - 1
+    if previous_row > header_end_row:
+        previous_values = [
+            worksheet.cell(previous_row, col).value
+            for col in range(export_min_col, export_max_col + 1)
+        ]
+        if all(value in (None, "") for value in previous_values):
+            footer_start = previous_row
+
+    return int(footer_start), int(total_row)
+
+
+def scan_yuchang_workbook(
+    template_path: str,
+    *,
+    sheet_name: str = "Sheet1",
+    item_col: str = "A",
+    header_end_row: int = 14,
+    export_min_col: str = "A",
+    export_max_col: str = "N",
+) -> dict[str, Any]:
+    """Build a live workbook index in one worksheet pass.
+
+    Column A is the permanent item identifier. Row numbers are deliberately
+    treated as current workbook addresses only.
+    """
+    workbook_path = Path(str(template_path or "").strip())
+    if not workbook_path.exists():
+        raise FileNotFoundError(f"YU workbook was not found: {workbook_path}")
+
+    wb = load_workbook(str(workbook_path), read_only=True, data_only=False)
+    try:
+        if sheet_name not in wb.sheetnames:
+            raise ValueError(f"Sheet '{sheet_name}' not found. Available sheets: {wb.sheetnames}")
+        ws = wb[sheet_name]
+
+        item_idx = column_index_from_string(item_col)
+        export_min_idx = column_index_from_string(export_min_col)
+        export_max_idx = column_index_from_string(export_max_col)
+        read_max_col = max(export_max_idx, item_idx, 8)
+
+        # Read the worksheet only once. Calling ReadOnlyWorksheet.cell() for every
+        # coordinate reparses the XML repeatedly and is extremely slow.
+        row_cache: list[tuple[int, tuple[Any, ...]]] = []
+        transport_row: int | None = None
+        total_row: int | None = None
+
+        for row_number, row_values in enumerate(
+            ws.iter_rows(
+                min_row=header_end_row + 1,
+                max_row=int(ws.max_row or 0),
+                min_col=1,
+                max_col=read_max_col,
+                values_only=True,
+            ),
+            start=header_end_row + 1,
+        ):
+            values = tuple(row_values)
+            row_cache.append((row_number, values))
+
+            export_values = [
+                _normalise_workbook_text(values[col - 1] if col - 1 < len(values) else None)
+                for col in range(export_min_idx, export_max_idx + 1)
+            ]
+            if total_row is None and any(
+                value == "ORDER TOTAL" or value.startswith("ORDER TOTAL ")
+                for value in export_values
+            ):
+                total_row = row_number
+            if transport_row is None and any("METHOD OF TRANSPORT" in value for value in export_values):
+                transport_row = row_number
+
+        if total_row is None:
+            total_row = int(ws.max_row or header_end_row)
+        if transport_row is None or transport_row > total_row:
+            transport_row = max(header_end_row + 1, total_row - 5)
+
+        footer_start = int(transport_row)
+        previous_row_number = footer_start - 1
+        previous_values = next(
+            (values for row_number, values in row_cache if row_number == previous_row_number),
+            (),
+        )
+        if previous_values:
+            previous_export_values = [
+                previous_values[col - 1] if col - 1 < len(previous_values) else None
+                for col in range(export_min_idx, export_max_idx + 1)
+            ]
+            if all(value in (None, "") for value in previous_export_values):
+                footer_start = previous_row_number
+
+        exact_rows: dict[str, list[int]] = defaultdict(list)
+        clean_rows: dict[str, list[int]] = defaultdict(list)
+        row_item_numbers: dict[int, str] = {}
+        detail_rows: set[int] = set()
+        signature_rows: dict[tuple[str, ...], list[int]] = defaultdict(list)
+        loose_signature_rows: dict[tuple[str, ...], list[int]] = defaultdict(list)
+
+        for row_number, values_tuple in row_cache:
+            if row_number >= footer_start:
+                break
+            values = list(values_tuple)
+            item_value = values[item_idx - 1] if item_idx - 1 < len(values) else None
+            item_number = str(item_value or "").strip()
+
+            supplier_values = values[1:8]
+            if _workbook_row_is_detail_values(supplier_values):
+                detail_rows.add(row_number)
+                # Exact signature: B:G. Loose signature omits F (unit size),
+                # which can be represented differently by Excel and SQL Server.
+                exact_signature = _workbook_row_signature_from_values(supplier_values[:6])
+                loose_signature = _workbook_row_signature_from_values(
+                    [supplier_values[0], supplier_values[1], supplier_values[2], supplier_values[3], supplier_values[5]]
+                )
+                signature_rows[exact_signature].append(row_number)
+                loose_signature_rows[loose_signature].append(row_number)
+
+            if not item_number:
+                continue
+
+            row_item_numbers[row_number] = item_number
+            exact_rows[item_number.upper()].append(row_number)
+            clean_rows[clean_item_key(item_number)].append(row_number)
+
+        return {
+            "path": str(workbook_path),
+            "mtime_ns": workbook_path.stat().st_mtime_ns,
+            "sheet_name": sheet_name,
+            "header_end_row": int(header_end_row),
+            "footer_start_row": int(footer_start),
+            "footer_end_row": int(total_row),
+            "exact_rows": dict(exact_rows),
+            "clean_rows": dict(clean_rows),
+            "row_item_numbers": row_item_numbers,
+            "detail_rows": detail_rows,
+            "signature_rows": dict(signature_rows),
+            "loose_signature_rows": dict(loose_signature_rows),
+        }
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+
+def workbook_rows_for_item_from_scan(scan: dict[str, Any], item_number: str, *, exact: bool = False) -> list[int]:
+    item_number = str(item_number or "").strip()
+    if not item_number:
+        return []
+    if exact:
+        return list((scan.get("exact_rows") or {}).get(item_number.upper(), []))
+    return list((scan.get("clean_rows") or {}).get(clean_item_key(item_number), []))
+
+
+def resolve_yuchang_items_to_current_rows(
+    template_path: str,
+    item_numbers_with_qty: Iterable[tuple[str, float | int]],
+    *,
+    sheet_name: str = "Sheet1",
+    exact_item_numbers: Iterable[str] | None = None,
+) -> tuple[list[tuple[int, float]], dict[str, Any]]:
+    """Resolve order items against the current Column A positions."""
+    scan = scan_yuchang_workbook(template_path, sheet_name=sheet_name)
+    exact_keys = {str(item or "").strip().upper() for item in (exact_item_numbers or [])}
+    rows_with_qty: list[tuple[int, float]] = []
+    missing: list[str] = []
+    duplicates: dict[str, list[int]] = {}
+
+    for item_number, qty in item_numbers_with_qty:
+        item_number = str(item_number or "").strip()
+        rows = workbook_rows_for_item_from_scan(
+            scan,
+            item_number,
+            exact=item_number.upper() in exact_keys,
+        )
+        if not rows:
+            missing.append(item_number)
+            continue
+        if len(rows) != 1:
+            duplicates[item_number] = sorted(set(int(row) for row in rows))
+            continue
+        rows_with_qty.append((int(rows[0]), float(qty)))
+
+    if missing or duplicates:
+        parts: list[str] = []
+        if missing:
+            parts.append("Missing from current workbook Column A: " + ", ".join(sorted(set(missing))))
+        if duplicates:
+            duplicate_text = "; ".join(
+                f"{item}: rows {', '.join(str(row) for row in rows)}"
+                for item, rows in sorted(duplicates.items())
+            )
+            parts.append("Duplicate item numbers in current workbook Column A: " + duplicate_text)
+        raise ValueError("\n".join(parts))
+
+    return rows_with_qty, scan
+
 # ------------------------------------------------------------
 # Order CSV + resolution + export
 # ------------------------------------------------------------
@@ -539,7 +998,7 @@ def write_audit_csv(audit_path: str, results: list[OrderResolveResult]) -> None:
                 "item_number",
                 "quantity",
                 "status",
-                "resolved_source_row",
+                "resolved_workbook_row",
                 "resolution_source",
                 "note",
                 "review_hit_1",
@@ -848,6 +1307,7 @@ def save_yuchang_workbook_matches(
     match_col: str = "A",
     review_sheet_name: str = "Match_Review",
     review_header_row: int = 4,
+    update_review_sheet: bool = False,
 ) -> dict:
     import xml.etree.ElementTree as ET
 
@@ -878,25 +1338,31 @@ def save_yuchang_workbook_matches(
 
         updated_parts[order_part] = _xlsx_xml_tostring(order_root)
 
-        try:
-            review_part = _xlsx_part_for_sheet(zin, review_sheet_name)
-        except Exception:
-            review_part = ""
-        if review_part:
-            review_root = ET.fromstring(zin.read(review_part))
-            source_col = _find_header_column_in_xml(review_root, shared_strings, "Source Row", review_header_row, "A")
-            final_col = _find_header_column_in_xml(review_root, shared_strings, "Final Selection", review_header_row, "B")
-            final_letter = get_column_letter(final_col)
-            review_row_by_source = _review_row_map_by_source(review_root, shared_strings, source_col, review_header_row)
+        # Match_Review stores historical source row numbers. Once users insert or
+        # move rows, writing back to it by row number can attach a part number to
+        # the wrong supplier line. Column A on Sheet1 is now the permanent mapping,
+        # so the review sheet is left untouched unless an older caller explicitly
+        # opts in.
+        if update_review_sheet:
+            try:
+                review_part = _xlsx_part_for_sheet(zin, review_sheet_name)
+            except Exception:
+                review_part = ""
+            if review_part:
+                review_root = ET.fromstring(zin.read(review_part))
+                source_col = _find_header_column_in_xml(review_root, shared_strings, "Source Row", review_header_row, "A")
+                final_col = _find_header_column_in_xml(review_root, shared_strings, "Final Selection", review_header_row, "B")
+                final_letter = get_column_letter(final_col)
+                review_row_by_source = _review_row_map_by_source(review_root, shared_strings, source_col, review_header_row)
 
-            for source_row, item_number in row_matches.items():
-                review_row = review_row_by_source.get(int(source_row))
-                if review_row is None:
-                    continue
-                value = str(item_number or "").strip() or None
-                _set_xml_cell_text(review_root, f"{final_letter}{review_row}", value)
+                for source_row, item_number in row_matches.items():
+                    review_row = review_row_by_source.get(int(source_row))
+                    if review_row is None:
+                        continue
+                    value = str(item_number or "").strip() or None
+                    _set_xml_cell_text(review_root, f"{final_letter}{review_row}", value)
 
-            updated_parts[review_part] = _xlsx_xml_tostring(review_root)
+                updated_parts[review_part] = _xlsx_xml_tostring(review_root)
 
         fd, tmp_name = tempfile.mkstemp(prefix=f".{workbook_path.stem}_", suffix=workbook_path.suffix, dir=str(workbook_path.parent))
         os.close(fd)
@@ -1114,8 +1580,8 @@ def export_yuchang_po_compact_by_rows(
     export_max_col: str = "N",
     header_start_row: int = 1,
     header_end_row: int = 14,
-    footer_start_row: int = 3045,
-    footer_end_row: int = 3050,
+    footer_start_row: int | None = None,
+    footer_end_row: int | None = None,
     max_blank_scan: int = 3,
     separator_source_gap: int = 50,
     auto_size_start_row: int = 12,
@@ -1135,6 +1601,23 @@ def export_yuchang_po_compact_by_rows(
 
     if export_min_idx > export_max_idx:
         raise ValueError("export_min_col cannot be after export_max_col")
+
+    detected_footer_start, detected_footer_end = detect_yuchang_footer_rows(
+        src,
+        header_end_row=header_end_row,
+        export_min_col=export_min_idx,
+        export_max_col=export_max_idx,
+    )
+    if footer_start_row is None:
+        footer_start_row = detected_footer_start
+    if footer_end_row is None:
+        footer_end_row = detected_footer_end
+    footer_start_row = int(footer_start_row)
+    footer_end_row = int(footer_end_row)
+    if footer_start_row <= header_end_row or footer_end_row < footer_start_row:
+        raise ValueError(
+            f"Invalid YU footer range detected: {footer_start_row}-{footer_end_row}"
+        )
 
     src[date_cell] = order_date
     src[order_no_cell] = order_number
@@ -1360,10 +1843,50 @@ def export_yuchang_po_compact_by_rows(
     }
 
 
+def export_yuchang_po_compact_by_items(
+    template_path: str,
+    output_path: str,
+    order_date: str,
+    order_number: str,
+    item_numbers_with_qty: Iterable[tuple[str, float | int]],
+    *,
+    sheet_name: str = "Sheet1",
+    exact_item_numbers: Iterable[str] | None = None,
+    **kwargs,
+) -> dict:
+    """Export by permanent item number, resolving current row positions at runtime."""
+    current_rows, scan = resolve_yuchang_items_to_current_rows(
+        template_path,
+        item_numbers_with_qty,
+        sheet_name=sheet_name,
+        exact_item_numbers=exact_item_numbers,
+    )
+    result = export_yuchang_po_compact_by_rows(
+        template_path=template_path,
+        output_path=output_path,
+        order_date=order_date,
+        order_number=order_number,
+        source_rows_with_qty=current_rows,
+        sheet_name=sheet_name,
+        footer_start_row=int(scan["footer_start_row"]),
+        footer_end_row=int(scan["footer_end_row"]),
+        **kwargs,
+    )
+    result["resolved_item_rows"] = [
+        {"source_row": int(row), "quantity": float(qty)}
+        for row, qty in current_rows
+    ]
+    result["footer_start_row"] = int(scan["footer_start_row"])
+    result["footer_end_row"] = int(scan["footer_end_row"])
+    return result
+
+
 # ------------------------------------------------------------
 # Window
 # ------------------------------------------------------------
 class YUOrderReviewWindow(QMainWindow):
+    orders_exported = Signal(object)
+
     def __init__(
         self,
         db: Any,
@@ -1390,6 +1913,11 @@ class YUOrderReviewWindow(QMainWindow):
         self.grouped_order_rows: list[dict] = []
         self.current_rows: list[dict] = []
         self.current_selected_detail: dict[str, Any] | None = None
+
+        # Live Sheet1 index. Column A is the permanent item mapping; source rows
+        # are only current workbook addresses used during validation.
+        self._workbook_scan: dict[str, Any] = {}
+        self._workbook_scan_error = ""
 
         self.setObjectName("YUOrderReviewWindow")
         self.setWindowTitle("YU Order Review")
@@ -1438,6 +1966,14 @@ class YUOrderReviewWindow(QMainWindow):
         self.export_visible_button = QPushButton("Export Visible", self.top_frame)
         self.export_visible_button.clicked.connect(self.export_visible_orders)
         top_layout.addWidget(self.export_visible_button)
+
+        self.export_myob_po_button = QPushButton("Export MYOB PO", self.top_frame)
+        self.export_myob_po_button.setToolTip(
+            "Create an AccountRight Item Purchases TXT import using the visible, resolved order lines, "
+            "the Widget item descriptions, and the latest imported YU costs."
+        )
+        self.export_myob_po_button.clicked.connect(self.export_myob_po)
+        top_layout.addWidget(self.export_myob_po_button)
 
         self.open_output_button = QPushButton("Open Output Folder", self.top_frame)
         self.open_output_button.clicked.connect(self.open_output_dir)
@@ -1498,7 +2034,7 @@ class YUOrderReviewWindow(QMainWindow):
         self.main_table.setObjectName("main_table")
         self.main_table.setColumnCount(8)
         self.main_table.setHorizontalHeaderLabels([
-            "Date", "Order No", "Item Number", "Qty", "Status", "Source Row", "Source", "Best Hit"
+            "Date", "Order No", "Item Number", "Qty", "Status", "Workbook Row", "Source", "Best Hit"
         ])
         self.main_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.main_table.setSelectionMode(QTableWidget.SingleSelection)
@@ -1522,7 +2058,7 @@ class YUOrderReviewWindow(QMainWindow):
         self.item_box = self.make_value_row(detail_layout, "Item Number")
         self.qty_box = self.make_value_row(detail_layout, "Qty")
         self.status_box = self.make_value_row(detail_layout, "Status")
-        self.resolved_row_box = self.make_value_row(detail_layout, "Resolved Row")
+        self.resolved_row_box = self.make_value_row(detail_layout, "Current Workbook Row")
 
         right_layout.addWidget(self.detail_frame)
 
@@ -1544,7 +2080,7 @@ class YUOrderReviewWindow(QMainWindow):
         self.candidate_table.setObjectName("candidate_table")
         self.candidate_table.setColumnCount(7)
         self.candidate_table.setHorizontalHeaderLabels([
-            "Row", "Hit Type", "Conf %", "Item", "Description", "Size", "Labelled As"
+            "Workbook Row", "Hit Type", "Conf %", "Item", "Description", "Size", "Labelled As"
         ])
         self.candidate_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.candidate_table.setSelectionMode(QTableWidget.SingleSelection)
@@ -1571,11 +2107,11 @@ class YUOrderReviewWindow(QMainWindow):
         action_bar.addWidget(self.clear_button)
 
         self.manual_row_edit = QLineEdit(self.candidate_frame)
-        self.manual_row_edit.setPlaceholderText("Type source row...")
+        self.manual_row_edit.setPlaceholderText("Type current workbook row...")
         self.manual_row_edit.returnPressed.connect(self.confirm_manual_row)
         action_bar.addWidget(self.manual_row_edit)
 
-        self.manual_row_button = QPushButton("Use Source Row", self.candidate_frame)
+        self.manual_row_button = QPushButton("Use Workbook Row", self.candidate_frame)
         self.manual_row_button.clicked.connect(self.confirm_manual_row)
         action_bar.addWidget(self.manual_row_button)
 
@@ -1882,7 +2418,108 @@ class YUOrderReviewWindow(QMainWindow):
         parts = [f"{clean_item_sql_expr(expr)} = ?" for expr in column_exprs]
         return "(" + " OR ".join(parts) + ")", tuple(clean for _ in column_exprs)
 
+    def refresh_workbook_index(self, force: bool = False) -> bool:
+        """Refresh the live Sheet1 mapping used for resolution and export."""
+        if not self.template_path:
+            self._workbook_scan = {}
+            self._workbook_scan_error = "No YU workbook template path is set."
+            return False
+
+        try:
+            workbook_path = Path(self.template_path)
+            current_mtime = workbook_path.stat().st_mtime_ns
+            if (
+                not force
+                and self._workbook_scan
+                and int(self._workbook_scan.get("mtime_ns") or -1) == int(current_mtime)
+            ):
+                return True
+
+            self._workbook_scan = scan_yuchang_workbook(self.template_path)
+            self._workbook_scan_error = ""
+            return True
+        except Exception as exc:
+            self._workbook_scan = {}
+            self._workbook_scan_error = f"{type(exc).__name__}: {exc}"
+            return False
+
+    def workbook_rows_for_item(self, item_number: str, *, force_refresh: bool = False) -> list[int]:
+        if force_refresh or not self._workbook_scan:
+            self.refresh_workbook_index(force=force_refresh)
+        if not self._workbook_scan:
+            return []
+
+        exact = self.item_is_fasteners(item_number)
+        return workbook_rows_for_item_from_scan(
+            self._workbook_scan,
+            item_number,
+            exact=exact,
+        )
+
+    @staticmethod
+    def supplier_record_signatures(record: dict[str, Any]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        exact_signature = _workbook_row_signature_from_values(
+            [
+                record.get("description"),
+                record.get("size_text"),
+                record.get("colour"),
+                record.get("pack_type"),
+                record.get("unit_size"),
+                record.get("labelled_as"),
+            ]
+        )
+        loose_signature = _workbook_row_signature_from_values(
+            [
+                record.get("description"),
+                record.get("size_text"),
+                record.get("colour"),
+                record.get("pack_type"),
+                record.get("labelled_as"),
+            ]
+        )
+        return exact_signature, loose_signature
+
+    def locate_current_workbook_rows_for_supplier_record(
+        self,
+        record: dict[str, Any],
+        preferred_row: int | None = None,
+    ) -> list[int]:
+        """Relocate a database snapshot row after workbook insertions or moves."""
+        if not self._workbook_scan:
+            self.refresh_workbook_index(force=False)
+        scan = self._workbook_scan
+        if not scan:
+            return []
+
+        exact_signature, loose_signature = self.supplier_record_signatures(record)
+        exact_rows = list((scan.get("signature_rows") or {}).get(exact_signature, []))
+        loose_rows = list((scan.get("loose_signature_rows") or {}).get(loose_signature, []))
+
+        candidates = exact_rows or loose_rows
+        candidates = sorted(set(int(row) for row in candidates))
+        if not candidates:
+            return []
+
+        if preferred_row is not None:
+            preferred_row = int(preferred_row)
+            if preferred_row in candidates:
+                return [preferred_row]
+            # A row insertion normally moves a line only a short distance. If
+            # otherwise-identical supplier lines exist, choose only when one
+            # candidate is uniquely closest to the old snapshot row.
+            distances = sorted((abs(row - preferred_row), row) for row in candidates)
+            if len(distances) == 1 or distances[0][0] < distances[1][0]:
+                return [distances[0][1]]
+
+        return candidates
+
+    def workbook_row_is_detail(self, row_number: int) -> bool:
+        if not self._workbook_scan:
+            self.refresh_workbook_index(force=False)
+        return int(row_number) in set(self._workbook_scan.get("detail_rows") or set())
+
     def refresh_all(self):
+        self.refresh_workbook_index(force=True)
         self.load_last_import_date()
         self.load_counts()
         self.load_main_table()
@@ -1900,6 +2537,51 @@ class YUOrderReviewWindow(QMainWindow):
     def resolve_item(self, item_number: str, quantity: float, date_text: str, order_number: str) -> OrderResolveResult:
         item_number = str(item_number or "").strip()
 
+        if not self._workbook_scan and not self.refresh_workbook_index(force=False):
+            return OrderResolveResult(
+                item_number=item_number,
+                quantity=quantity,
+                date=date_text,
+                order_number=order_number,
+                status="error",
+                source_row=None,
+                source="workbook_unavailable",
+                note=f"The current YU workbook could not be scanned: {self._workbook_scan_error}",
+                review_hits=[],
+            )
+
+        # Permanent resolution comes only from the current workbook's Column A.
+        # The database source_row is a historical validation snapshot and is not
+        # trusted as an export destination.
+        workbook_rows = self.workbook_rows_for_item(item_number)
+        if len(workbook_rows) == 1:
+            current_row = int(workbook_rows[0])
+            return OrderResolveResult(
+                item_number=item_number,
+                quantity=quantity,
+                date=date_text,
+                order_number=order_number,
+                status="resolved",
+                source_row=current_row,
+                source="workbook_column_a",
+                note=f"Resolved from current Sheet1 Column A at row {current_row}.",
+                review_hits=[],
+            )
+        if len(workbook_rows) > 1:
+            return OrderResolveResult(
+                item_number=item_number,
+                quantity=quantity,
+                date=date_text,
+                order_number=order_number,
+                status="error",
+                source_row=None,
+                source="workbook_column_a_duplicate",
+                note=f"Item number appears more than once in current Sheet1 Column A: {workbook_rows}.",
+                review_hits=[],
+            )
+
+        hits: list[ReviewHit] = []
+
         direct_condition, direct_params = self.item_match_condition(
             ["current_item_number", "literal_item_number"], item_number
         )
@@ -1913,31 +2595,14 @@ class YUOrderReviewWindow(QMainWindow):
             """,
             direct_params,
         )
-        direct_rows = [int(row["source_row"]) for row in direct_rows_raw]
-
-        if len(direct_rows) == 1:
-            return OrderResolveResult(
-                item_number=item_number,
-                quantity=quantity,
-                date=date_text,
-                order_number=order_number,
-                status="resolved",
-                source_row=direct_rows[0],
-                source="sheet1_direct",
-                note="Resolved by exact item number already present on supplier rows.",
-                review_hits=[],
-            )
-        if len(direct_rows) > 1:
-            return OrderResolveResult(
-                item_number=item_number,
-                quantity=quantity,
-                date=date_text,
-                order_number=order_number,
-                status="error",
-                source_row=None,
-                source="sheet1_direct_duplicate",
-                note=f"Item number exists more than once on supplier rows: {direct_rows}.",
-                review_hits=[],
+        for row in direct_rows_raw:
+            hits.append(
+                ReviewHit(
+                    source_row=int(row["source_row"]),
+                    match_type="supplier_snapshot",
+                    confidence=None,
+                    note="Item exists in the imported supplier snapshot but is missing from current workbook Column A.",
+                )
             )
 
         final_condition, final_params = self.item_match_condition(["final_selection"], item_number)
@@ -1950,33 +2615,15 @@ class YUOrderReviewWindow(QMainWindow):
             """,
             final_params,
         )
-        final_rows = [int(row["source_row"]) for row in final_rows_raw]
-        if len(final_rows) == 1:
-            return OrderResolveResult(
-                item_number=item_number,
-                quantity=quantity,
-                date=date_text,
-                order_number=order_number,
-                status="resolved",
-                source_row=final_rows[0],
-                source="match_review_final",
-                note="Resolved by approved Final Selection.",
-                review_hits=[],
+        for row in final_rows_raw:
+            hits.append(
+                ReviewHit(
+                    source_row=int(row["source_row"]),
+                    match_type="database_confirmation",
+                    confidence=None,
+                    note="Database confirmation exists, but Column A is the permanent mapping and currently has no unique match.",
+                )
             )
-        if len(final_rows) > 1:
-            return OrderResolveResult(
-                item_number=item_number,
-                quantity=quantity,
-                date=date_text,
-                order_number=order_number,
-                status="error",
-                source_row=None,
-                source="match_review_final_duplicate",
-                note=f"Item number exists more than once in Final Selection: {final_rows}.",
-                review_hits=[],
-            )
-
-        hits: list[ReviewHit] = []
 
         suggested_condition, suggested_params = self.item_match_condition(["suggested_match"], item_number)
         suggested_hits = self.db.all(
@@ -2023,14 +2670,18 @@ class YUOrderReviewWindow(QMainWindow):
         if hits:
             hits_sorted = sorted(
                 hits,
-                key=lambda x: (x.confidence if x.confidence is not None else -1),
+                key=lambda x: (
+                    x.confidence if x.confidence is not None else -1,
+                    -int(x.source_row),
+                ),
                 reverse=True,
             )
             best = hits_sorted[0]
             confidence_txt = "" if best.confidence is None else f" Best confidence: {best.confidence:.1%}."
             note = (
-                f"No approved mapping yet. Best review hit is source row {best.source_row} via {best.match_type}.{confidence_txt} "
-                "Confirm a candidate row first."
+                f"No unique current Column A mapping exists. Best validation hit is snapshot row "
+                f"{best.source_row} via {best.match_type}.{confidence_txt} "
+                "Confirm the current workbook row to write the item number into Column A."
             )
             return OrderResolveResult(
                 item_number=item_number,
@@ -2039,7 +2690,7 @@ class YUOrderReviewWindow(QMainWindow):
                 order_number=order_number,
                 status="needs_review",
                 source_row=None,
-                source="review_hit_only",
+                source="validation_required",
                 note=note,
                 review_hits=hits_sorted,
             )
@@ -2052,7 +2703,7 @@ class YUOrderReviewWindow(QMainWindow):
             status="unmatched",
             source_row=None,
             source="not_found",
-            note="No direct match, no approved final selection, and no candidate review hits were found.",
+            note="Item number is not in current workbook Column A and no validation candidates were found.",
             review_hits=[],
         )
 
@@ -2189,7 +2840,7 @@ class YUOrderReviewWindow(QMainWindow):
         if result.review_hits:
             hit = result.review_hits[0]
             conf = "" if hit.confidence is None else f" {hit.confidence:.1%}"
-            return f"row {hit.source_row} {hit.match_type}{conf}"
+            return f"snapshot row {hit.source_row} {hit.match_type}{conf}"
         return ""
 
     def selected_row_detail(self) -> dict[str, Any] | None:
@@ -2204,6 +2855,12 @@ class YUOrderReviewWindow(QMainWindow):
             "sheet_col_c": str(row.get("sheet_col_c") or ""),
             "sheet_col_d": str(row.get("sheet_col_d") or ""),
             "sheet_col_g": str(row.get("sheet_col_g") or ""),
+            "description": row.get("description"),
+            "size_text": row.get("size_text"),
+            "colour": row.get("colour"),
+            "pack_type": row.get("pack_type"),
+            "unit_size": row.get("unit_size"),
+            "labelled_as": row.get("labelled_as"),
         }
 
     def candidate_supplier_select_sql(self, prefix: str = "") -> str:
@@ -2212,8 +2869,47 @@ class YUOrderReviewWindow(QMainWindow):
             f"COALESCE(NULLIF({p}current_item_number, ''), {p}literal_item_number, '') AS sheet_col_b, "
             f"{p}description AS sheet_col_c, "
             f"{p}size_text AS sheet_col_d, "
-            f"{p}labelled_as AS sheet_col_g"
+            f"{p}labelled_as AS sheet_col_g, "
+            f"{p}description AS description, "
+            f"{p}size_text AS size_text, "
+            f"{p}colour AS colour, "
+            f"{p}pack_type AS pack_type, "
+            f"{p}unit_size AS unit_size, "
+            f"{p}labelled_as AS labelled_as"
         )
+
+    def decorate_candidate_row(
+        self,
+        row: dict,
+        *,
+        hit_type: str,
+        confidence: float | None,
+    ) -> dict:
+        db_source_row = int(row["source_row"])
+        values = self.supplier_candidate_values(row)
+        current_rows = self.locate_current_workbook_rows_for_supplier_record(
+            values,
+            preferred_row=db_source_row,
+        )
+        workbook_row = int(current_rows[0]) if len(current_rows) == 1 else None
+
+        if workbook_row is None:
+            row_state = "ambiguous" if current_rows else "not found in current workbook"
+        elif workbook_row == db_source_row:
+            row_state = "current"
+        else:
+            row_state = f"moved from snapshot row {db_source_row}"
+
+        return {
+            "source_row": workbook_row,
+            "workbook_row": workbook_row,
+            "db_source_row": db_source_row,
+            "row_state": row_state,
+            "candidate_workbook_rows": current_rows,
+            "hit_type": hit_type,
+            "confidence": confidence,
+            **values,
+        }
 
     def load_candidates_for_item(self, item_number: str, current_result: OrderResolveResult) -> list[dict]:
         rows: list[dict] = []
@@ -2233,12 +2929,7 @@ class YUOrderReviewWindow(QMainWindow):
             direct_params,
         )
         for row in direct_rows:
-            rows.append({
-                "source_row": int(row["source_row"]),
-                "hit_type": "direct",
-                "confidence": None,
-                **self.supplier_candidate_values(row),
-            })
+            rows.append(self.decorate_candidate_row(row, hit_type="direct", confidence=None))
 
         final_condition, final_params = self.item_match_condition(["r.final_selection"], item_number)
         final_rows = self.db.all(
@@ -2252,12 +2943,7 @@ class YUOrderReviewWindow(QMainWindow):
             final_params,
         )
         for row in final_rows:
-            rows.append({
-                "source_row": int(row["source_row"]),
-                "hit_type": "final_selection",
-                "confidence": None,
-                **self.supplier_candidate_values(row),
-            })
+            rows.append(self.decorate_candidate_row(row, hit_type="database_confirmation", confidence=None))
 
         suggested_condition, suggested_params = self.item_match_condition(["r.suggested_match"], item_number)
         suggested_rows = self.db.all(
@@ -2271,12 +2957,13 @@ class YUOrderReviewWindow(QMainWindow):
             suggested_params,
         )
         for row in suggested_rows:
-            rows.append({
-                "source_row": int(row["source_row"]),
-                "hit_type": "suggested_match",
-                "confidence": float(row["confidence_pct"]) if row.get("confidence_pct") is not None else None,
-                **self.supplier_candidate_values(row),
-            })
+            rows.append(
+                self.decorate_candidate_row(
+                    row,
+                    hit_type="suggested_match",
+                    confidence=float(row["confidence_pct"]) if row.get("confidence_pct") is not None else None,
+                )
+            )
 
         candidate_condition, candidate_params = self.item_match_condition(["c.candidate_item_number"], item_number)
         candidate_rows = self.db.all(
@@ -2290,36 +2977,46 @@ class YUOrderReviewWindow(QMainWindow):
             candidate_params,
         )
         for row in candidate_rows:
-            rows.append({
-                "source_row": int(row["source_row"]),
-                "hit_type": f"candidate_{row.get('candidate_rank')}",
-                "confidence": float(row["confidence_pct"]) if row.get("confidence_pct") is not None else None,
-                **self.supplier_candidate_values(row),
-            })
-
-        if current_result.source_row is not None:
-            source_row = int(current_result.source_row)
-            if not any(r["source_row"] == source_row and r["hit_type"] == "current" for r in rows):
-                src = self.db.one(
-                    f"""
-                    SELECT s.source_row, {supplier_cols}
-                    FROM dbo.{self.tables["supplier_lines"]} s
-                    WHERE s.source_row = ?
-                    """,
-                    (source_row,),
+            rows.append(
+                self.decorate_candidate_row(
+                    row,
+                    hit_type=f"candidate_{row.get('candidate_rank')}",
+                    confidence=float(row["confidence_pct"]) if row.get("confidence_pct") is not None else None,
                 )
-                if src is not None:
-                    rows.insert(0, {
-                        "source_row": source_row,
-                        "hit_type": "current",
-                        "confidence": None,
-                        **self.supplier_candidate_values(src),
-                    })
+            )
 
-        deduped = []
-        seen = set()
+        # When Column A already contains the item, always show its current row,
+        # even if no matching database snapshot row is available.
+        if current_result.source_row is not None:
+            current_row = int(current_result.source_row)
+            if not any(r.get("workbook_row") == current_row for r in rows):
+                rows.insert(
+                    0,
+                    {
+                        "source_row": current_row,
+                        "workbook_row": current_row,
+                        "db_source_row": None,
+                        "row_state": "current Column A mapping",
+                        "candidate_workbook_rows": [current_row],
+                        "hit_type": "current_workbook",
+                        "confidence": None,
+                        "sheet_col_b": item_number,
+                        "sheet_col_c": "",
+                        "sheet_col_d": "",
+                        "sheet_col_g": "",
+                        "description": None,
+                        "size_text": None,
+                        "colour": None,
+                        "pack_type": None,
+                        "unit_size": None,
+                        "labelled_as": None,
+                    },
+                )
+
+        deduped: list[dict] = []
+        seen: set[tuple[Any, str]] = set()
         for row in rows:
-            key = (row["source_row"], row["hit_type"])
+            key = (row.get("db_source_row"), str(row.get("hit_type")))
             if key in seen:
                 continue
             seen.add(key)
@@ -2353,9 +3050,17 @@ class YUOrderReviewWindow(QMainWindow):
         for cand in candidates:
             row_index = self.candidate_table.rowCount()
             self.candidate_table.insertRow(row_index)
+
+            workbook_row = cand.get("workbook_row")
+            row_text = str(workbook_row) if workbook_row is not None else "?"
+            hit_type = str(cand.get("hit_type") or "")
+            row_state = str(cand.get("row_state") or "")
+            if row_state and row_state not in {"current", "current Column A mapping"}:
+                hit_type = f"{hit_type} ({row_state})"
+
             values = [
-                str(cand["source_row"]),
-                cand["hit_type"],
+                row_text,
+                hit_type,
                 self.format_confidence(cand["confidence"]),
                 cand.get("sheet_col_b", ""),
                 cand.get("sheet_col_c", ""),
@@ -2363,11 +3068,16 @@ class YUOrderReviewWindow(QMainWindow):
                 cand.get("sheet_col_g", ""),
             ]
             for col, value in enumerate(values):
-                item = QTableWidgetItem(value)
+                item = QTableWidgetItem("" if value is None else str(value))
                 if col in {0, 2}:
                     item.setTextAlignment(Qt.AlignCenter)
                 if col == 0:
-                    item.setData(Qt.UserRole, int(cand["source_row"]))
+                    item.setData(Qt.UserRole, dict(cand))
+                    if workbook_row is None:
+                        item.setToolTip(
+                            "This database snapshot row could not be located uniquely in the current workbook. "
+                            "Use the manual current workbook row field."
+                        )
                 self.candidate_table.setItem(row_index, col, item)
 
         self.auto_size_all_columns(self.candidate_table)
@@ -2383,10 +3093,23 @@ class YUOrderReviewWindow(QMainWindow):
         item = self.candidate_table.item(row_index, 0)
         if item is None:
             return
-        source_row = item.data(Qt.UserRole)
-        try:
-            source_row = int(source_row)
-        except Exception:
+
+        candidate = item.data(Qt.UserRole)
+        if not isinstance(candidate, dict):
+            return
+
+        workbook_row = candidate.get("workbook_row")
+        db_source_row = candidate.get("db_source_row")
+        row_state = str(candidate.get("row_state") or "")
+        possible_rows = candidate.get("candidate_workbook_rows") or []
+
+        if db_source_row is None:
+            lines = [
+                f"<b>Current Workbook Row:</b> {self.html_text(workbook_row)}",
+                f"<b>Row State:</b> {self.html_text(row_state)}",
+                "<b>Mapping Source:</b> Current Sheet1 Column A",
+            ]
+            self.preview_browser.setHtml("<br>".join(lines))
             return
 
         preview = self.db.one(
@@ -2399,6 +3122,7 @@ class YUOrderReviewWindow(QMainWindow):
                 s.size_text,
                 s.colour,
                 s.pack_type,
+                s.unit_size,
                 s.labelled_as,
                 r.final_selection,
                 r.suggested_match,
@@ -2407,18 +3131,26 @@ class YUOrderReviewWindow(QMainWindow):
             LEFT JOIN dbo.{self.tables["match_review"]} r ON r.source_row = s.source_row
             WHERE s.source_row = ?
             """,
-            (source_row,),
+            (int(db_source_row),),
         )
         if preview is None:
             return
 
+        current_row_text = (
+            str(workbook_row)
+            if workbook_row is not None
+            else ("Ambiguous: " + ", ".join(str(row) for row in possible_rows) if possible_rows else "Not found")
+        )
         lines = [
-            f"<b>Source Row:</b> {self.html_text(preview.get('source_row'))}",
+            f"<b>Current Workbook Row:</b> {self.html_text(current_row_text)}",
+            f"<b>Database Snapshot Row:</b> {self.html_text(preview.get('source_row'))}",
+            f"<b>Row State:</b> {self.html_text(row_state)}",
             f"<b>Current Item:</b> {self.html_text(preview.get('current_item_number') or preview.get('literal_item_number'))}",
             f"<b>Description:</b> {self.html_text(preview.get('description'))}",
             f"<b>Size:</b> {self.html_text(preview.get('size_text'))}",
             f"<b>Colour:</b> {self.html_text(preview.get('colour'))}",
             f"<b>Pack:</b> {self.html_text(preview.get('pack_type'))}",
+            f"<b>Unit Size:</b> {self.html_text(preview.get('unit_size'))}",
             f"<b>Labelled As:</b> {self.html_text(preview.get('labelled_as'))}",
             f"<b>Final Selection:</b> {self.html_text(preview.get('final_selection'))}",
             f"<b>Suggested Match:</b> {self.html_text(preview.get('suggested_match'))}",
@@ -2435,17 +3167,15 @@ class YUOrderReviewWindow(QMainWindow):
         self.manual_row_edit.clear()
 
     # ---------------- actions
-    def selected_candidate_source_row(self) -> int | None:
+    def selected_candidate_mapping(self) -> dict[str, Any] | None:
         row_index = self.candidate_table.currentRow()
         if row_index < 0:
             return None
         item = self.candidate_table.item(row_index, 0)
         if item is None:
             return None
-        try:
-            return int(item.data(Qt.UserRole))
-        except Exception:
-            return None
+        value = item.data(Qt.UserRole)
+        return dict(value) if isinstance(value, dict) else None
 
     def next_review_row(self) -> int:
         value = self.db.scalar(f"SELECT ISNULL(MAX(review_row), 4) + 1 FROM dbo.{self.tables['match_review']}")
@@ -2580,45 +3310,144 @@ class YUOrderReviewWindow(QMainWindow):
         return True
 
     def sync_confirmed_matches_to_workbook(self) -> bool:
-        rows = self.db.all(
+        """Legacy compatibility hook.
+
+        Confirmed mappings are no longer replayed from database source rows.
+        Column A is authoritative and is scanned in its current position.
+        """
+        if self.refresh_workbook_index(force=True):
+            return True
+        QMessageBox.warning(
+            self,
+            "YU Order Review",
+            "The current YU workbook could not be scanned.\n\n"
+            f"{self._workbook_scan_error}",
+        )
+        return False
+
+    def db_source_row_for_current_workbook_row(self, workbook_row: int) -> int | None:
+        """Best-effort link from a current workbook row to the old DB snapshot row."""
+        records = self.db.all(
             f"""
-            SELECT source_row, final_selection
-            FROM dbo.{self.tables["match_review"]}
-            WHERE ISNULL(final_selection, '') <> ''
+            SELECT
+                source_row,
+                description,
+                size_text,
+                colour,
+                pack_type,
+                unit_size,
+                labelled_as
+            FROM dbo.{self.tables["supplier_lines"]}
+            WHERE row_kind = 'detail'
             ORDER BY source_row
             """
         )
-        row_matches: dict[int, str | None] = {}
-        for row in rows:
-            try:
-                row_matches[int(row["source_row"])] = str(row.get("final_selection") or "").strip() or None
-            except Exception:
-                pass
-        return self.save_workbook_matches_or_warn(row_matches, "Sync YU Matches")
+        matches: list[int] = []
+        for record in records:
+            db_source_row = int(record["source_row"])
+            current_rows = self.locate_current_workbook_rows_for_supplier_record(
+                record,
+                preferred_row=db_source_row,
+            )
+            if len(current_rows) == 1 and int(current_rows[0]) == int(workbook_row):
+                matches.append(db_source_row)
+        return matches[0] if len(matches) == 1 else None
 
-    def confirm_item_to_source_row(self, item_number: str, source_row: int):
+    def confirm_item_to_source_row(
+        self,
+        item_number: str,
+        source_row: int,
+        *,
+        db_source_row: int | None = None,
+    ):
+        """Write the part number to the current workbook row.
+
+        source_row is intentionally a current Sheet1 address, not a permanent key.
+        """
         item_number = str(item_number or "").strip()
         source_row = int(source_row)
-        self.ensure_match_review_row(source_row)
 
+        if not self.refresh_workbook_index(force=True):
+            QMessageBox.warning(
+                self,
+                "Confirm YU Match",
+                "The current YU workbook could not be scanned.\n\n"
+                f"{self._workbook_scan_error}",
+            )
+            return
+
+        if not self.workbook_row_is_detail(source_row):
+            QMessageBox.warning(
+                self,
+                "Confirm YU Match",
+                f"Current workbook row {source_row} is not recognised as a YU item detail row.",
+            )
+            return
+
+        existing_at_target = str(
+            (self._workbook_scan.get("row_item_numbers") or {}).get(source_row) or ""
+        ).strip()
+        if existing_at_target:
+            same_item = (
+                existing_at_target.upper() == item_number.upper()
+                if self.item_is_fasteners(item_number)
+                else clean_item_key(existing_at_target) == clean_item_key(item_number)
+            )
+            if not same_item:
+                QMessageBox.warning(
+                    self,
+                    "Confirm YU Match",
+                    f"Current workbook row {source_row} already contains item "
+                    f"{existing_at_target} in Column A.\n\n"
+                    "Clear or correct that mapping before assigning another item.",
+                )
+                return
+
+        # Enforce one Column A location per item. Any previous occurrence is
+        # cleared from its current row, regardless of how the template moved.
         row_matches: dict[int, str | None] = {source_row: item_number}
-        for existing_source_row in self.source_rows_for_final_selection(item_number):
-            if existing_source_row != source_row:
-                row_matches[existing_source_row] = None
+        for existing_row in self.workbook_rows_for_item(item_number):
+            if int(existing_row) != source_row:
+                row_matches[int(existing_row)] = None
 
         if not self.save_workbook_matches_or_warn(row_matches, "Confirm YU Match"):
             return
 
-        self.reset_row_status_for_item(item_number, exclude_source_row=source_row)
-        self.db.execute(
-            f"""
-            UPDATE dbo.{self.tables["match_review"]}
-            SET final_selection = ?, review_status = 'confirmed'
-            WHERE source_row = ?
-            """,
-            (item_number, source_row),
+        self.refresh_workbook_index(force=True)
+
+        if db_source_row is None:
+            db_source_row = self.db_source_row_for_current_workbook_row(source_row)
+
+        if db_source_row is not None:
+            db_source_row = int(db_source_row)
+            self.ensure_match_review_row(db_source_row)
+            self.reset_row_status_for_item(item_number, exclude_source_row=db_source_row)
+            self.db.execute(
+                f"""
+                UPDATE dbo.{self.tables["match_review"]}
+                SET final_selection = ?, review_status = 'confirmed'
+                WHERE source_row = ?
+                """,
+                (item_number, db_source_row),
+            )
+            self.db.execute(
+                f"""
+                UPDATE dbo.{self.tables["supplier_lines"]}
+                SET current_item_number = ?
+                WHERE source_row = ?
+                """,
+                (item_number, db_source_row),
+            )
+
+        snapshot_text = (
+            f" Database snapshot row {db_source_row} was updated."
+            if db_source_row is not None
+            else " No unique database snapshot row was required."
         )
-        self.statusBar().showMessage(f"Confirmed {item_number} to source row {source_row} and saved it to the workbook.", 5000)
+        self.statusBar().showMessage(
+            f"Confirmed {item_number} to current workbook row {source_row}.{snapshot_text}",
+            6000,
+        )
         self.refresh_all()
         self.reselect_item(item_number)
 
@@ -2627,11 +3456,34 @@ class YUOrderReviewWindow(QMainWindow):
         if detail is None:
             QMessageBox.warning(self, "YU Order Review", "Select an order line first.")
             return
-        source_row = self.selected_candidate_source_row()
-        if source_row is None:
+
+        candidate = self.selected_candidate_mapping()
+        if candidate is None:
             QMessageBox.warning(self, "YU Order Review", "Select a candidate supplier row first.")
             return
-        self.confirm_item_to_source_row(str(detail["Item Number"]), int(source_row))
+
+        workbook_row = candidate.get("workbook_row")
+        if workbook_row is None:
+            possible_rows = candidate.get("candidate_workbook_rows") or []
+            possible_text = (
+                "\n\nPossible current workbook rows: "
+                + ", ".join(str(row) for row in possible_rows)
+                if possible_rows
+                else ""
+            )
+            QMessageBox.warning(
+                self,
+                "YU Order Review",
+                "The selected database candidate could not be located uniquely in the current workbook."
+                f"{possible_text}\n\nUse the manual current workbook row field.",
+            )
+            return
+
+        self.confirm_item_to_source_row(
+            str(detail["Item Number"]),
+            int(workbook_row),
+            db_source_row=candidate.get("db_source_row"),
+        )
 
     def confirm_manual_row(self):
         detail = self.current_selected_detail
@@ -2640,24 +3492,32 @@ class YUOrderReviewWindow(QMainWindow):
             return
         text = (self.manual_row_edit.text() or "").strip()
         if not text:
-            QMessageBox.warning(self, "YU Order Review", "Type a source row first.")
+            QMessageBox.warning(self, "YU Order Review", "Type a current workbook row first.")
             self.manual_row_edit.setFocus()
             return
         try:
-            source_row = int(text)
+            workbook_row = int(text)
         except Exception:
-            QMessageBox.warning(self, "YU Order Review", "Source row must be a whole number.")
+            QMessageBox.warning(self, "YU Order Review", "Workbook row must be a whole number.")
             return
 
-        exists = self.db.scalar(
-            f"SELECT COUNT(*) FROM dbo.{self.tables['supplier_lines']} WHERE source_row = ?",
-            (source_row,),
-        )
-        if not exists:
-            QMessageBox.warning(self, "YU Order Review", f"Source row {source_row} was not found.")
+        if not self.refresh_workbook_index(force=True):
+            QMessageBox.warning(
+                self,
+                "YU Order Review",
+                "The current YU workbook could not be scanned.\n\n"
+                f"{self._workbook_scan_error}",
+            )
+            return
+        if not self.workbook_row_is_detail(workbook_row):
+            QMessageBox.warning(
+                self,
+                "YU Order Review",
+                f"Current workbook row {workbook_row} is not an item detail row.",
+            )
             return
 
-        self.confirm_item_to_source_row(str(detail["Item Number"]), source_row)
+        self.confirm_item_to_source_row(str(detail["Item Number"]), workbook_row)
 
     def clear_confirmation(self):
         detail = self.current_selected_detail
@@ -2666,6 +3526,16 @@ class YUOrderReviewWindow(QMainWindow):
             return
         item_number = str(detail["Item Number"])
 
+        if not self.refresh_workbook_index(force=True):
+            QMessageBox.warning(
+                self,
+                "Clear YU Match",
+                "The current YU workbook could not be scanned.\n\n"
+                f"{self._workbook_scan_error}",
+            )
+            return
+
+        workbook_rows = self.workbook_rows_for_item(item_number)
         final_condition, final_params = self.item_match_condition(["r.final_selection"], item_number)
         rows = self.db.all(
             f"""
@@ -2684,18 +3554,15 @@ class YUOrderReviewWindow(QMainWindow):
             """,
             final_params,
         )
-        if not rows:
+
+        if not workbook_rows and not rows:
             QMessageBox.information(self, "YU Order Review", f"There is no confirmed mapping for {item_number}.")
             return
 
-        row_matches: dict[int, str | None] = {}
-        for row in rows:
-            try:
-                row_matches[int(row["source_row"])] = None
-            except Exception:
-                pass
-        if not self.save_workbook_matches_or_warn(row_matches, "Clear YU Match"):
-            return
+        if workbook_rows:
+            row_matches = {int(row): None for row in workbook_rows}
+            if not self.save_workbook_matches_or_warn(row_matches, "Clear YU Match"):
+                return
 
         for row in rows:
             self.db.execute(
@@ -2707,7 +3574,11 @@ class YUOrderReviewWindow(QMainWindow):
                 (str(row["new_status"]), int(row["source_row"])),
             )
 
-        self.statusBar().showMessage(f"Cleared confirmation for {item_number} and saved it to the workbook.", 5000)
+        self.refresh_workbook_index(force=True)
+        self.statusBar().showMessage(
+            f"Cleared the current Column A mapping for {item_number}.",
+            5000,
+        )
         self.refresh_all()
         self.reselect_item(item_number)
 
@@ -2719,6 +3590,271 @@ class YUOrderReviewWindow(QMainWindow):
                 self.main_table.scrollToItem(item)
                 self.on_main_selection_changed()
                 break
+
+    def _load_myob_item_master(self) -> tuple[dict[str, dict[str, Any]], dict[str, list[str]]]:
+        try:
+            rows = self.db.all(
+                """
+                SELECT
+                    TRIM(COALESCE(item_number, '')) AS item_number,
+                    COALESCE(
+                        NULLIF(TRIM(COALESCE(item_name, '')), ''),
+                        NULLIF(TRIM(COALESCE(description, '')), ''),
+                        ''
+                    ) AS myob_description,
+                    yu_last_cost,
+                    yu_last_cost_date
+                FROM items
+                WHERE TRIM(COALESCE(item_number, '')) <> ''
+                """
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not read item descriptions and YU costs from the items table. "
+                "Run the YU cost database update first and confirm the items table contains "
+                "yu_last_cost and yu_last_cost_date."
+            ) from exc
+
+        by_key: dict[str, dict[str, Any]] = {}
+        collisions: dict[str, list[str]] = defaultdict(list)
+        for raw_row in rows:
+            row = dict(raw_row)
+            item_number = str(row.get("item_number") or "").strip()
+            key = clean_item_key(item_number)
+            if not key:
+                continue
+            collisions[key].append(item_number)
+            if key not in by_key:
+                by_key[key] = row
+
+        collisions = {
+            key: sorted(set(values))
+            for key, values in collisions.items()
+            if len(set(values)) > 1
+        }
+        return by_key, collisions
+
+    def export_myob_po(self):
+        try:
+            self._export_myob_po_impl()
+        except Exception as exc:
+            self.show_myob_export_error(exc)
+
+    def _export_myob_po_impl(self):
+        order_filter = str(self.order_filter_combo.currentText() or "").strip()
+        selected_order_rows = [
+            row
+            for row in self.grouped_order_rows
+            if not order_filter
+            or order_filter.lower() == "all"
+            or str(row.get("Order Number") or "").strip() == order_filter
+        ]
+        if not selected_order_rows:
+            QMessageBox.warning(self, "Export MYOB PO", "There are no order rows available to export.")
+            return
+
+        # Deliberately ignore the Status and Search display filters here. Accounting
+        # exports must contain the complete selected order, not an accidentally
+        # filtered subset of the table.
+        visible_rows: list[dict[str, Any]] = []
+        for source_row in selected_order_rows:
+            result = self.resolve_item(
+                item_number=source_row["Item Number"],
+                quantity=float(source_row["QTY"]),
+                date_text=source_row["Date"],
+                order_number=source_row["Order Number"],
+            )
+            detail = dict(source_row)
+            detail["resolve_result"] = result
+            visible_rows.append(detail)
+
+        unresolved = [row for row in visible_rows if row["resolve_result"].status != "resolved"]
+        if unresolved:
+            item_list = ", ".join(sorted({str(row.get("Item Number") or "") for row in unresolved}))
+            QMessageBox.warning(
+                self,
+                "Export MYOB PO",
+                "MYOB export stopped because some visible rows are unresolved.\n\n"
+                f"Items: {item_list}",
+            )
+            return
+
+        item_master, collisions = self._load_myob_item_master()
+        problems: list[str] = []
+        grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+        total_value = Decimal("0")
+        cost_dates: list[str] = []
+
+        for row in visible_rows:
+            requested_item = str(row.get("Item Number") or "").strip()
+            key = clean_item_key(requested_item)
+            if key in collisions:
+                problems.append(
+                    f"{requested_item}: item-key collision in the Widget database ({', '.join(collisions[key])})"
+                )
+                continue
+
+            master = item_master.get(key)
+            if not master:
+                problems.append(f"{requested_item}: not found in the Widget items table")
+                continue
+
+            actual_item = str(master.get("item_number") or requested_item).strip()
+            description = _single_line_description(master.get("myob_description"))
+            if not description:
+                problems.append(f"{actual_item}: description is blank in the Widget items table")
+
+            try:
+                price = _decimal_value(master.get("yu_last_cost"), f"YU cost for {actual_item}")
+                if price <= 0:
+                    raise ValueError("cost is zero or negative")
+            except Exception:
+                problems.append(f"{actual_item}: latest YU cost is missing or zero")
+                continue
+
+            try:
+                quantity = _decimal_value(row.get("QTY"), f"quantity for {actual_item}")
+                if quantity <= 0:
+                    raise ValueError("quantity is zero or negative")
+            except Exception:
+                problems.append(f"{actual_item}: quantity is invalid or zero")
+                continue
+
+            cost_date = str(master.get("yu_last_cost_date") or "").strip()
+            if cost_date:
+                cost_dates.append(cost_date)
+
+            order_date = _normalise_myob_date(row.get("Date"))
+            order_number = str(row.get("Order Number") or "").strip()
+            if not order_number:
+                problems.append(f"{actual_item}: order number is blank")
+                continue
+
+            grouped[(order_date, order_number)].append({
+                "item_number": actual_item,
+                "description": description,
+                "quantity": quantity,
+                "price": price,
+                "cost_date": cost_date,
+            })
+            total_value += quantity * price
+
+        if problems:
+            QMessageBox.warning(
+                self,
+                "Export MYOB PO",
+                "MYOB export stopped. Every line must have an item description and a positive YU cost.\n\n"
+                + "\n".join(problems[:30])
+                + ("\n\nMore problems were omitted." if len(problems) > 30 else ""),
+            )
+            return
+
+        if not grouped:
+            QMessageBox.warning(self, "Export MYOB PO", "There are no valid MYOB order lines to export.")
+            return
+
+        cost_date_text = "not recorded"
+        parsed_cost_dates = []
+        for value in cost_dates:
+            text = str(value).split(" ")[0]
+            for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d/%m/%y"):
+                try:
+                    parsed_cost_dates.append(datetime.strptime(text, fmt).date())
+                    break
+                except ValueError:
+                    continue
+        if parsed_cost_dates:
+            oldest = min(parsed_cost_dates).strftime("%d/%m/%Y")
+            newest = max(parsed_cost_dates).strftime("%d/%m/%Y")
+            cost_date_text = oldest if oldest == newest else f"{oldest} to {newest}"
+
+        answer = QMessageBox.question(
+            self,
+            "Export MYOB PO",
+            "Create AccountRight purchase-order import file(s)?\n\n"
+            f"Orders: {len(grouped)}\n"
+            f"Lines: {sum(len(lines) for lines in grouped.values())}\n"
+            f"Order value from latest YU costs: ${total_value:,.2f}\n"
+            f"Cost dates: {cost_date_text}\n\n"
+            "The import creates Orders, not Bills. Review the MYOB total before saving the order.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        output_dir = QFileDialog.getExistingDirectory(
+            self,
+            "Choose MYOB PO export folder",
+            self.output_dir or str(Path.cwd() / DEFAULT_OUTPUT_DIR),
+        )
+        if not output_dir:
+            return
+
+        planned_paths = [
+            Path(output_dir) / f"myob_po_{order_number}.txt"
+            for (_date_text, order_number) in sorted(grouped, key=lambda value: (value[1], value[0]))
+        ]
+        existing = [path for path in planned_paths if path.exists()]
+        if existing:
+            overwrite = QMessageBox.question(
+                self,
+                "Overwrite MYOB PO file",
+                "The following file(s) already exist:\n\n"
+                + "\n".join(str(path) for path in existing)
+                + "\n\nOverwrite them?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if overwrite != QMessageBox.Yes:
+                return
+
+        exports: list[str] = []
+        for (date_text, order_number), lines in sorted(grouped.items(), key=lambda value: (value[0][1], value[0][0])):
+            output_path = Path(output_dir) / f"myob_po_{order_number}.txt"
+            exports.append(
+                write_myob_po_import_txt(
+                    output_path=output_path,
+                    order_date=date_text,
+                    order_number=order_number,
+                    lines=lines,
+                )
+            )
+
+        self.output_dir = output_dir
+        self.statusBar().showMessage(f"Exported {len(exports)} MYOB PO import file(s).", 6000)
+        QMessageBox.information(
+            self,
+            "Export MYOB PO",
+            "MYOB purchase-order import export complete.\n\n"
+            + "\n".join(exports)
+            + "\n\nImport in AccountRight using:\n"
+            "File > Import/Export Assistant > Import data > Purchases > Item Purchases\n"
+            "Format: Commas; First record: Headers or Labels",
+        )
+
+    def show_myob_export_error(self, exc: Exception):
+        error_path = None
+        try:
+            target_dir = Path(self.output_dir or tempfile.gettempdir())
+            target_dir.mkdir(parents=True, exist_ok=True)
+            error_path = target_dir / "myob_po_export_error.log"
+            error_path.write_text(traceback.format_exc(), encoding="utf-8")
+        except Exception:
+            error_path = None
+
+        message = (
+            "The MYOB PO export failed.\n\n"
+            f"{type(exc).__name__}: {exc}\n\n"
+            "No MYOB import file was completed. Fix the issue and try again."
+        )
+        if error_path is not None:
+            message += f"\n\nTechnical error log:\n{error_path}"
+        QMessageBox.critical(self, "Export MYOB PO", message)
+        try:
+            self.statusBar().showMessage("MYOB PO export failed.", 8000)
+        except Exception:
+            pass
 
     def export_visible_orders(self):
         """Export visible YU order rows with user-facing error reporting.
@@ -2750,8 +3886,27 @@ class YUOrderReviewWindow(QMainWindow):
             QMessageBox.warning(self, "YU Order Review", "There are no visible order rows to export.")
             return
 
-        if not self.sync_confirmed_matches_to_workbook():
+        if not self.refresh_workbook_index(force=True):
+            QMessageBox.warning(
+                self,
+                "YU Order Review",
+                "The current YU workbook could not be scanned.\n\n"
+                f"{self._workbook_scan_error}",
+            )
             return
+
+        # Re-resolve immediately before export. This deliberately ignores stored
+        # database source rows and follows the item number's current Column A row.
+        visible_rows: list[dict] = []
+        for source in self.current_rows:
+            row = dict(source)
+            row["resolve_result"] = self.resolve_item(
+                item_number=str(row.get("Item Number") or ""),
+                quantity=float(row.get("QTY") or 0),
+                date_text=str(row.get("Date") or ""),
+                order_number=str(row.get("Order Number") or ""),
+            )
+            visible_rows.append(row)
 
         output_dir = QFileDialog.getExistingDirectory(
             self,
@@ -2761,7 +3916,6 @@ class YUOrderReviewWindow(QMainWindow):
         if not output_dir:
             return
 
-        visible_rows = [dict(row) for row in self.current_rows]
         unresolved = [row for row in visible_rows if row["resolve_result"].status != "resolved"]
         audit_path = str(Path(output_dir) / "yu_order_audit.csv")
         write_audit_csv(audit_path, [row["resolve_result"] for row in visible_rows])
@@ -2771,24 +3925,19 @@ class YUOrderReviewWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "YU Order Review",
-                "Export stopped because some visible items are still unresolved.\n\n"
+                "Export stopped because some visible items do not have one unique current "
+                "Column A mapping in the YU workbook.\n\n"
                 f"Items: {item_list}\n\nAudit written to:\n{audit_path}",
             )
             return
 
         invalid_rows: list[str] = []
         for row in visible_rows:
-            result: OrderResolveResult = row["resolve_result"]
             item_number = str(row.get("Item Number") or "").strip()
             try:
-                source_row = int(result.source_row)
-                if source_row <= 0:
-                    raise ValueError("source row must be greater than zero")
-            except Exception:
-                invalid_rows.append(f"{item_number}: invalid source row {result.source_row!r}")
-
-            try:
-                float(row.get("QTY") or 0)
+                qty = float(row.get("QTY") or 0)
+                if qty <= 0:
+                    raise ValueError("quantity must be greater than zero")
             except Exception:
                 invalid_rows.append(f"{item_number}: invalid quantity {row.get('QTY')!r}")
 
@@ -2796,34 +3945,42 @@ class YUOrderReviewWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "YU Order Review",
-                "Export stopped because one or more resolved rows contain invalid export data.\n\n"
+                "Export stopped because one or more rows contain invalid quantities.\n\n"
                 + "\n".join(invalid_rows[:20])
                 + ("\n\nMore rows were omitted from this message." if len(invalid_rows) > 20 else "")
                 + f"\n\nAudit written to:\n{audit_path}",
             )
             return
 
-        grouped: dict[tuple[str, str], list[tuple[int, float]]] = defaultdict(list)
+        grouped: dict[tuple[str, str], list[tuple[str, float]]] = defaultdict(list)
         grouped_items: dict[tuple[str, str], list[str]] = defaultdict(list)
         for row in visible_rows:
-            result: OrderResolveResult = row["resolve_result"]
-            order_key = (row["Date"], row["Order Number"])
-            grouped[order_key].append((int(result.source_row), float(row["QTY"])))
+            order_key = (str(row["Date"]), str(row["Order Number"]))
+            item_number = str(row["Item Number"]).strip()
+            qty = float(row["QTY"])
+            grouped[order_key].append((item_number, qty))
+            current_row = row["resolve_result"].source_row
             grouped_items[order_key].append(
-                f"{row['Item Number']} row {int(result.source_row)} qty {self.format_qty(row['QTY'])}"
+                f"{item_number} current row {current_row} qty {self.format_qty(qty)}"
             )
 
         exports = []
-        for (date_text, order_number), resolved_rows in sorted(grouped.items(), key=lambda x: (x[0][1], x[0][0])):
+        for (date_text, order_number), item_lines in sorted(grouped.items(), key=lambda x: (x[0][1], x[0][0])):
             filename = f"yuchang_order_{order_number}.xlsx"
             output_path = str(Path(output_dir) / filename)
             try:
-                export_yuchang_po_compact_by_rows(
+                exact_item_numbers = {
+                    item_number
+                    for item_number, _qty in item_lines
+                    if self.item_is_fasteners(item_number)
+                }
+                result = export_yuchang_po_compact_by_items(
                     template_path=self.template_path,
                     output_path=output_path,
                     order_date=date_text,
                     order_number=order_number,
-                    source_rows_with_qty=resolved_rows,
+                    item_numbers_with_qty=item_lines,
+                    exact_item_numbers=exact_item_numbers,
                 )
             except PermissionError as exc:
                 raise PermissionError(
@@ -2835,23 +3992,61 @@ class YUOrderReviewWindow(QMainWindow):
             except Exception as exc:
                 item_details = "\n".join(grouped_items.get((date_text, order_number), [])[:30])
                 raise RuntimeError(
-                    "Export failed while building the YU workbook.\n\n"
+                    "Export failed while resolving current workbook item positions.\n\n"
                     f"Order: {order_number}\n"
                     f"Date: {date_text}\n"
                     f"Output file: {output_path}\n\n"
-                    "Rows in this export:\n"
-                    f"{item_details}"
+                    "Items in this export:\n"
+                    f"{item_details}\n\n"
+                    f"Reason: {exc}"
                 ) from exc
             exports.append(output_path)
 
+            # Keep the audit display aligned with the rows actually used by the
+            # final runtime scan.
+            current_row_map = {
+                str(item).strip(): int(row)
+                for (item, _qty), row_info in zip(
+                    item_lines,
+                    result.get("resolved_item_rows") or [],
+                )
+                for row in [row_info.get("source_row")]
+                if row is not None
+            }
+            for row in visible_rows:
+                if (
+                    str(row.get("Date")) == date_text
+                    and str(row.get("Order Number")) == order_number
+                    and str(row.get("Item Number")).strip() in current_row_map
+                ):
+                    row["resolve_result"].source_row = current_row_map[str(row.get("Item Number")).strip()]
+
+        # Re-write the audit after the final runtime scan so it records the
+        # exact workbook rows used for the completed exports.
+        write_audit_csv(audit_path, [row["resolve_result"] for row in visible_rows])
+
         self.output_dir = output_dir
-        self.statusBar().showMessage(f"Exported {len(exports)} workbook(s).", 5000)
+        exported_payload = [
+            {
+                "order_number": str(row.get("Order Number") or "").strip(),
+                "item_number": str(row.get("Item Number") or "").strip(),
+                "qty": float(row.get("QTY") or 0),
+            }
+            for row in visible_rows
+        ]
+        try:
+            self.orders_exported.emit(exported_payload)
+        except Exception:
+            pass
+        self.statusBar().showMessage(f"Exported {len(exports)} workbook(s) by current Column A item mapping.", 6000)
         QMessageBox.information(
             self,
             "YU Order Review",
             "Export complete.\n\n"
             + "\n".join(exports)
-            + f"\n\nAudit:\n{audit_path}",
+            + f"\n\nAudit:\n{audit_path}\n\n"
+            "Item locations were resolved from the current workbook Column A. "
+            "Inserted or moved rows do not require database row-number changes.",
         )
 
     def show_export_error(self, exc: Exception):

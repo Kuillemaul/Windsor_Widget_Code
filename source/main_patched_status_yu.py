@@ -37,6 +37,7 @@ except Exception:
     certifi = None
 from pathlib import Path
 from datetime import datetime, date, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from collections import Counter
 
 from PySide6.QtCore import Qt, QDate, QSettings, QMargins, QUrl, QEvent, QSignalBlocker, QTimer, QObject, Signal, QCoreApplication, QMetaObject, QSize
@@ -116,8 +117,231 @@ from yu_order_workflow import YUOrderEntryDialog, load_yu_review_module
 TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
 TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
 TABLE_FORMAT_SETTINGS_PREFIX = "table_format"
-APP_VERSION = "1.4.5"
+APP_VERSION = "1.5.3"
 APP_DESIGNER = "Bradley Mayze"
+YU_SUPPLIER_DISPLAY_NAME = "Yuchang Textile Factory"
+# Generic latest purchase-cost fields. These apply to every item in the item master.
+ITEM_COST_VALUE_COLUMN = "last_purchase_cost"
+ITEM_COST_DATE_COLUMN = "last_purchase_cost_date"
+# Legacy YU-specific fields are retained because the YU MYOB PO exporter uses them.
+YU_COST_VALUE_COLUMN = "yu_last_cost"
+YU_COST_DATE_COLUMN = "yu_last_cost_date"
+
+
+def _normalise_yu_supplier_key(value):
+    return re.sub(r"[^A-Z0-9]+", "", str(value or "").upper())
+
+
+def _is_yu_supplier_text(value):
+    key = _normalise_yu_supplier_key(value)
+    return key == "YU" or key.startswith("YUCHANG")
+
+
+def _normalise_yu_cost_header(value):
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
+def _parse_yu_cost_date(value):
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    if text.isdigit():
+        try:
+            serial = int(text)
+            if 1 <= serial <= 60000:
+                return (datetime(1899, 12, 30) + timedelta(days=serial)).date()
+        except Exception:
+            pass
+
+    for fmt in (
+        "%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d",
+        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M",
+        "%d/%m/%y", "%d-%m-%y", "%Y%m%d", "%d%m%Y",
+    ):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _parse_yu_cost_price(value):
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, (int, float)):
+        try:
+            return Decimal(str(value))
+        except InvalidOperation:
+            return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+    negative = text.startswith("(") and text.endswith(")")
+    text = text.strip("()").replace("$", "").replace(",", "").strip()
+    if not text:
+        return None
+    try:
+        result = Decimal(text)
+    except InvalidOperation:
+        return None
+    return -result if negative else result
+
+
+def _locate_yu_cost_header(raw_rows, max_scan_rows=50):
+    aliases = {
+        "item_number": {"itemnumber", "itemno", "item"},
+        "price": {"price", "unitprice", "cost", "unitcost", "lastcost"},
+        "source_date": {"date", "purchasedate", "billdate", "transactiondate"},
+        "description": {"description", "itemdescription", "itemname", "purchasedescription", "linedescription"},
+        "supplier_name": {"supplier", "suppliername", "colastname", "companylastname", "lastname"},
+    }
+    for index, values in enumerate(raw_rows[:max_scan_rows]):
+        headers = ["" if value is None else str(value) for value in values]
+        normalised = {_normalise_yu_cost_header(header): pos for pos, header in enumerate(headers)}
+        resolved = {}
+        for field_name, field_aliases in aliases.items():
+            match = next((normalised[key] for key in field_aliases if key in normalised), None)
+            if match is not None:
+                resolved[field_name] = match
+        if all(name in resolved for name in ("item_number", "price", "source_date")):
+            return index, headers, resolved
+    raise ValueError(
+        "Could not find the MYOB cost header row. Required headings are Item Number, Price, and Date."
+    )
+
+
+def read_yu_cost_source_file(file_path):
+    """Read an MYOB Item Purchases export without touching the database.
+
+    Despite the legacy function name, this parser is used for all item costs.
+    Positive normal item lines are returned. Blank, backslash, and zero-cost rows
+    are counted and ignored. The maximum parseable source date is retained even
+    when a row is ignored so the next incremental export can start from the same
+    date and re-capture same-day changes.
+    """
+    import csv
+
+    path = Path(file_path)
+    suffix = path.suffix.lower()
+    raw_rows = []
+
+    if suffix in {".txt", ".csv"}:
+        data = None
+        last_error = None
+        for encoding in ("utf-8-sig", "cp1252", "latin-1"):
+            try:
+                data = path.read_text(encoding=encoding)
+                break
+            except UnicodeDecodeError as exc:
+                last_error = exc
+        if data is None:
+            raise ValueError(f"Could not read the selected text file: {last_error}")
+
+        sample_lines = [line for line in data.splitlines()[:25] if line.strip() and line.strip() != "{}"]
+        sample = "\n".join(sample_lines)
+        delimiter = "\t" if sample.count("\t") > sample.count(",") else ","
+        raw_rows = list(csv.reader(data.splitlines(), delimiter=delimiter))
+    elif suffix in {".xlsx", ".xlsm"}:
+        if load_workbook is None:
+            raise ValueError("Excel import is unavailable because openpyxl is not installed.")
+        workbook = load_workbook(filename=str(path), read_only=True, data_only=True)
+        try:
+            raw_rows = [list(row) for row in workbook.active.iter_rows(values_only=True)]
+        finally:
+            workbook.close()
+    else:
+        raise ValueError("Unsupported file type. Choose a TXT, CSV, XLSX, or XLSM file.")
+
+    if not raw_rows:
+        raise ValueError("The selected MYOB cost file is empty.")
+
+    header_index, _headers, column_map = _locate_yu_cost_header(raw_rows)
+    has_supplier_column = "supplier_name" in column_map
+    has_description_column = "description" in column_map
+    stats = {
+        "source_rows": 0,
+        "positive_item_rows": 0,
+        "blank_item_rows": 0,
+        "backslash_rows": 0,
+        "zero_or_negative_rows": 0,
+        "invalid_price_rows": 0,
+        "invalid_date_rows": 0,
+        "blank_description_rows": 0,
+        "source_has_supplier": has_supplier_column,
+        "source_has_description": has_description_column,
+    }
+    records = []
+    source_max_date = None
+
+    for zero_based_index, values in enumerate(raw_rows[header_index + 1:], start=header_index + 1):
+        line_number = zero_based_index + 1
+        if not any(str(value or "").strip() for value in values):
+            continue
+        stats["source_rows"] += 1
+
+        def cell(field_name):
+            index = column_map.get(field_name)
+            return values[index] if index is not None and index < len(values) else ""
+
+        source_date = _parse_yu_cost_date(cell("source_date"))
+        if source_date is not None and (source_max_date is None or source_date > source_max_date):
+            source_max_date = source_date
+
+        item_number = str(cell("item_number") or "").strip()
+        if not item_number:
+            stats["blank_item_rows"] += 1
+            continue
+        if item_number.startswith("\\"):
+            stats["backslash_rows"] += 1
+            continue
+        if source_date is None:
+            stats["invalid_date_rows"] += 1
+            continue
+
+        price = _parse_yu_cost_price(cell("price"))
+        if price is None:
+            stats["invalid_price_rows"] += 1
+            continue
+        if price <= 0:
+            stats["zero_or_negative_rows"] += 1
+            continue
+
+        description = str(cell("description") or "").strip() if has_description_column else ""
+        if has_description_column and not description:
+            stats["blank_description_rows"] += 1
+        supplier_name = str(cell("supplier_name") or "").strip() if has_supplier_column else ""
+        records.append({
+            "item_number": item_number,
+            "description": description,
+            "price": price,
+            "source_date": source_date,
+            "supplier_name": supplier_name,
+            "line_number": line_number,
+        })
+        stats["positive_item_rows"] += 1
+
+    if source_max_date is None:
+        raise ValueError("The selected MYOB cost file did not contain any valid dates.")
+    if not records:
+        raise ValueError("The selected MYOB cost file did not contain any positive item costs.")
+
+    return {
+        "records": records,
+        "source_max_date": source_max_date,
+        "stats": stats,
+    }
 # After the one-time no-space item-number migration, sales/order/stock tables
 # store canonical item numbers.  Keep runtime item-number resolution for entry/import,
 # but do not run REPLACE/LTRIM functions across the sales table during Item Summary queries.
@@ -5728,9 +5952,10 @@ class Ui_MainWindow(object):
             [
                 "Review suggested or manually entered order lines.",
                 "Enter item/quantity details and use <b>Add Line</b> where required.",
-                "Use <b>Create YU Order</b> when preparing a YU supplier order.",
+                "Tick <b>Select</b> beside each line required for the next YU purchase order.",
+                "Use <b>Create YU Order from Selection</b> to load all checked lines into one order.",
+                "After the YU workbook exports successfully, those To Order lines change to <b>ORDERED</b>.",
                 "Use import tools when loading updated order data.",
-                "Sort and review the table before committing order action.",
             ],
         )
 
@@ -5813,6 +6038,7 @@ class Ui_MainWindow(object):
                 "Check the instructions tab on the right before importing.",
                 "For sales imports, use MYOB AccountRight Import/Export Assistant data.",
                 "Use <b>Update Cover Orders</b> for cover order exports with Invoice No., Co./Last Name, Item Number, Quantity, Date, and Journal Memo.",
+                "Use <b>Update Costs & Descriptions</b> for MYOB Item Purchases exports containing Item Number, Description, Price, and Date.",
                 "Make sure required columns are present before upload.",
                 "After import, return to Customer Summary, Item Summary, or Order Analysis to review the new data.",
             ],
@@ -6501,9 +6727,10 @@ class Ui_MainWindow(object):
         self.updateOrders_button.setObjectName("updateOrders_button")
         self.updateOrders_button.setMinimumWidth(128)
 
-        self.createYUOrder_pushButton = QPushButton("Create YU Order", actions)
+        self.createYUOrder_pushButton = QPushButton("Create YU Order from Selection", actions)
         self.createYUOrder_pushButton.setObjectName("createYUOrder_pushButton")
-        self.createYUOrder_pushButton.setMinimumWidth(142)
+        self.createYUOrder_pushButton.setMinimumWidth(235)
+        self.createYUOrder_pushButton.setEnabled(False)
 
         self.toOrderUsers_label = QLabel("Active: -", actions)
         self.toOrderUsers_label.setObjectName("toOrderUsers_label")
@@ -7075,6 +7302,17 @@ class Ui_MainWindow(object):
         self.updateCoverOrders_pushButton = QPushButton("Update Cover Orders", self.frame_47)
         self.updateCoverOrders_pushButton.setObjectName("updateCoverOrders_pushButton")
         self.lastUpdateCoverOrders_textBrowser = self._text_box(self.frame_47, "lastUpdateCoverOrders_textBrowser", "Cover orders not updated this session")
+        self.updateYUCosts_pushButton = QPushButton("Update Costs & Descriptions", self.frame_47)
+        self.updateYUCosts_pushButton.setObjectName("updateYUCosts_pushButton")
+        self.updateAllCosts_checkBox = QCheckBox("Full refresh: overwrite all matching costs from selected file", self.frame_47)
+        self.updateAllCosts_checkBox.setObjectName("updateAllCosts_checkBox")
+        self.updateAllCosts_checkBox.setChecked(False)
+        self.updateAllCosts_checkBox.setMinimumHeight(36)
+        self.updateAllCosts_checkBox.setToolTip(
+            "Use with a full/current MYOB purchase export. The newest positive cost in the selected file "
+            "will replace the stored cost for every matching item, even when the stored date is newer."
+        )
+        self.lastUpdateYUCosts_textBrowser = self._text_box(self.frame_47, "lastUpdateYUCosts_textBrowser", "Costs and descriptions not updated this session")
         self.updateDataCreateYUOrder_pushButton = QPushButton("Create YU Order", self.frame_47)
         self.updateDataCreateYUOrder_pushButton.setObjectName("updateDataCreateYUOrder_pushButton")
         for widget in (
@@ -7086,6 +7324,9 @@ class Ui_MainWindow(object):
             self.lastUpdateOrders_textBrowser_3,
             self.updateCoverOrders_pushButton,
             self.lastUpdateCoverOrders_textBrowser,
+            self.updateYUCosts_pushButton,
+            self.updateAllCosts_checkBox,
+            self.lastUpdateYUCosts_textBrowser,
             self.updateDataCreateYUOrder_pushButton,
         ):
             import_layout.addWidget(widget)
@@ -7097,7 +7338,7 @@ class Ui_MainWindow(object):
         self.salesImportInstructions_textEdit.setObjectName("salesImportInstructions_textEdit")
         self.salesImportInstructions_textEdit.setReadOnly(True)
         self.updateDataInstructions_tabs.addTab(self.salesImportInstructions_textEdit, "Sales")
-        for title in ("Stock", "Orders", "Cover Orders", "Customers", "Items"):
+        for title in ("Stock", "Orders", "Cover Orders", "Item Costs", "Customers", "Items"):
             placeholder = QTextEdit(self.updateDataInstructions_tabs)
             placeholder.setReadOnly(True)
             if title == "Cover Orders":
@@ -7109,6 +7350,8 @@ class Ui_MainWindow(object):
                     "Do not manually filter the file. The app imports only rows where Journal Memo contains COVER ORDER.\n"
                     "The import replaces the existing cover order table."
                 )
+            elif title == "Item Costs":
+                placeholder.setPlainText("Item cost and description import instructions will load when the database opens.")
             else:
                 placeholder.setPlainText(f"{title} import instructions will be added here.")
             self.updateDataInstructions_tabs.addTab(placeholder, title)
@@ -7240,14 +7483,15 @@ class MainWindow(QMainWindow):
         self._updating_order_table = False
         self._updating_on_order_table = False
         self.order_item_column = 0
-        self.order_description_column = 1
-        self.order_on_order_column = 2
-        self.order_qty_column = 3
-        self.order_supplier_column = 4
-        self.order_priority_column = 5
+        self.order_select_column = 1
+        self.order_description_column = 2
+        self.order_on_order_column = 3
+        self.order_qty_column = 4
+        self.order_supplier_column = 5
+        self.order_priority_column = 6
         self.order_status_column = self.order_priority_column
-        self.order_remove_column = 6
-        self.order_edit_column = 7
+        self.order_remove_column = 7
+        self.order_edit_column = 8
         self._updating_container_table = False
         self._spin_arrow_icon_cache = {}
         self.container_item_completer = None
@@ -7324,6 +7568,7 @@ class MainWindow(QMainWindow):
         self.ensure_cover_orders_table()
         self.ensure_shipment_tables()
         self.ensure_item_planning_status_column()
+        self.ensure_item_cost_columns()
         self.load_reference_lists()
 
         self.setup_customer_autocomplete()
@@ -9069,13 +9314,13 @@ class MainWindow(QMainWindow):
         if containers_list is not None:
             containers_list.cellDoubleClicked.connect(self.handle_saved_container_double_click)
 
-        create_yu_buttons = []
-        for button_name in ("createYUOrder_pushButton", "updateDataCreateYUOrder_pushButton"):
-            button = getattr(self.ui, button_name, None)
-            if button is not None and button not in create_yu_buttons:
-                create_yu_buttons.append(button)
-        for create_yu_order_button in create_yu_buttons:
-            create_yu_order_button.clicked.connect(self.open_yu_order_entry_dialog)
+        to_order_yu_button = getattr(self.ui, "createYUOrder_pushButton", None)
+        if to_order_yu_button is not None:
+            to_order_yu_button.clicked.connect(self.create_yu_order_from_selection)
+
+        update_data_yu_button = getattr(self.ui, "updateDataCreateYUOrder_pushButton", None)
+        if update_data_yu_button is not None:
+            update_data_yu_button.clicked.connect(lambda _checked=False: self.open_yu_order_entry_dialog())
 
         update_order_buttons = []
         for button_name in ("updateOrders_button", "updatOrders_pushButton_3"):
@@ -9096,6 +9341,10 @@ class MainWindow(QMainWindow):
         update_cover_orders_button = getattr(self.ui, "updateCoverOrders_pushButton", None)
         if update_cover_orders_button is not None:
             update_cover_orders_button.clicked.connect(self.import_cover_orders_from_dialog)
+
+        update_yu_costs_button = getattr(self.ui, "updateYUCosts_pushButton", None)
+        if update_yu_costs_button is not None:
+            update_yu_costs_button.clicked.connect(self.import_yu_costs_from_dialog)
 
         self.setup_item_summary_editing()
 
@@ -9299,6 +9548,63 @@ class MainWindow(QMainWindow):
         else:
             cur.execute("ALTER TABLE items ADD COLUMN planning_status TEXT")
         self.db_conn.commit()
+
+    def ensure_item_cost_columns(self):
+        """Add generic and YU-specific latest-cost fields when required.
+
+        The original implementation stored only YU costs. Version 1.5.1 keeps
+        those fields for the YU PO exporter and adds generic latest purchase-cost
+        fields for every item. Existing YU values are copied into the generic
+        fields only where no generic value is already present.
+        """
+        if self.db_conn is None or not self.has_table("items"):
+            return
+        existing_columns = {str(name).lower(): name for name in self.get_table_columns("items")}
+        desired = [
+            (ITEM_COST_VALUE_COLUMN, "DECIMAL(18,6) NULL", "REAL"),
+            (ITEM_COST_DATE_COLUMN, "DATE NULL", "TEXT"),
+            (YU_COST_VALUE_COLUMN, "DECIMAL(18,6) NULL", "REAL"),
+            (YU_COST_DATE_COLUMN, "DATE NULL", "TEXT"),
+        ]
+        cur = self.db_conn.cursor()
+        changed = False
+        for column_name, sqlserver_type, sqlite_type in desired:
+            if column_name.lower() in existing_columns:
+                continue
+            if self.db_engine == "sqlserver":
+                cur.execute(f"ALTER TABLE items ADD {self.db_identifier(column_name)} {sqlserver_type}")
+            else:
+                cur.execute(f"ALTER TABLE items ADD COLUMN {column_name} {sqlite_type}")
+            changed = True
+        if changed:
+            self.db_conn.commit()
+
+        # Preserve the costs already imported before the generic fields existed.
+        cur = self.db_conn.cursor()
+        cur.execute(
+            f"UPDATE items SET {self.db_identifier(ITEM_COST_VALUE_COLUMN)} = "
+            f"{self.db_identifier(YU_COST_VALUE_COLUMN)} "
+            f"WHERE {self.db_identifier(ITEM_COST_VALUE_COLUMN)} IS NULL "
+            f"AND {self.db_identifier(YU_COST_VALUE_COLUMN)} IS NOT NULL"
+        )
+        cur.execute(
+            f"UPDATE items SET {self.db_identifier(ITEM_COST_DATE_COLUMN)} = "
+            f"{self.db_identifier(YU_COST_DATE_COLUMN)} "
+            f"WHERE {self.db_identifier(ITEM_COST_DATE_COLUMN)} IS NULL "
+            f"AND {self.db_identifier(YU_COST_DATE_COLUMN)} IS NOT NULL"
+        )
+        self.db_conn.commit()
+
+    def ensure_item_yu_cost_columns(self):
+        """Backward-compatible alias retained for older code paths."""
+        self.ensure_item_cost_columns()
+
+    def item_row_is_yu_supplier(self, row):
+        if not row:
+            return False
+        row_dict = self.row_to_dict(row) if not isinstance(row, dict) else row
+        supplier_columns = self.get_items_supplier_column_names()
+        return any(_is_yu_supplier_text(row_dict.get(column_name)) for column_name in supplier_columns)
 
     def db_identifier(self, name):
         text = str(name or "").replace("]", "]]" ).strip()
@@ -14156,6 +14462,50 @@ class MainWindow(QMainWindow):
             "Date,Co./Last Name,Invoice No.,Item Number,Quantity,Journal Memo\n"
         )
 
+    def yu_cost_import_instruction_text(self):
+        return (
+            "ITEM COST AND DESCRIPTION IMPORT\n\n"
+            "Use this import to save the latest positive MYOB purchase cost against every matching item in the Widget item master.\n"
+            "When the Widget has no description at all for an item, the importer also fills item_name and description from the newest non-blank MYOB purchase description.\n"
+            "Existing descriptions are never overwritten. The importer updates existing items only; it does not create new items.\n"
+            "For Yuchang items it also keeps the existing yu_last_cost fields current for the YU MYOB PO exporter.\n\n"
+            "Accepted file types:\n"
+            "TXT, CSV, XLSX, XLSM\n\n"
+            "Required columns:\n"
+            "Item Number\n"
+            "Price\n"
+            "Date\n\n"
+            "Required to backfill missing descriptions:\n"
+            "Description (Item Description / Item Name are also accepted)\n\n"
+            "Recommended optional column:\n"
+            "Co./Last Name (or Supplier)\n\n"
+            "How to export from MYOB AccountRight:\n"
+            "1. Go to File > Import/Export Assistant.\n"
+            "2. Choose Export data > Purchases > Item Purchases / Bills.\n"
+            "3. For the first all-item description backfill, export the full purchase history required to find a usable description and latest cost for each item.\n"
+            "4. After that, use the incremental date range shown in the import window. Start on the shown date, not the following day.\n"
+            "5. Export Item Number, Description, Price, Date, and Co./Last Name if MYOB offers it.\n"
+            "6. Include field headings and save as comma-separated or tab-separated text.\n"
+            "7. In Windsor Widget, click Update Costs & Descriptions and choose the export.\n\n"
+            "Rules used by the importer:\n"
+            "- Every positive purchase row is considered, regardless of supplier.\n"
+            "- Only item numbers that match an existing Widget item are updated.\n"
+            "- Blank item numbers, MYOB backslash lines, and prices less than or equal to zero are ignored because they are not usable item costs.\n"
+            "- When an item appears more than once, the newest Date wins for cost. On the same date, the last positive row in the file wins.\n"
+            "- For a missing Widget description, the newest non-blank MYOB description in the file is used.\n"
+            "- A description is written only when both item_name and description are blank. Existing text is left untouched.\n"
+            "- Normally, an older source row never overwrites a newer cost already stored in the item master.\n"
+            "- Tick Full refresh only when using a full/current history export. In that mode, the newest positive cost in the selected file overwrites every matching stored cost, even when the stored date is newer.\n"
+            "- Full refresh is useful after adding previously missing items or correcting historical item mappings. Descriptions are still only filled when blank.\n"
+            "- The latest source date in the file is saved so future exports only need to begin from that date.\n"
+            "- The start date is intentionally inclusive so same-day bills added later are captured on the next import.\n\n"
+            "Supplier note:\n"
+            "last_purchase_cost is the most recent purchase cost for the item from any supplier. If the same item is bought from multiple suppliers, the latest bill wins.\n"
+            "The YU-specific mirror uses Co./Last Name when supplied; otherwise it uses the item's current supplier assignment in the Widget.\n\n"
+            "Example header:\n"
+            "Item Number,Description,Price,Date,Co./Last Name\n"
+        )
+
     def placeholder_import_instruction_text(self, import_name):
         return (
             f"{import_name.upper()} IMPORT\n\n"
@@ -14221,6 +14571,22 @@ class MainWindow(QMainWindow):
             return None
         return self.parse_date_value(row.get("start_date"))
 
+    def latest_yu_cost_export_start_date(self):
+        stored = self.parse_date_value(self.get_meta_value("yu_cost_latest_source_date", ""))
+        if stored is not None:
+            return stored
+        if self.db_conn is None or not self.has_table("items"):
+            return None
+        self.ensure_item_cost_columns()
+        try:
+            row = self.db_one(
+                f"SELECT MAX({self.db_identifier(ITEM_COST_DATE_COLUMN)}) AS start_date FROM items "
+                f"WHERE {self.db_identifier(ITEM_COST_DATE_COLUMN)} IS NOT NULL"
+            )
+        except Exception:
+            return None
+        return self.parse_date_value(row.get("start_date") if row else None)
+
     def import_dialog_today_text(self):
         return self.current_business_date().strftime("%d/%m/%Y")
 
@@ -14277,6 +14643,21 @@ class MainWindow(QMainWindow):
                 "No historical date range is needed. Export the current Analyze Inventory [Summary] report.\n"
             )
 
+        if import_key == "yu_costs":
+            start_date = self.latest_yu_cost_export_start_date()
+            if start_date is None:
+                return (
+                    "DATE RANGE TO USE\n"
+                    f"To date: {today_text}\n"
+                    "From date: no previous item-cost source date is stored. Export the full purchase history needed to establish the latest purchase cost for every item.\n"
+                )
+            return (
+                "DATE RANGE TO USE\n"
+                f"From date: {start_date.strftime('%d/%m/%Y')}\n"
+                f"To date: {today_text}\n"
+                "Start on the stored date, not the following day. This re-captures same-day bills and safely updates only newer or changed same-day costs.\n"
+            )
+
         return ""
 
     def import_instruction_dialog_text(self, import_key):
@@ -14293,6 +14674,9 @@ class MainWindow(QMainWindow):
         elif import_key == "cover_orders":
             title = "COVER ORDERS IMPORT"
             body = self.cover_orders_import_instruction_text()
+        elif import_key == "yu_costs":
+            title = "ITEM COST AND DESCRIPTION IMPORT"
+            body = self.yu_cost_import_instruction_text()
         else:
             title = "IMPORT"
             body = self.placeholder_import_instruction_text(import_key or "data")
@@ -15651,6 +16035,7 @@ class MainWindow(QMainWindow):
                 found_stock_tab = False
                 found_orders_tab = False
                 found_cover_tab = False
+                found_yu_cost_tab = False
                 for idx in range(existing_tabs.count()):
                     tab_name = existing_tabs.tabText(idx).strip().casefold()
                     widget = existing_tabs.widget(idx)
@@ -15666,6 +16051,14 @@ class MainWindow(QMainWindow):
                         if hasattr(widget, "setPlainText"):
                             widget.setPlainText(self.cover_orders_import_instruction_text())
                         found_cover_tab = True
+                    elif tab_name in {"yu costs", "item costs"}:
+                        if hasattr(widget, "setPlainText"):
+                            widget.setPlainText(self.yu_cost_import_instruction_text())
+                        try:
+                            existing_tabs.setTabText(idx, "Item Costs")
+                        except Exception:
+                            pass
+                        found_yu_cost_tab = True
                 if not found_stock_tab:
                     stock_text = QTextEdit(existing_tabs)
                     stock_text.setReadOnly(True)
@@ -15681,6 +16074,11 @@ class MainWindow(QMainWindow):
                     cover_text.setReadOnly(True)
                     cover_text.setPlainText(self.cover_orders_import_instruction_text())
                     existing_tabs.addTab(cover_text, "Cover Orders")
+                if not found_yu_cost_tab:
+                    yu_cost_text = QTextEdit(existing_tabs)
+                    yu_cost_text.setReadOnly(True)
+                    yu_cost_text.setPlainText(self.yu_cost_import_instruction_text())
+                    existing_tabs.addTab(yu_cost_text, "Item Costs")
             except Exception:
                 pass
             return
@@ -15712,7 +16110,7 @@ class MainWindow(QMainWindow):
         setattr(self.ui, "salesImportInstructions_textEdit", sales_text)
         tabs.addTab(sales_text, "Sales")
 
-        for tab_name in ("Stock", "Orders", "Cover Orders", "Customers", "Items"):
+        for tab_name in ("Stock", "Orders", "Cover Orders", "Item Costs", "Customers", "Items"):
             text_box = QTextEdit(tabs)
             text_box.setReadOnly(True)
             if tab_name == "Stock":
@@ -15721,6 +16119,8 @@ class MainWindow(QMainWindow):
                 text_box.setPlainText(self.orders_import_instruction_text())
             elif tab_name == "Cover Orders":
                 text_box.setPlainText(self.cover_orders_import_instruction_text())
+            elif tab_name == "Item Costs":
+                text_box.setPlainText(self.yu_cost_import_instruction_text())
             else:
                 text_box.setPlainText(self.placeholder_import_instruction_text(tab_name))
             tabs.addTab(text_box, tab_name)
@@ -15752,6 +16152,12 @@ class MainWindow(QMainWindow):
             cover_orders_status.setOpenLinks(False)
             cover_orders_status.setPlainText(self.get_meta_value("cover_orders_last_import_display", "No cover orders import yet."))
 
+        yu_cost_status = getattr(self.ui, "lastUpdateYUCosts_textBrowser", None)
+        if yu_cost_status is not None:
+            yu_cost_status.setReadOnly(True)
+            yu_cost_status.setOpenLinks(False)
+            yu_cost_status.setPlainText(self.get_meta_value("yu_cost_last_import_display", "No item cost import yet."))
+
         freight_box = getattr(self.ui, "chargeFreight_textBrowser", None)
         if freight_box is not None:
             freight_box.setReadOnly(True)
@@ -15773,22 +16179,34 @@ class MainWindow(QMainWindow):
             return
 
         table.clear()
-        table.setColumnCount(8)
-        table.setHorizontalHeaderLabels(["Item Number", "Description", "On Order", "Qty", "Supplier", "Status", "Remove", "Edit"])
+        table.setColumnCount(9)
+        table.setHorizontalHeaderLabels([
+            "Item Number",
+            "Select",
+            "Description",
+            "On Order",
+            "Qty",
+            "Supplier",
+            "Status",
+            "Remove",
+            "Edit",
+        ])
         table.setRowCount(0)
         table.setSelectionBehavior(QAbstractItemView.SelectRows)
         table.setSelectionMode(QAbstractItemView.SingleSelection)
         table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
         table.verticalHeader().setVisible(False)
-        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Fixed)
-        table.setColumnWidth(7, 34)
+        table.horizontalHeader().setSectionResizeMode(self.order_item_column, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(self.order_select_column, QHeaderView.Fixed)
+        table.horizontalHeader().setSectionResizeMode(self.order_description_column, QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(self.order_on_order_column, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(self.order_qty_column, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(self.order_supplier_column, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(self.order_priority_column, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(self.order_remove_column, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(self.order_edit_column, QHeaderView.Fixed)
+        table.setColumnWidth(self.order_select_column, 64)
+        table.setColumnWidth(self.order_edit_column, 34)
         table.setProperty("_table_font_menu_installed", True)
         table.setProperty("_table_font_scope_key", "main_window")
         table.setProperty("_table_font_default_size", current_table_font_size(table))
@@ -15797,6 +16215,7 @@ class MainWindow(QMainWindow):
         table.customContextMenuRequested.connect(self.show_order_table_context_menu)
         table.cellDoubleClicked.connect(self.handle_order_table_double_click)
         table.itemChanged.connect(self.handle_order_table_item_changed)
+        self.update_yu_selection_button()
 
     def get_saved_container_refs(self):
         if self.db_conn is None or not self.has_table("containers"):
@@ -16402,8 +16821,10 @@ class MainWindow(QMainWindow):
         table = getattr(self.ui, "order_table", None)
         if table is None or row < 0 or row >= table.rowCount():
             return None
-        item_number = table.item(row, 0).text().strip() if table.item(row, 0) is not None and table.item(row, 0).text() else ""
-        description = table.item(row, 1).text().strip() if table.item(row, 1) is not None and table.item(row, 1).text() else ""
+        item_number_item = table.item(row, self.order_item_column)
+        description_item = table.item(row, self.order_description_column)
+        item_number = item_number_item.text().strip() if item_number_item is not None and item_number_item.text() else ""
+        description = description_item.text().strip() if description_item is not None and description_item.text() else ""
         qty_item = table.item(row, self.order_qty_column)
         qty_value = qty_item.data(Qt.UserRole) if qty_item is not None else None
         if qty_value in (None, "") and qty_item is not None:
@@ -16423,6 +16844,12 @@ class MainWindow(QMainWindow):
             "urgent": priority_text == "URGENT",
             "status": self.normalise_order_status(priority_text),
             "on_order": self.get_item_on_order_qty(item_number),
+            "source_signature": self.to_order_line_signature(
+                item_number,
+                qty_value,
+                supplier_value,
+                description,
+            ),
         }
 
     def get_item_on_order_qty(self, item_number):
@@ -16479,6 +16906,7 @@ class MainWindow(QMainWindow):
                     "item_number": row_data.get("item_number", ""),
                     "qty": row_data.get("qty", 0),
                 }],
+                source_to_order_lines=[row_data],
             )
             return
 
@@ -18534,8 +18962,12 @@ class MainWindow(QMainWindow):
                 if supplier_item is not None:
                     supplier_item.setText(supplier)
                     supplier_item.setData(Qt.UserRole, supplier)
+            current_status_item = table.item(row, self.order_priority_column)
+            current_status = (current_status_item.text() or "").strip().upper() if current_status_item is not None else ""
             if urgent:
                 table.setItem(row, self.order_priority_column, self.build_order_status_item("URGENT", True))
+            elif current_status == "ORDERED":
+                table.setItem(row, self.order_priority_column, self.build_order_status_item(""))
             self._updating_order_table = False
 
             self.save_order_table_state()
@@ -18546,8 +18978,9 @@ class MainWindow(QMainWindow):
         row = table.rowCount()
         self._updating_order_table = True
         table.insertRow(row)
-        table.setItem(row, 0, self.make_order_table_item(item_number))
-        table.setItem(row, 1, self.make_order_table_item(description))
+        table.setItem(row, self.order_item_column, self.make_order_table_item(item_number))
+        table.setItem(row, self.order_select_column, self.build_order_select_item(False))
+        table.setItem(row, self.order_description_column, self.make_order_table_item(description))
         table.setItem(
             row,
             self.order_on_order_column,
@@ -18572,8 +19005,10 @@ class MainWindow(QMainWindow):
 
         table.setItem(row, self.order_priority_column, self.build_order_status_item("URGENT" if urgent else status, urgent))
         table.setItem(row, self.order_remove_column, self.build_order_remove_item())
+        self.mark_row_edited_by_current_user(table, row, self.order_edit_column)
         self._updating_order_table = False
         table.resizeRowsToContents()
+        self.update_yu_selection_button()
 
         self.save_order_table_state()
         if self.current_item_number:
@@ -20153,6 +20588,339 @@ class MainWindow(QMainWindow):
         item_number = self.canonicalize_import_item_number(raw_item_number)
         return (invoice_no, customer_name, item_number, quantity_value, cover_date, journal_memo)
 
+    def import_yu_costs_from_dialog(self):
+        if not self.show_import_instructions_dialog("yu_costs", "Item cost and description import instructions"):
+            return
+
+        force_all_costs = bool(
+            getattr(getattr(self, "ui", None), "updateAllCosts_checkBox", None)
+            and self.ui.updateAllCosts_checkBox.isChecked()
+        )
+
+        filters = (
+            "MYOB cost files (*.txt *.csv *.xlsx *.xlsm);;"
+            "Text files (*.txt *.csv);;Excel files (*.xlsx *.xlsm);;All files (*.*)"
+        )
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choose MYOB item cost export",
+            str(self.base_dir),
+            filters,
+        )
+        if not file_path:
+            return
+
+        if force_all_costs:
+            choice = QMessageBox.warning(
+                self,
+                "Confirm full cost refresh",
+                "Full refresh is enabled.\n\n"
+                "For every matching item, the newest positive cost in the selected file will overwrite "
+                "the stored cost even when the database currently has a newer date.\n\n"
+                "Use this only with a full and current MYOB purchase-history export. Missing descriptions "
+                "will still be filled only when the Widget description is blank.\n\n"
+                "Continue?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if choice != QMessageBox.Yes:
+                return
+
+        progress_text = (
+            "Rebuilding all matching item costs..."
+            if force_all_costs
+            else "Importing item costs and descriptions..."
+        )
+        progress = self.create_import_progress_dialog(progress_text, file_path)
+        try:
+            result = self.import_yu_cost_file(
+                file_path,
+                progress=progress,
+                force_all_costs=force_all_costs,
+            )
+            self.update_import_progress(progress, 94, "Refreshing item displays...")
+        except Exception as exc:
+            self.close_import_progress(progress)
+            QMessageBox.critical(self, "Item import failed", f"Could not import item costs and descriptions.\n\n{exc}")
+            return
+
+        source_date = result.get("source_max_date")
+        source_date_text = source_date.strftime("%d/%m/%Y") if isinstance(source_date, date) else "Unknown"
+        import_mode_text = "Full refresh" if force_all_costs else "Incremental/protected"
+        display_text = (
+            f"Last import: {datetime.now().strftime('%d/%m/%Y %H:%M')}\n"
+            f"File: {Path(file_path).name}\n"
+            f"Mode: {import_mode_text}\n"
+            f"Export through: {source_date_text}\n"
+            f"Item costs updated: {result.get('updated_count', 0):,}\n"
+            f"Descriptions added: {result.get('description_updated_count', 0):,}\n"
+            f"Already current: {result.get('unchanged_count', 0):,}\n"
+            f"Older rows skipped: {result.get('older_count', 0):,}\n"
+            f"YU costs mirrored: {result.get('yu_updated_count', 0):,}\n"
+            f"Unknown/ambiguous rows: {result.get('unknown_count', 0) + result.get('ambiguous_count', 0):,}"
+        )
+        self.set_meta_value("yu_cost_last_import_display", display_text)
+        self.set_meta_value("yu_cost_last_import_iso", datetime.now().isoformat(timespec="seconds"))
+        self.set_meta_value("yu_cost_latest_source_date", source_date.isoformat() if isinstance(source_date, date) else "")
+
+        status = getattr(self.ui, "lastUpdateYUCosts_textBrowser", None)
+        if status is not None:
+            status.setPlainText(display_text)
+
+        self.rerun_item_if_ready()
+        self.rerun_order_analysis_if_ready()
+        self.refresh_dashboard()
+        self.close_import_progress(progress)
+
+        full_refresh_checkbox = getattr(getattr(self, "ui", None), "updateAllCosts_checkBox", None)
+        if full_refresh_checkbox is not None and force_all_costs:
+            full_refresh_checkbox.setChecked(False)
+
+        parser_stats = result.get("parser_stats", {})
+        QMessageBox.information(
+            self,
+            "Item costs and descriptions imported",
+            f"Mode: {import_mode_text}\n"
+            f"Updated {result.get('updated_count', 0):,} item cost(s).\n"
+            f"Added {result.get('description_updated_count', 0):,} missing description(s).\n\n"
+            f"Export through: {source_date_text}\n"
+            f"Matched items in file: {result.get('matched_item_count', 0):,}\n"
+            f"Already current: {result.get('unchanged_count', 0):,}\n"
+            f"Older stored cost protected: {result.get('older_count', 0):,}\n"
+            f"YU-specific costs mirrored: {result.get('yu_updated_count', 0):,}\n"
+            f"Unknown item rows skipped: {result.get('unknown_count', 0):,}\n"
+            f"Ambiguous item rows skipped: {result.get('ambiguous_count', 0):,}\n"
+            f"Blank item rows ignored: {parser_stats.get('blank_item_rows', 0):,}\n"
+            f"MYOB control/backslash rows ignored: {parser_stats.get('backslash_rows', 0):,}\n"
+            f"Zero/negative costs ignored: {parser_stats.get('zero_or_negative_rows', 0):,}.\n"
+            f"Description column present: {'Yes' if parser_stats.get('source_has_description') else 'No'}\n"
+            f"Matched items still missing a source description: {result.get('description_unavailable_count', 0):,}."
+        )
+
+    def _build_yu_cost_item_lookup(self):
+        rows = [self.row_to_dict(row) for row in self.db_all("SELECT * FROM items")]
+        exact_candidates = {}
+        clean_candidates = {}
+
+        for row in rows:
+            item_number = str(row.get("item_number") or "").strip()
+            if not item_number:
+                continue
+            exact_candidates.setdefault(self.item_exact_key(item_number), []).append(row)
+            if not self.row_is_fasteners_item(row):
+                clean_candidates.setdefault(self.item_clean_key(item_number), []).append(row)
+
+        return exact_candidates, clean_candidates
+
+    def _resolve_yu_cost_item_row(self, raw_item_number, exact_candidates, clean_candidates):
+        exact_rows = exact_candidates.get(self.item_exact_key(raw_item_number), [])
+        if len(exact_rows) == 1:
+            return exact_rows[0], "exact"
+        if len(exact_rows) > 1:
+            return None, "ambiguous"
+
+        clean_rows = clean_candidates.get(self.item_clean_key(raw_item_number), [])
+        if len(clean_rows) == 1:
+            return clean_rows[0], "canonical"
+        if len(clean_rows) > 1:
+            return None, "ambiguous"
+        return None, "unknown"
+
+    def import_yu_cost_file(self, file_path, progress=None, force_all_costs=False):
+        """Import latest positive purchase costs and fill missing descriptions.
+
+        The legacy method name is retained so existing button wiring and patches
+        continue to work. Generic fields are updated for all items. YU-specific
+        fields are additionally maintained for the YU PO export workflow.
+
+        When force_all_costs is True, the newest positive cost in the selected
+        file replaces the stored cost for every matched item regardless of the
+        stored cost date. This is intended for deliberate full-history rebuilds.
+        """
+        self.update_import_progress(progress, 5, "Preparing item cost fields...")
+        self.ensure_item_cost_columns()
+        self.update_import_progress(progress, 12, "Reading MYOB purchase costs...")
+        parsed = read_yu_cost_source_file(file_path)
+        records = parsed["records"]
+        parser_stats = parsed["stats"]
+        source_has_supplier = bool(parser_stats.get("source_has_supplier"))
+        source_has_description = bool(parser_stats.get("source_has_description"))
+
+        self.update_import_progress(progress, 35, "Matching purchase rows to the item master...")
+        exact_candidates, clean_candidates = self._build_yu_cost_item_lookup()
+        supplier_columns = self.get_items_supplier_column_names()
+        item_columns = {str(name).lower(): name for name in self.get_table_columns("items")}
+        description_columns = []
+        for candidate in ("item_name", "description"):
+            actual = item_columns.get(candidate)
+            if actual and actual not in description_columns:
+                description_columns.append(actual)
+
+        latest_by_item = {}
+        latest_yu_by_item = {}
+        latest_description_by_item = {}
+        unknown_count = 0
+        ambiguous_count = 0
+
+        for record in records:
+            item_row, match_status = self._resolve_yu_cost_item_row(
+                record.get("item_number", ""), exact_candidates, clean_candidates
+            )
+            if item_row is None:
+                if match_status == "ambiguous":
+                    ambiguous_count += 1
+                else:
+                    unknown_count += 1
+                continue
+
+            item_number = str(item_row.get("item_number") or "").strip()
+            candidate_key = (record["source_date"], int(record.get("line_number") or 0))
+            previous = latest_by_item.get(item_number)
+            if previous is None or candidate_key >= previous[0]:
+                latest_by_item[item_number] = (candidate_key, record, item_row)
+
+            incoming_description = str(record.get("description") or "").strip()
+            if incoming_description:
+                previous_description = latest_description_by_item.get(item_number)
+                if previous_description is None or candidate_key >= previous_description[0]:
+                    latest_description_by_item[item_number] = (candidate_key, incoming_description, item_row)
+
+            source_supplier = str(record.get("supplier_name") or "").strip()
+            if source_has_supplier and source_supplier:
+                is_yu_record = _is_yu_supplier_text(source_supplier)
+            else:
+                is_yu_record = any(
+                    _is_yu_supplier_text(item_row.get(column_name))
+                    for column_name in supplier_columns
+                )
+            if is_yu_record:
+                previous_yu = latest_yu_by_item.get(item_number)
+                if previous_yu is None or candidate_key >= previous_yu[0]:
+                    latest_yu_by_item[item_number] = (candidate_key, record, item_row)
+
+        if not latest_by_item:
+            raise ValueError(
+                "No positive purchase costs matched existing items in the Widget item master. "
+                "Check the item numbers and export headings."
+            )
+
+        self.update_import_progress(progress, 60, f"Comparing {len(latest_by_item):,} latest item costs...")
+        updates = []
+        unchanged_count = 0
+        older_count = 0
+
+        for item_number, (_candidate_key, record, item_row) in latest_by_item.items():
+            incoming_date = record["source_date"]
+            incoming_price = Decimal(record["price"])
+            stored_date = self.parse_date_value(item_row.get(ITEM_COST_DATE_COLUMN))
+            stored_price = _parse_yu_cost_price(item_row.get(ITEM_COST_VALUE_COLUMN))
+
+            if not force_all_costs:
+                if stored_date is not None and stored_date > incoming_date:
+                    older_count += 1
+                    continue
+                if (
+                    stored_date == incoming_date
+                    and stored_price is not None
+                    and stored_price.quantize(Decimal("0.000001")) == incoming_price.quantize(Decimal("0.000001"))
+                ):
+                    unchanged_count += 1
+                    continue
+
+            updates.append((float(incoming_price), incoming_date.isoformat(), item_number))
+
+        self.update_import_progress(progress, 74, f"Saving {len(updates):,} latest item costs...")
+        cur = self.db_conn.cursor()
+        if updates:
+            cur.executemany(
+                f"UPDATE items SET {self.db_identifier(ITEM_COST_VALUE_COLUMN)} = ?, "
+                f"{self.db_identifier(ITEM_COST_DATE_COLUMN)} = ? WHERE item_number = ?",
+                updates,
+            )
+
+        description_updated_count = 0
+        description_unavailable_count = 0
+        if description_columns:
+            self.update_import_progress(progress, 80, "Filling missing item descriptions...")
+            item_number_sql = self.db_identifier(item_columns.get("item_number", "item_number"))
+            for item_number, (_candidate_key, incoming_description, item_row) in latest_description_by_item.items():
+                existing_values = [str(item_row.get(column_name) or "").strip() for column_name in description_columns]
+                if any(existing_values):
+                    continue
+
+                assignments = ", ".join(f"{self.db_identifier(column_name)} = ?" for column_name in description_columns)
+                blank_conditions = " AND ".join(
+                    f"({self.db_identifier(column_name)} IS NULL OR LTRIM(RTRIM({self.db_identifier(column_name)})) = '')"
+                    for column_name in description_columns
+                )
+                values = [incoming_description for _ in description_columns]
+                cur.execute(
+                    f"UPDATE items SET {assignments} WHERE {item_number_sql} = ? AND {blank_conditions}",
+                    [*values, item_number],
+                )
+                try:
+                    if int(cur.rowcount or 0) > 0:
+                        description_updated_count += 1
+                except Exception:
+                    description_updated_count += 1
+
+            for item_number, (_candidate_key, _record, item_row) in latest_by_item.items():
+                existing_values = [str(item_row.get(column_name) or "").strip() for column_name in description_columns]
+                if not any(existing_values) and item_number not in latest_description_by_item:
+                    description_unavailable_count += 1
+        elif source_has_description:
+            description_unavailable_count = len(latest_by_item)
+
+        yu_updates = []
+        yu_unchanged_count = 0
+        yu_older_count = 0
+        for item_number, (_candidate_key, record, item_row) in latest_yu_by_item.items():
+            incoming_date = record["source_date"]
+            incoming_price = Decimal(record["price"])
+            stored_date = self.parse_date_value(item_row.get(YU_COST_DATE_COLUMN))
+            stored_price = _parse_yu_cost_price(item_row.get(YU_COST_VALUE_COLUMN))
+
+            if not force_all_costs:
+                if stored_date is not None and stored_date > incoming_date:
+                    yu_older_count += 1
+                    continue
+                if (
+                    stored_date == incoming_date
+                    and stored_price is not None
+                    and stored_price.quantize(Decimal("0.000001")) == incoming_price.quantize(Decimal("0.000001"))
+                ):
+                    yu_unchanged_count += 1
+                    continue
+            yu_updates.append((float(incoming_price), incoming_date.isoformat(), item_number))
+
+        self.update_import_progress(progress, 86, f"Maintaining {len(yu_updates):,} YU-specific costs...")
+        if yu_updates:
+            cur.executemany(
+                f"UPDATE items SET {self.db_identifier(YU_COST_VALUE_COLUMN)} = ?, "
+                f"{self.db_identifier(YU_COST_DATE_COLUMN)} = ? WHERE item_number = ?",
+                yu_updates,
+            )
+        self.db_conn.commit()
+
+        self.update_import_progress(progress, 90, "Item cost and description import complete.")
+        return {
+            "updated_count": len(updates),
+            "unchanged_count": unchanged_count,
+            "older_count": older_count,
+            "unknown_count": unknown_count,
+            "ambiguous_count": ambiguous_count,
+            "matched_item_count": len(latest_by_item),
+            "description_updated_count": description_updated_count,
+            "description_unavailable_count": description_unavailable_count,
+            "description_source_has_column": source_has_description,
+            "yu_updated_count": len(yu_updates),
+            "yu_unchanged_count": yu_unchanged_count,
+            "yu_older_count": yu_older_count,
+            "source_max_date": parsed["source_max_date"],
+            "parser_stats": parser_stats,
+            "force_all_costs": bool(force_all_costs),
+        }
+
     def import_stock_from_dialog(self):
         if not self.show_import_instructions_dialog("stock", "Stock import instructions"):
             return
@@ -20433,6 +21201,8 @@ class MainWindow(QMainWindow):
         status = str(status_text or "").strip().upper()
         if status == "IN CONTAINER":
             return "IN CONTAINER"
+        if status == "ORDERED":
+            return "ORDERED"
         if status == "URGENT" or is_urgent:
             return "URGENT"
         return ""
@@ -20447,6 +21217,16 @@ class MainWindow(QMainWindow):
                 bold=True,
                 align=Qt.AlignCenter,
             )
+        if status == "ORDERED":
+            item = self.make_order_table_item(
+                "ORDERED",
+                background=QColor("#c9f2d2"),
+                foreground=QColor("#145a27"),
+                bold=True,
+                align=Qt.AlignCenter,
+            )
+            item.setToolTip("Included in a successfully exported YU purchase order.")
+            return item
         if status == "IN CONTAINER":
             return self.make_order_table_item(
                 "IN CONTAINER",
@@ -20469,18 +21249,193 @@ class MainWindow(QMainWindow):
             align=Qt.AlignCenter,
         )
 
-    def populate_order_table_from_rows(self, rows):
+    def build_order_select_item(self, checked=False):
+        item = SortableTableWidgetItem("")
+        item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+        item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+        item.setTextAlignment(Qt.AlignCenter)
+        item.setToolTip("Select this line for the next YU purchase order.")
+        return item
+
+    def to_order_line_signature(self, item_number, qty_value, supplier_name="", description=""):
+        canonical_item = self.canonicalize_import_item_number(str(item_number or "").strip()).casefold()
+        qty_number = self.parse_float(qty_value)
+        qty_token = f"{qty_number:.6f}".rstrip("0").rstrip(".")
+        return "|".join([
+            canonical_item,
+            qty_token,
+            str(supplier_name or "").strip().casefold(),
+            str(description or "").strip().casefold(),
+        ])
+
+    def get_selected_to_order_signatures(self):
+        table = getattr(self.ui, "order_table", None)
+        if table is None:
+            return set()
+        selected = set()
+        for row in range(table.rowCount()):
+            select_item = table.item(row, self.order_select_column)
+            if select_item is None or select_item.checkState() != Qt.Checked:
+                continue
+            row_data = self.get_order_row_data(row)
+            if row_data is not None:
+                selected.add(row_data.get("source_signature", ""))
+        selected.discard("")
+        return selected
+
+    def update_yu_selection_button(self):
+        table = getattr(self.ui, "order_table", None)
+        button = getattr(self.ui, "createYUOrder_pushButton", None)
+        if button is None:
+            return
+        selected_count = 0
+        if table is not None:
+            for row in range(table.rowCount()):
+                item = table.item(row, self.order_select_column)
+                if item is not None and item.checkState() == Qt.Checked:
+                    selected_count += 1
+        button.setEnabled(selected_count > 0)
+        if selected_count:
+            button.setText(f"Create YU Order from Selection ({selected_count})")
+        else:
+            button.setText("Create YU Order from Selection")
+
+    def selected_to_order_lines(self):
+        table = getattr(self.ui, "order_table", None)
+        if table is None:
+            return []
+        selected_lines = []
+        for row in range(table.rowCount()):
+            select_item = table.item(row, self.order_select_column)
+            if select_item is None or select_item.checkState() != Qt.Checked:
+                continue
+            row_data = self.get_order_row_data(row)
+            if row_data is None or self.parse_float(row_data.get("qty", 0)) <= 0:
+                continue
+            selected_lines.append(row_data)
+        return selected_lines
+
+    def create_yu_order_from_selection(self):
+        selected_lines = self.selected_to_order_lines()
+        if not selected_lines:
+            QMessageBox.warning(
+                self,
+                "Create YU Order",
+                "Select at least one line in the To Order table first.",
+            )
+            self.update_yu_selection_button()
+            return
+
+        initial_lines = [
+            {
+                "item_number": line.get("item_number", ""),
+                "qty": line.get("qty", 0),
+            }
+            for line in selected_lines
+        ]
+        self.open_yu_order_entry_dialog(
+            initial_lines=initial_lines,
+            source_to_order_lines=selected_lines,
+        )
+
+    def mark_to_order_lines_ordered(self, source_lines, exported_rows=None):
+        table = getattr(self.ui, "order_table", None)
+        if table is None:
+            return 0
+
+        exported_items = set()
+        for row in exported_rows or []:
+            item_number = str(
+                row.get("item_number")
+                or row.get("Item Number")
+                or row.get("item")
+                or ""
+            ).strip()
+            if item_number:
+                exported_items.add(self.canonicalize_import_item_number(item_number).casefold())
+
+        target_signatures = set()
+        for line in source_lines or []:
+            item_number = str(line.get("item_number", "") or "").strip()
+            canonical_item = self.canonicalize_import_item_number(item_number).casefold()
+            if exported_items and canonical_item not in exported_items:
+                continue
+            signature = str(line.get("source_signature", "") or "").strip()
+            if not signature:
+                signature = self.to_order_line_signature(
+                    item_number,
+                    line.get("qty", 0),
+                    line.get("supplier_name", ""),
+                    line.get("description", ""),
+                )
+            if signature:
+                target_signatures.add(signature)
+
+        if not target_signatures:
+            return 0
+
+        changed = 0
+        self._updating_order_table = True
+        try:
+            for row in range(table.rowCount()):
+                row_data = self.get_order_row_data(row)
+                if row_data is None or row_data.get("source_signature") not in target_signatures:
+                    continue
+                table.setItem(row, self.order_priority_column, self.build_order_status_item("ORDERED"))
+                select_item = table.item(row, self.order_select_column)
+                if select_item is not None:
+                    select_item.setCheckState(Qt.Unchecked)
+                self.mark_row_edited_by_current_user(table, row, self.order_edit_column)
+                changed += 1
+        finally:
+            self._updating_order_table = False
+
+        if changed:
+            self.save_order_table_state()
+            self.refresh_item_summary_context_boxes()
+            self.rerun_order_analysis_if_ready()
+            self.update_yu_selection_button()
+        return changed
+
+    def handle_yu_order_export_completed(self, exported_rows, source_to_order_lines):
+        changed = self.mark_to_order_lines_ordered(
+            source_to_order_lines,
+            exported_rows=exported_rows,
+        )
+        if changed:
+            self._show_refresh_message(
+                f"Marked {changed} To Order line{'s' if changed != 1 else ''} as ORDERED.",
+                5000,
+            )
+
+    def populate_order_table_from_rows(self, rows, selected_signatures=None):
         table = getattr(self.ui, "order_table", None)
         if table is None:
             return
+        selected_signatures = set(selected_signatures or [])
         self._updating_order_table = True
         table.setRowCount(0)
         for line in rows:
             row = table.rowCount()
             table.insertRow(row)
             item_number = line.get("item_number", "")
-            table.setItem(row, 0, self.make_order_table_item(item_number))
-            table.setItem(row, 1, self.make_order_table_item(line.get("description", "")))
+            description = line.get("description", "")
+            qty_value = self.parse_float(line.get("qty", 0))
+            supplier_value = (line.get("supplier_name", "") or "").strip()
+            signature = self.to_order_line_signature(
+                item_number,
+                qty_value,
+                supplier_value,
+                description,
+            )
+
+            table.setItem(row, self.order_item_column, self.make_order_table_item(item_number))
+            table.setItem(
+                row,
+                self.order_select_column,
+                self.build_order_select_item(signature in selected_signatures),
+            )
+            table.setItem(row, self.order_description_column, self.make_order_table_item(description))
             table.setItem(
                 row,
                 self.order_on_order_column,
@@ -20490,7 +21445,6 @@ class MainWindow(QMainWindow):
                 ),
             )
 
-            qty_value = self.parse_float(line.get("qty", 0))
             qty_item = self.make_order_table_item(
                 self.format_value(qty_value),
                 editable=True,
@@ -20499,17 +21453,21 @@ class MainWindow(QMainWindow):
             qty_item.setData(Qt.UserRole, qty_value)
             table.setItem(row, self.order_qty_column, qty_item)
 
-            supplier_value = (line.get("supplier_name", "") or "").strip()
             supplier_item = self.make_order_table_item(supplier_value, editable=False)
             supplier_item.setData(Qt.UserRole, supplier_value)
             supplier_item.setToolTip("Double-click to choose a supplier.")
             table.setItem(row, self.order_supplier_column, supplier_item)
 
-            table.setItem(row, self.order_priority_column, self.build_order_status_item(line.get("status", ""), bool(line.get("urgent"))))
+            table.setItem(
+                row,
+                self.order_priority_column,
+                self.build_order_status_item(line.get("status", ""), bool(line.get("urgent"))),
+            )
             table.setItem(row, self.order_remove_column, self.build_order_remove_item())
             self.set_row_edit_audit_metadata(table, row, self.order_edit_column, line)
         self._updating_order_table = False
         table.resizeRowsToContents()
+        self.update_yu_selection_button()
 
     def get_order_table_rows(self):
         table = getattr(self.ui, "order_table", None)
@@ -20517,8 +21475,10 @@ class MainWindow(QMainWindow):
             return []
         rows = []
         for row in range(table.rowCount()):
-            item_number = table.item(row, 0).text().strip() if table.item(row, 0) is not None and table.item(row, 0).text() else ""
-            description = table.item(row, 1).text().strip() if table.item(row, 1) is not None and table.item(row, 1).text() else ""
+            item_cell = table.item(row, self.order_item_column)
+            description_cell = table.item(row, self.order_description_column)
+            item_number = item_cell.text().strip() if item_cell is not None and item_cell.text() else ""
+            description = description_cell.text().strip() if description_cell is not None and description_cell.text() else ""
             qty_item = table.item(row, self.order_qty_column)
             qty_value = qty_item.data(Qt.UserRole) if qty_item is not None else None
             if qty_value in (None, "") and qty_item is not None:
@@ -20527,7 +21487,8 @@ class MainWindow(QMainWindow):
             supplier_value = ""
             if supplier_item is not None:
                 supplier_value = str(supplier_item.data(Qt.UserRole) or supplier_item.text() or "").strip()
-            priority_text = table.item(row, self.order_priority_column).text().strip().upper() if table.item(row, self.order_priority_column) is not None and table.item(row, self.order_priority_column).text() else ""
+            priority_item = table.item(row, self.order_priority_column)
+            priority_text = priority_item.text().strip().upper() if priority_item is not None and priority_item.text() else ""
             if not item_number:
                 continue
             edit_meta = self.get_row_edit_audit_metadata(table, row, self.order_edit_column)
@@ -20581,6 +21542,7 @@ class MainWindow(QMainWindow):
     def load_saved_order_lines(self):
         if self.db_conn is None or not self.has_table("to_order_lines"):
             return
+        selected_signatures = self.get_selected_to_order_signatures()
         rows = self.db_all(
             """
             SELECT item_number, description, qty, supplier_name, urgent, status,
@@ -20605,7 +21567,7 @@ class MainWindow(QMainWindow):
             }
             for row in rows
         ]
-        self.populate_order_table_from_rows(parsed_rows)
+        self.populate_order_table_from_rows(parsed_rows, selected_signatures=selected_signatures)
         self.mark_collaboration_state_loaded("to_order")
 
     def prompt_for_supplier_name(self, current_supplier=""):
@@ -20706,9 +21668,14 @@ class MainWindow(QMainWindow):
         row = table.rowCount()
         self._updating_order_table = True
         table.insertRow(row)
-        table.setItem(row, 0, self.make_order_table_item(item_number))
-        table.setItem(row, 1, self.make_order_table_item(description))
-        table.setItem(row, self.order_on_order_column, self.make_order_table_item(self.format_value(on_order_qty), align=Qt.AlignRight | Qt.AlignVCenter))
+        table.setItem(row, self.order_item_column, self.make_order_table_item(item_number))
+        table.setItem(row, self.order_select_column, self.build_order_select_item(False))
+        table.setItem(row, self.order_description_column, self.make_order_table_item(description))
+        table.setItem(
+            row,
+            self.order_on_order_column,
+            self.make_order_table_item(self.format_value(on_order_qty), align=Qt.AlignRight | Qt.AlignVCenter),
+        )
 
         qty_item = self.make_order_table_item(
             self.format_value(qty_value),
@@ -20725,12 +21692,14 @@ class MainWindow(QMainWindow):
 
         table.setItem(row, self.order_priority_column, self.build_order_status_item("URGENT" if is_urgent else "", is_urgent))
         table.setItem(row, self.order_remove_column, self.build_order_remove_item())
+        self.mark_row_edited_by_current_user(table, row, self.order_edit_column)
         self._updating_order_table = False
 
         table.resizeRowsToContents()
         self.save_order_table_state()
         self.refresh_item_summary_context_boxes()
         self.rerun_order_analysis_if_ready()
+        self.update_yu_selection_button()
         item_edit.clear()
         qty_widget.clear()
         item_edit.setFocus()
@@ -20740,8 +21709,14 @@ class MainWindow(QMainWindow):
         if table is None or row < 0:
             return
 
+        if column == self.order_select_column:
+            select_item = table.item(row, column)
+            if select_item is not None:
+                select_item.setCheckState(Qt.Unchecked if select_item.checkState() == Qt.Checked else Qt.Checked)
+            return
+
         if column == self.order_remove_column:
-            item_number = table.item(row, 0).text() if table.item(row, 0) else "this line"
+            item_number = table.item(row, self.order_item_column).text() if table.item(row, self.order_item_column) else "this line"
             result = QMessageBox.question(
                 self,
                 "Remove line",
@@ -20754,6 +21729,7 @@ class MainWindow(QMainWindow):
                 self.save_order_table_state()
                 self.refresh_item_summary_context_boxes()
                 self.rerun_order_analysis_if_ready()
+                self.update_yu_selection_button()
             return
 
         if column == self.order_qty_column:
@@ -20777,8 +21753,12 @@ class MainWindow(QMainWindow):
             item.setText(resolved_supplier)
             item.setData(Qt.UserRole, resolved_supplier)
             item.setToolTip("Double-click to choose a supplier.")
+            status_item = table.item(row, self.order_priority_column)
+            current_status = (status_item.text() or "").strip().upper() if status_item is not None else ""
+            if current_status == "ORDERED":
+                table.setItem(row, self.order_priority_column, self.build_order_status_item(""))
             self._updating_order_table = False
-            item_number_item = table.item(row, 0)
+            item_number_item = table.item(row, self.order_item_column)
             item_number = item_number_item.text().strip() if item_number_item is not None and item_number_item.text() else ""
             self.update_item_supplier_in_database(item_number, resolved_supplier)
             self.load_reference_lists()
@@ -20790,6 +21770,8 @@ class MainWindow(QMainWindow):
         if column == self.order_priority_column:
             priority_item = table.item(row, column)
             current_text = (priority_item.text() or "").strip().upper() if priority_item is not None else ""
+            if current_text in {"ORDERED", "IN CONTAINER"}:
+                return
             new_status = "" if current_text == "URGENT" else "URGENT"
             self._updating_order_table = True
             table.setItem(row, column, self.build_order_status_item(new_status))
@@ -20800,6 +21782,10 @@ class MainWindow(QMainWindow):
 
     def handle_order_table_item_changed(self, item):
         if self._updating_order_table or item is None:
+            return
+
+        if item.column() == self.order_select_column:
+            self.update_yu_selection_button()
             return
 
         if item.column() == self.order_on_order_column:
@@ -20818,6 +21804,12 @@ class MainWindow(QMainWindow):
             self._updating_order_table = True
             item.setText(self.format_value(new_qty))
             item.setData(Qt.UserRole, new_qty)
+            table = getattr(self.ui, "order_table", None)
+            if table is not None:
+                status_item = table.item(item.row(), self.order_priority_column)
+                current_status = (status_item.text() or "").strip().upper() if status_item is not None else ""
+                if current_status == "ORDERED":
+                    table.setItem(item.row(), self.order_priority_column, self.build_order_status_item(""))
             self._updating_order_table = False
             self.mark_row_edited_by_current_user(getattr(self.ui, "order_table", None), item.row(), self.order_edit_column)
             self.save_order_table_state()
@@ -20844,8 +21836,14 @@ class MainWindow(QMainWindow):
             self._updating_order_table = True
             item.setText(resolved_supplier)
             item.setData(Qt.UserRole, resolved_supplier)
+            table = getattr(self.ui, "order_table", None)
+            if table is not None:
+                status_item = table.item(item.row(), self.order_priority_column)
+                current_status = (status_item.text() or "").strip().upper() if status_item is not None else ""
+                if current_status == "ORDERED":
+                    table.setItem(item.row(), self.order_priority_column, self.build_order_status_item(""))
             self._updating_order_table = False
-            item_number_item = getattr(self.ui, "order_table", None).item(item.row(), 0) if getattr(self.ui, "order_table", None) is not None else None
+            item_number_item = table.item(item.row(), self.order_item_column) if table is not None else None
             item_number = item_number_item.text().strip() if item_number_item is not None and item_number_item.text() else ""
             self.update_item_supplier_in_database(item_number, resolved_supplier)
             self.load_reference_lists()
@@ -26368,17 +27366,23 @@ $mail.Display()
         self.settings.setValue("yu/template_path", file_path)
         return file_path
 
-    def open_yu_order_entry_dialog(self, initial_order_number="", initial_lines=None):
+    def open_yu_order_entry_dialog(
+        self,
+        initial_order_number="",
+        initial_lines=None,
+        source_to_order_lines=None,
+    ):
         dialog = YUOrderEntryDialog(
             self,
             self,
             initial_order_number=initial_order_number,
             initial_lines=initial_lines or [],
+            source_to_order_lines=source_to_order_lines or [],
         )
         self.yu_order_entry_dialog = dialog
         dialog.exec()
 
-    def open_yu_order_review_window(self, csv_path):
+    def open_yu_order_review_window(self, csv_path, source_to_order_lines=None):
         message_parent = QApplication.activeModalWidget() or self
 
         template_path = self.ensure_yu_template_path()
@@ -26409,6 +27413,18 @@ $mail.Display()
                 "yu_order_review_export_test_window is bundled inside the app."
             )
             return False
+
+        tracked_source_lines = [dict(line) for line in (source_to_order_lines or [])]
+        if tracked_source_lines and hasattr(window, "orders_exported"):
+            try:
+                window.orders_exported.connect(
+                    lambda exported_rows, source_lines=tracked_source_lines: self.handle_yu_order_export_completed(
+                        exported_rows,
+                        source_lines,
+                    )
+                )
+            except Exception:
+                pass
 
         self.yu_order_review_db_helpers.append(db_helper)
         self.yu_order_review_windows.append(window)
