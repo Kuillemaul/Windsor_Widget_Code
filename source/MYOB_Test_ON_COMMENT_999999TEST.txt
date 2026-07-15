@@ -1,6 +1,6 @@
 {}
 Co./Last Name,First Name,Addr 1 - Line 1,Addr 1 - Line 2,Addr 1 - Line 3,Addr 1 - Line 4,Inclusive,Purchase No.,Date,Supplier Invoice No.,Ship Via,Delivery Status,Item Number,Quantity,Description,Price,Discount,Total,Job,Comment,Journal Memo,Shipping Date,Tax Code,Tax Amount,Freight Amount,Freight Tax Code,Freight Tax Amount,Purchase Status,Currency Code,Exchange Rate,Terms - Payment is Due,           - Discount Days,           - Balance Due Days,           - % Discount,Amount Paid,Category,Order,Received,Billed,Location ID,Card ID,Record ID
 Yuchang Textile Factory,,,,,,,999999TEST,15/07/2026,,SEA,P,\ON,0.000,O/NO 260703 SH,0,0%,0.00,,,Purchase; Yuchang Textile Factory,,OSP,0.00,0.00,OSP,0.00,O,,,,,,,0.00,,0.000,0.000,0.000,Location1,,
-Yuchang Textile Factory,,,,,,,999999TEST,15/07/2026,,SEA,P,\COMMENT,0.000,GOING BY AIR DIRECT TO SLEEPYHEAD NZ,0,0%,0.00,,,Purchase; Yuchang Textile Factory,,OSP,0.00,0.00,OSP,0.00,O,,,,,,,0.00,,0.000,0.000,0.000,Location1,,
 Yuchang Textile Factory,,,,,,,999999TEST,15/07/2026,,SEA,P,MT36SOLIDGREY,1.000,MATTRESS TAPE 36 MM SOLID GREY T656,0.05,0%,0.05,,,Purchase; Yuchang Textile Factory,,OSP,0.00,0.00,OSP,0.00,O,,,,,,,0.00,,1.000,0.000,0.000,Location1,,
+Yuchang Textile Factory,,,,,,,999999TEST,15/07/2026,,SEA,P,\COMMENT,0.000,GOING BY AIR DIRECT TO SLEEPYHEAD NZ,0,0%,0.00,,,Purchase; Yuchang Textile Factory,,OSP,0.00,0.00,OSP,0.00,O,,,,,,,0.00,,0.000,0.000,0.000,Location1,,
 

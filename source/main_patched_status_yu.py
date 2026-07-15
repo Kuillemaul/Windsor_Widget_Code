@@ -118,7 +118,7 @@ from yu_order_workflow import YUOrderEntryDialog, load_yu_review_module
 TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
 TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
 TABLE_FORMAT_SETTINGS_PREFIX = "table_format"
-APP_VERSION = "1.5.4"
+APP_VERSION = "1.5.5"
 APP_DESIGNER = "Bradley Mayze"
 YU_SUPPLIER_DISPLAY_NAME = "Yuchang Textile Factory"
 # Generic latest purchase-cost fields. These apply to every item in the item master.
@@ -22669,6 +22669,17 @@ class MainWindow(QMainWindow):
                 )
             )
             for line in order_lines:
+                item_row, line_value, used_generic_cost = self._myob_container_item_row(
+                    purchase_no,
+                    purchase_date,
+                    line,
+                )
+                rows.append(item_row)
+                total_value += line_value
+                if used_generic_cost:
+                    generic_cost_fallbacks.append(item_row["Item Number"])
+
+                # Keep each line comment directly below the item it belongs to in MYOB.
                 comment = re.sub(r"\s+", " ", str(line.get("comments") or "").strip())
                 if comment:
                     rows.append(
@@ -22679,15 +22690,6 @@ class MainWindow(QMainWindow):
                             comment,
                         )
                     )
-                item_row, line_value, used_generic_cost = self._myob_container_item_row(
-                    purchase_no,
-                    purchase_date,
-                    line,
-                )
-                rows.append(item_row)
-                total_value += line_value
-                if used_generic_cost:
-                    generic_cost_fallbacks.append(item_row["Item Number"])
 
         global_notes = []
         if getattr(self.ui, "checkBox", None) is not None and self.ui.checkBox.isChecked():
