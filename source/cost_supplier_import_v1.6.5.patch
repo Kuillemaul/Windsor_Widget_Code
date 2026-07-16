@@ -1,0 +1,293 @@
+--- /mnt/data/Windsor_Widget_Item_Master_Import_v1.6.4/main_patched_status_yu.py	2026-07-16 03:54:52.635201425 +0000
++++ /mnt/data/Windsor_Widget_Cost_Supplier_v1.6.5/main_patched_status_yu.py	2026-07-16 03:59:32.232709902 +0000
+@@ -120,7 +120,7 @@
+ TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
+ TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
+ TABLE_FORMAT_SETTINGS_PREFIX = "table_format"
+-APP_VERSION = "1.6.4"
++APP_VERSION = "1.6.5"
+ APP_DESIGNER = "Bradley Mayze"
+ YU_SUPPLIER_DISPLAY_NAME = "Yuchang Textile Factory"
+ # Generic latest purchase-cost fields. These apply to every item in the item master.
+@@ -6106,7 +6106,7 @@
+                 "Use the Watched Folder tab to queue or automatically import recognised exports from standard subfolders.",
+                 "For sales imports, use MYOB AccountRight Import/Export Assistant data.",
+                 "Use <b>Update Cover Orders</b> for cover order exports with Invoice No., Co./Last Name, Item Number, Quantity, Date, and Journal Memo.",
+-                "Use <b>Update Costs & Descriptions</b> for MYOB Item Purchases exports containing Item Number, Description, Price, and Date.",
++                "Use <b>Update Costs, Descriptions & Suppliers</b> for MYOB Item Purchases exports containing Item Number, Description, Price, Date, and Co./Last Name.",
+                 "Make sure required columns are present before upload.",
+                 "After import, return to Customer Summary, Item Summary, or Order Analysis to review the new data.",
+             ],
+@@ -7478,7 +7478,7 @@
+         self.updateCoverOrders_pushButton = QPushButton("Update Cover Orders", self.frame_47)
+         self.updateCoverOrders_pushButton.setObjectName("updateCoverOrders_pushButton")
+         self.lastUpdateCoverOrders_textBrowser = self._text_box(self.frame_47, "lastUpdateCoverOrders_textBrowser", "Cover orders not updated this session")
+-        self.updateYUCosts_pushButton = QPushButton("Update Costs & Descriptions", self.frame_47)
++        self.updateYUCosts_pushButton = QPushButton("Update Costs, Descriptions && Suppliers", self.frame_47)
+         self.updateYUCosts_pushButton.setObjectName("updateYUCosts_pushButton")
+         self.updateAllCosts_checkBox = QCheckBox("Full refresh: overwrite all matching costs from selected file", self.frame_47)
+         self.updateAllCosts_checkBox.setObjectName("updateAllCosts_checkBox")
+@@ -7529,7 +7529,7 @@
+                     "The import replaces the existing cover order table."
+                 )
+             elif title == "Item Costs":
+-                placeholder.setPlainText("Item cost and description import instructions will load when the database opens.")
++                placeholder.setPlainText("Item cost, description and supplier import instructions will load when the database opens.")
+             elif title == "Items":
+                 placeholder.setPlainText("Item master import instructions will load when the database opens.")
+             else:
+@@ -14972,8 +14972,8 @@
+ 
+     def yu_cost_import_instruction_text(self):
+         return (
+-            "ITEM COST AND DESCRIPTION IMPORT\n\n"
+-            "Use this import to save the latest positive MYOB purchase cost against every matching item in the Widget item master.\n"
++            "ITEM COST, DESCRIPTION AND SUPPLIER IMPORT\n\n"
++            "Use this import to save the latest positive MYOB purchase cost and last purchased supplier against every matching item in the Widget item master.\n"
+             "When the Widget has no description at all for an item, the importer also fills item_name and description from the newest non-blank MYOB purchase description.\n"
+             "Existing descriptions are never overwritten. The importer updates existing items only; it does not create new items.\n"
+             "For Yuchang items it also keeps the existing yu_last_cost fields current for the YU MYOB PO exporter.\n\n"
+@@ -14985,7 +14985,7 @@
+             "Date\n\n"
+             "Required to backfill missing descriptions:\n"
+             "Description (Item Description / Item Name are also accepted)\n\n"
+-            "Recommended optional column:\n"
++            "Required to update the last purchased supplier:\n"
+             "Co./Last Name (or Supplier)\n\n"
+             "How to export from MYOB AccountRight:\n"
+             "1. Go to File > Import/Export Assistant.\n"
+@@ -14994,9 +14994,12 @@
+             "4. After that, use the incremental date range shown in the import window. Start on the shown date, not the following day.\n"
+             "5. Export Item Number, Description, Price, Date, and Co./Last Name if MYOB offers it.\n"
+             "6. Include field headings and save as comma-separated or tab-separated text.\n"
+-            "7. In Windsor Widget, click Update Costs & Descriptions and choose the export.\n\n"
++            "7. In Windsor Widget, click Update Costs, Descriptions & Suppliers and choose the export.\n\n"
+             "Rules used by the importer:\n"
+             "- Every positive purchase row is considered, regardless of supplier.\n"
++            "- When Co./Last Name is present, the supplier from the newest usable purchase row becomes the item supplier in the Widget.\n"
++            "- Supplier is updated when the source purchase is at least as recent as the stored latest-cost date. Full refresh always uses the newest supplier in the selected file.\n"
++            "- Supplier names found in the import are also added to the Widget supplier list.\n"
+             "- Only item numbers that match an existing Widget item are updated.\n"
+             "- Blank item numbers, MYOB backslash lines, and prices less than or equal to zero are ignored because they are not usable item costs.\n"
+             "- When an item appears more than once, the newest Date wins for cost. On the same date, the last positive row in the file wins.\n"
+@@ -15008,7 +15011,7 @@
+             "- The latest source date in the file is saved so future exports only need to begin from that date.\n"
+             "- The start date is intentionally inclusive so same-day bills added later are captured on the next import.\n\n"
+             "Supplier note:\n"
+-            "last_purchase_cost is the most recent purchase cost for the item from any supplier. If the same item is bought from multiple suppliers, the latest bill wins.\n"
++            "last_purchase_cost and the item supplier both follow the newest usable purchase row from any supplier. If the same item is bought from multiple suppliers, the latest bill wins.\n"
+             "The YU-specific mirror uses Co./Last Name when supplied; otherwise it uses the item's current supplier assignment in the Widget.\n\n"
+             "Example header:\n"
+             "Item Number,Description,Price,Date,Co./Last Name\n"
+@@ -18443,7 +18446,11 @@
+                 self._update_watched_import_meta("cover_orders", candidates[0], message)
+             elif kind == "item_costs":
+                 result = self.import_yu_cost_file(paths[0], progress=None, force_all_costs=False)
+-                message = f"{result.get('updated_count', 0):,} cost(s), {result.get('description_updated_count', 0):,} description(s)"
++                message = (
++                    f"{result.get('updated_count', 0):,} cost(s), "
++                    f"{result.get('description_updated_count', 0):,} description(s), "
++                    f"{result.get('supplier_updated_count', 0):,} supplier(s)"
++                )
+                 self._update_watched_import_meta("item_costs", candidates[0], message, result=result)
+             elif kind == "orders":
+                 todo = next(candidate for candidate in candidates if candidate.get("kind") == "orders_todo")
+@@ -22989,7 +22996,7 @@
+         return (invoice_no, customer_name, item_number, quantity_value, cover_date, journal_memo)
+ 
+     def import_yu_costs_from_dialog(self):
+-        if not self.show_import_instructions_dialog("yu_costs", "Item cost and description import instructions"):
++        if not self.show_import_instructions_dialog("yu_costs", "Item cost, description and supplier import instructions"):
+             return
+ 
+         force_all_costs = bool(
+@@ -23018,7 +23025,8 @@
+                 "For every matching item, the newest positive cost in the selected file will overwrite "
+                 "the stored cost even when the database currently has a newer date.\n\n"
+                 "Use this only with a full and current MYOB purchase-history export. Missing descriptions "
+-                "will still be filled only when the Widget description is blank.\n\n"
++                "will still be filled only when the Widget description is blank. When Co./Last Name is present, "
++                "the newest supplier in the file will also replace the stored item supplier.\n\n"
+                 "Continue?",
+                 QMessageBox.Yes | QMessageBox.No,
+                 QMessageBox.No,
+@@ -23029,7 +23037,7 @@
+         progress_text = (
+             "Rebuilding all matching item costs..."
+             if force_all_costs
+-            else "Importing item costs and descriptions..."
++            else "Importing item costs, descriptions and suppliers..."
+         )
+         progress = self.create_import_progress_dialog(progress_text, file_path)
+         try:
+@@ -23041,7 +23049,7 @@
+             self.update_import_progress(progress, 94, "Refreshing item displays...")
+         except Exception as exc:
+             self.close_import_progress(progress)
+-            QMessageBox.critical(self, "Item import failed", f"Could not import item costs and descriptions.\n\n{exc}")
++            QMessageBox.critical(self, "Item import failed", f"Could not import item costs, descriptions and suppliers.\n\n{exc}")
+             return
+ 
+         source_date = result.get("source_max_date")
+@@ -23054,6 +23062,7 @@
+             f"Export through: {source_date_text}\n"
+             f"Item costs updated: {result.get('updated_count', 0):,}\n"
+             f"Descriptions added: {result.get('description_updated_count', 0):,}\n"
++            f"Suppliers updated: {result.get('supplier_updated_count', 0):,}\n"
+             f"Already current: {result.get('unchanged_count', 0):,}\n"
+             f"Older rows skipped: {result.get('older_count', 0):,}\n"
+             f"YU costs mirrored: {result.get('yu_updated_count', 0):,}\n"
+@@ -23067,6 +23076,7 @@
+         if status is not None:
+             status.setPlainText(display_text)
+ 
++        self.load_reference_lists()
+         self.rerun_item_if_ready()
+         self.rerun_order_analysis_if_ready()
+         self.refresh_dashboard()
+@@ -23079,10 +23089,11 @@
+         parser_stats = result.get("parser_stats", {})
+         QMessageBox.information(
+             self,
+-            "Item costs and descriptions imported",
++            "Item costs, descriptions and suppliers imported",
+             f"Mode: {import_mode_text}\n"
+             f"Updated {result.get('updated_count', 0):,} item cost(s).\n"
+-            f"Added {result.get('description_updated_count', 0):,} missing description(s).\n\n"
++            f"Added {result.get('description_updated_count', 0):,} missing description(s).\n"
++            f"Updated {result.get('supplier_updated_count', 0):,} last-purchased supplier(s).\n\n"
+             f"Export through: {source_date_text}\n"
+             f"Matched items in file: {result.get('matched_item_count', 0):,}\n"
+             f"Already current: {result.get('unchanged_count', 0):,}\n"
+@@ -23094,6 +23105,10 @@
+             f"MYOB control/backslash rows ignored: {parser_stats.get('backslash_rows', 0):,}\n"
+             f"Zero/negative costs ignored: {parser_stats.get('zero_or_negative_rows', 0):,}.\n"
+             f"Description column present: {'Yes' if parser_stats.get('source_has_description') else 'No'}\n"
++            f"Supplier column present: {'Yes' if parser_stats.get('source_has_supplier') else 'No'}\n"
++            f"Supplier already current: {result.get('supplier_unchanged_count', 0):,}\n"
++            f"Older supplier rows protected: {result.get('supplier_older_count', 0):,}\n"
++            f"Matched items without source supplier: {result.get('supplier_unavailable_count', 0):,}\n"
+             f"Matched items still missing a source description: {result.get('description_unavailable_count', 0):,}."
+         )
+ 
+@@ -23127,7 +23142,7 @@
+         return None, "unknown"
+ 
+     def import_yu_cost_file(self, file_path, progress=None, force_all_costs=False):
+-        """Import latest positive purchase costs and fill missing descriptions.
++        """Import latest positive purchase costs, missing descriptions, and suppliers.
+ 
+         The legacy method name is retained so existing button wiring and patches
+         continue to work. Generic fields are updated for all items. YU-specific
+@@ -23149,6 +23164,7 @@
+         self.update_import_progress(progress, 35, "Matching purchase rows to the item master...")
+         exact_candidates, clean_candidates = self._build_yu_cost_item_lookup()
+         supplier_columns = self.get_items_supplier_column_names()
++        supplier_column = supplier_columns[0] if supplier_columns else None
+         item_columns = {str(name).lower(): name for name in self.get_table_columns("items")}
+         description_columns = []
+         for candidate in ("item_name", "description"):
+@@ -23271,6 +23287,81 @@
+         elif source_has_description:
+             description_unavailable_count = len(latest_by_item)
+ 
++        supplier_updated_count = 0
++        supplier_unchanged_count = 0
++        supplier_older_count = 0
++        supplier_unavailable_count = 0
++        supplier_target_missing = bool(source_has_supplier and not supplier_column)
++        suppliers_to_register = set()
++
++        if source_has_supplier and supplier_column:
++            self.update_import_progress(progress, 83, "Updating last purchased suppliers...")
++            supplier_updates = []
++            for item_number, (_candidate_key, record, item_row) in latest_by_item.items():
++                source_supplier = str(record.get("supplier_name") or "").strip()
++                if not source_supplier:
++                    supplier_unavailable_count += 1
++                    continue
++
++                incoming_date = record["source_date"]
++                stored_date = self.parse_date_value(item_row.get(ITEM_COST_DATE_COLUMN))
++                if not force_all_costs and stored_date is not None and stored_date > incoming_date:
++                    supplier_older_count += 1
++                    continue
++
++                suppliers_to_register.add(source_supplier)
++                current_supplier = next(
++                    (
++                        str(item_row.get(column_name) or "").strip()
++                        for column_name in supplier_columns
++                        if str(item_row.get(column_name) or "").strip()
++                    ),
++                    "",
++                )
++                if current_supplier.casefold() == source_supplier.casefold():
++                    supplier_unchanged_count += 1
++                    continue
++
++                supplier_updates.append((source_supplier, item_number))
++
++            if supplier_updates:
++                cur.executemany(
++                    f"UPDATE items SET {self.db_identifier(supplier_column)} = ? WHERE item_number = ?",
++                    supplier_updates,
++                )
++                supplier_updated_count = len(supplier_updates)
++
++            if suppliers_to_register and self.has_table("supplier_master"):
++                for supplier_name in sorted(suppliers_to_register, key=str.casefold):
++                    if self.db_engine == "sqlserver":
++                        cur.execute(
++                            """
++                            IF NOT EXISTS (
++                                SELECT 1
++                                FROM supplier_master
++                                WHERE UPPER(LTRIM(RTRIM(COALESCE(supplier_name, '')))) =
++                                      UPPER(LTRIM(RTRIM(?)))
++                            )
++                                INSERT INTO supplier_master (supplier_name) VALUES (?);
++                            """,
++                            (supplier_name, supplier_name),
++                        )
++                    else:
++                        cur.execute(
++                            "SELECT 1 FROM supplier_master "
++                            "WHERE UPPER(TRIM(COALESCE(supplier_name, ''))) = UPPER(TRIM(?)) LIMIT 1",
++                            (supplier_name,),
++                        )
++                        if cur.fetchone() is None:
++                            cur.execute(
++                                "INSERT INTO supplier_master (supplier_name) VALUES (?)",
++                                (supplier_name,),
++                            )
++        elif source_has_supplier:
++            supplier_unavailable_count = len(latest_by_item)
++        else:
++            supplier_unavailable_count = 0
++
+         yu_updates = []
+         yu_unchanged_count = 0
+         yu_older_count = 0
+@@ -23302,7 +23393,7 @@
+             )
+         self.db_conn.commit()
+ 
+-        self.update_import_progress(progress, 90, "Item cost and description import complete.")
++        self.update_import_progress(progress, 90, "Item cost, description and supplier import complete.")
+         return {
+             "updated_count": len(updates),
+             "unchanged_count": unchanged_count,
+@@ -23313,6 +23404,12 @@
+             "description_updated_count": description_updated_count,
+             "description_unavailable_count": description_unavailable_count,
+             "description_source_has_column": source_has_description,
++            "supplier_updated_count": supplier_updated_count,
++            "supplier_unchanged_count": supplier_unchanged_count,
++            "supplier_older_count": supplier_older_count,
++            "supplier_unavailable_count": supplier_unavailable_count,
++            "supplier_source_has_column": source_has_supplier,
++            "supplier_target_missing": supplier_target_missing,
+             "yu_updated_count": len(yu_updates),
+             "yu_unchanged_count": yu_unchanged_count,
+             "yu_older_count": yu_older_count,

@@ -120,7 +120,7 @@ from yu_order_workflow import YUOrderEntryDialog, load_yu_review_module
 TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
 TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
 TABLE_FORMAT_SETTINGS_PREFIX = "table_format"
-APP_VERSION = "1.6.2"
+APP_VERSION = "1.6.5"
 APP_DESIGNER = "Bradley Mayze"
 YU_SUPPLIER_DISPLAY_NAME = "Yuchang Textile Factory"
 # Generic latest purchase-cost fields. These apply to every item in the item master.
@@ -129,6 +129,8 @@ ITEM_COST_DATE_COLUMN = "last_purchase_cost_date"
 # Legacy YU-specific fields are retained because the YU MYOB PO exporter uses them.
 YU_COST_VALUE_COLUMN = "yu_last_cost"
 YU_COST_DATE_COLUMN = "yu_last_cost_date"
+ITEM_MASTER_ID_COLUMN = "item_master_id"
+ITEM_STANDARD_COST_COLUMN = "standard_cost"
 
 MYOB_CONTAINER_PO_HEADERS = [
     "Co./Last Name",
@@ -6104,7 +6106,7 @@ class Ui_MainWindow(object):
                 "Use the Watched Folder tab to queue or automatically import recognised exports from standard subfolders.",
                 "For sales imports, use MYOB AccountRight Import/Export Assistant data.",
                 "Use <b>Update Cover Orders</b> for cover order exports with Invoice No., Co./Last Name, Item Number, Quantity, Date, and Journal Memo.",
-                "Use <b>Update Costs & Descriptions</b> for MYOB Item Purchases exports containing Item Number, Description, Price, and Date.",
+                "Use <b>Update Costs, Descriptions & Suppliers</b> for MYOB Item Purchases exports containing Item Number, Description, Price, Date, and Co./Last Name.",
                 "Make sure required columns are present before upload.",
                 "After import, return to Customer Summary, Item Summary, or Order Analysis to review the new data.",
             ],
@@ -7460,6 +7462,13 @@ class Ui_MainWindow(object):
         self.updateSales_pushButton = QPushButton("Update Sales", self.frame_47)
         self.updateSales_pushButton.setObjectName("updateSales_pushButton")
         self.lastUpdateSales_textBrowser = self._text_box(self.frame_47, "lastUpdateSales_textBrowser", "Sales not updated this session")
+        self.updateItemMaster_pushButton = QPushButton("Update Item Master", self.frame_47)
+        self.updateItemMaster_pushButton.setObjectName("updateItemMaster_pushButton")
+        self.lastUpdateItemMaster_textBrowser = self._text_box(
+            self.frame_47,
+            "lastUpdateItemMaster_textBrowser",
+            "Item master not updated this session",
+        )
         self.updateStock_pushButton = QPushButton("Update Stock", self.frame_47)
         self.updateStock_pushButton.setObjectName("updateStock_pushButton")
         self.lastUPdateStock_textBrowser_2 = self._text_box(self.frame_47, "lastUPdateStock_textBrowser_2", "Stock not updated this session")
@@ -7469,7 +7478,7 @@ class Ui_MainWindow(object):
         self.updateCoverOrders_pushButton = QPushButton("Update Cover Orders", self.frame_47)
         self.updateCoverOrders_pushButton.setObjectName("updateCoverOrders_pushButton")
         self.lastUpdateCoverOrders_textBrowser = self._text_box(self.frame_47, "lastUpdateCoverOrders_textBrowser", "Cover orders not updated this session")
-        self.updateYUCosts_pushButton = QPushButton("Update Costs & Descriptions", self.frame_47)
+        self.updateYUCosts_pushButton = QPushButton("Update Costs, Descriptions && Suppliers", self.frame_47)
         self.updateYUCosts_pushButton.setObjectName("updateYUCosts_pushButton")
         self.updateAllCosts_checkBox = QCheckBox("Full refresh: overwrite all matching costs from selected file", self.frame_47)
         self.updateAllCosts_checkBox.setObjectName("updateAllCosts_checkBox")
@@ -7485,6 +7494,8 @@ class Ui_MainWindow(object):
         for widget in (
             self.updateSales_pushButton,
             self.lastUpdateSales_textBrowser,
+            self.updateItemMaster_pushButton,
+            self.lastUpdateItemMaster_textBrowser,
             self.updateStock_pushButton,
             self.lastUPdateStock_textBrowser_2,
             self.updatOrders_pushButton_3,
@@ -7518,7 +7529,9 @@ class Ui_MainWindow(object):
                     "The import replaces the existing cover order table."
                 )
             elif title == "Item Costs":
-                placeholder.setPlainText("Item cost and description import instructions will load when the database opens.")
+                placeholder.setPlainText("Item cost, description and supplier import instructions will load when the database opens.")
+            elif title == "Items":
+                placeholder.setPlainText("Item master import instructions will load when the database opens.")
             else:
                 placeholder.setPlainText(f"{title} import instructions will be added here.")
             self.updateDataInstructions_tabs.addTab(placeholder, title)
@@ -7822,6 +7835,8 @@ class MainWindow(QMainWindow):
         self.ensure_shipment_tables()
         self.ensure_item_planning_status_column()
         self.ensure_item_cost_columns()
+        self.ensure_item_master_import_columns()
+        self.ensure_item_master_identity_column()
         self.ensure_container_line_comments_column()
         self.load_reference_lists()
 
@@ -9607,6 +9622,10 @@ class MainWindow(QMainWindow):
         if update_sales_button is not None:
             update_sales_button.clicked.connect(self.import_sales_from_dialog)
 
+        update_item_master_button = getattr(self.ui, "updateItemMaster_pushButton", None)
+        if update_item_master_button is not None:
+            update_item_master_button.clicked.connect(self.import_item_master_from_dialog)
+
         update_stock_button = getattr(self.ui, "updateStock_pushButton", None)
         if update_stock_button is not None:
             update_stock_button.clicked.connect(self.import_stock_from_dialog)
@@ -9865,6 +9884,63 @@ class MainWindow(QMainWindow):
             f"{self.db_identifier(YU_COST_DATE_COLUMN)} "
             f"WHERE {self.db_identifier(ITEM_COST_DATE_COLUMN)} IS NULL "
             f"AND {self.db_identifier(YU_COST_DATE_COLUMN)} IS NOT NULL"
+        )
+        self.db_conn.commit()
+
+    def ensure_item_master_import_columns(self):
+        """Add fields supplied by the MYOB item-list export.
+
+        Standard Cost is kept separate from latest purchase cost. A zero MYOB
+        standard cost is still a valid current value and must not overwrite
+        last_purchase_cost or yu_last_cost.
+        """
+        if self.db_conn is None or not self.has_table("items"):
+            return
+        existing_columns = {str(name).lower(): name for name in self.get_table_columns("items")}
+        if ITEM_STANDARD_COST_COLUMN.lower() in existing_columns:
+            return
+        cur = self.db_conn.cursor()
+        if self.db_engine == "sqlserver":
+            cur.execute(
+                f"ALTER TABLE items ADD {self.db_identifier(ITEM_STANDARD_COST_COLUMN)} DECIMAL(18,6) NULL"
+            )
+        else:
+            cur.execute(f"ALTER TABLE items ADD COLUMN {ITEM_STANDARD_COST_COLUMN} REAL")
+        self.db_conn.commit()
+
+    def ensure_item_master_identity_column(self):
+        """Ensure every item-master row has a stable unique database identifier.
+
+        Item numbers are business keys, not physical row identifiers. Exact duplicate
+        item numbers can therefore only be merged safely when the two physical rows
+        can be addressed independently. SQL Server IDENTITY supplies that stable key.
+        """
+        if self.db_conn is None or not self.has_table("items"):
+            return
+        if self.db_engine != "sqlserver":
+            return
+
+        existing_columns = {str(name).lower(): name for name in self.get_table_columns("items")}
+        cur = self.db_conn.cursor()
+        changed = False
+        if ITEM_MASTER_ID_COLUMN.lower() not in existing_columns:
+            cur.execute(
+                f"ALTER TABLE dbo.items ADD {self.db_identifier(ITEM_MASTER_ID_COLUMN)} "
+                "BIGINT IDENTITY(1,1) NOT NULL"
+            )
+            changed = True
+
+        cur.execute(
+            f"""
+            IF NOT EXISTS (
+                SELECT 1
+                FROM sys.indexes
+                WHERE object_id = OBJECT_ID('dbo.items')
+                  AND name = 'UX_items_item_master_id'
+            )
+            CREATE UNIQUE INDEX UX_items_item_master_id
+                ON dbo.items ({self.db_identifier(ITEM_MASTER_ID_COLUMN)})
+            """
         )
         self.db_conn.commit()
 
@@ -14815,6 +14891,32 @@ class MainWindow(QMainWindow):
             "Purchase No.,Item Number,Quantity,Shipping Date\n"
         )
 
+    def item_master_import_instruction_text(self):
+        return (
+            "ITEM MASTER IMPORT\n\n"
+            "Use this import for a complete MYOB Items export such as ITEMWHOLE.TXT.\n"
+            "It adds missing item-master records, fills blank names/descriptions, and stores MYOB Standard Cost separately.\n"
+            "It does not replace latest purchase cost and it does not import stock-on-hand quantities.\n\n"
+            "Required columns:\n"
+            "Item Number\n"
+            "Item Name\n\n"
+            "Optional columns:\n"
+            "Description\n"
+            "Standard Cost\n\n"
+            "Matching rules:\n"
+            "- Item-number matching ignores spaces, tabs, non-breaking spaces, and letter case.\n"
+            "- Existing Widget item numbers are retained; the MYOB spelling is not forced over them.\n"
+            "- New normal item numbers are stored in the Widget no-space convention.\n"
+            "- Backslash control/non-stock rows such as \\ON, \\COMMENT, \\FC, and \\STOCK ADJ are skipped.\n"
+            "- Existing names and descriptions are protected; only blank fields are filled.\n"
+            "- Standard Cost is refreshed from the file, including a genuine $0.00 value.\n"
+            "- Canonical collisions in the database or source file are skipped and reported rather than guessed.\n"
+            "- Supplier is not available in this export and is therefore not changed.\n\n"
+            "Recommended MYOB export:\n"
+            "File > Import/Export Assistant > Export data > Items\n"
+            "Fields: Item Number, Item Name, Description, Standard Cost\n"
+        )
+
     def stock_import_instruction_text(self):
         return (
             "STOCK IMPORT\n\n"
@@ -14870,8 +14972,8 @@ class MainWindow(QMainWindow):
 
     def yu_cost_import_instruction_text(self):
         return (
-            "ITEM COST AND DESCRIPTION IMPORT\n\n"
-            "Use this import to save the latest positive MYOB purchase cost against every matching item in the Widget item master.\n"
+            "ITEM COST, DESCRIPTION AND SUPPLIER IMPORT\n\n"
+            "Use this import to save the latest positive MYOB purchase cost and last purchased supplier against every matching item in the Widget item master.\n"
             "When the Widget has no description at all for an item, the importer also fills item_name and description from the newest non-blank MYOB purchase description.\n"
             "Existing descriptions are never overwritten. The importer updates existing items only; it does not create new items.\n"
             "For Yuchang items it also keeps the existing yu_last_cost fields current for the YU MYOB PO exporter.\n\n"
@@ -14883,7 +14985,7 @@ class MainWindow(QMainWindow):
             "Date\n\n"
             "Required to backfill missing descriptions:\n"
             "Description (Item Description / Item Name are also accepted)\n\n"
-            "Recommended optional column:\n"
+            "Required to update the last purchased supplier:\n"
             "Co./Last Name (or Supplier)\n\n"
             "How to export from MYOB AccountRight:\n"
             "1. Go to File > Import/Export Assistant.\n"
@@ -14892,9 +14994,12 @@ class MainWindow(QMainWindow):
             "4. After that, use the incremental date range shown in the import window. Start on the shown date, not the following day.\n"
             "5. Export Item Number, Description, Price, Date, and Co./Last Name if MYOB offers it.\n"
             "6. Include field headings and save as comma-separated or tab-separated text.\n"
-            "7. In Windsor Widget, click Update Costs & Descriptions and choose the export.\n\n"
+            "7. In Windsor Widget, click Update Costs, Descriptions & Suppliers and choose the export.\n\n"
             "Rules used by the importer:\n"
             "- Every positive purchase row is considered, regardless of supplier.\n"
+            "- When Co./Last Name is present, the supplier from the newest usable purchase row becomes the item supplier in the Widget.\n"
+            "- Supplier is updated when the source purchase is at least as recent as the stored latest-cost date. Full refresh always uses the newest supplier in the selected file.\n"
+            "- Supplier names found in the import are also added to the Widget supplier list.\n"
             "- Only item numbers that match an existing Widget item are updated.\n"
             "- Blank item numbers, MYOB backslash lines, and prices less than or equal to zero are ignored because they are not usable item costs.\n"
             "- When an item appears more than once, the newest Date wins for cost. On the same date, the last positive row in the file wins.\n"
@@ -14906,7 +15011,7 @@ class MainWindow(QMainWindow):
             "- The latest source date in the file is saved so future exports only need to begin from that date.\n"
             "- The start date is intentionally inclusive so same-day bills added later are captured on the next import.\n\n"
             "Supplier note:\n"
-            "last_purchase_cost is the most recent purchase cost for the item from any supplier. If the same item is bought from multiple suppliers, the latest bill wins.\n"
+            "last_purchase_cost and the item supplier both follow the newest usable purchase row from any supplier. If the same item is bought from multiple suppliers, the latest bill wins.\n"
             "The YU-specific mirror uses Co./Last Name when supplied; otherwise it uses the item's current supplier assignment in the Widget.\n\n"
             "Example header:\n"
             "Item Number,Description,Price,Date,Co./Last Name\n"
@@ -15043,6 +15148,12 @@ class MainWindow(QMainWindow):
                 "Start from this earliest date because the cover order import clears and replaces the existing cover order table.\n"
             )
 
+        if import_key == "item_master":
+            return (
+                "DATE RANGE TO USE\n"
+                "No date range is needed. Export the complete current MYOB item list.\n"
+            )
+
         if import_key == "stock":
             return (
                 "DATE RANGE TO USE\n"
@@ -15074,6 +15185,9 @@ class MainWindow(QMainWindow):
         elif import_key == "orders":
             title = "ORDERS IMPORT"
             body = self.orders_import_instruction_text()
+        elif import_key == "item_master":
+            title = "ITEM MASTER IMPORT"
+            body = self.item_master_import_instruction_text()
         elif import_key == "stock":
             title = "STOCK IMPORT"
             body = self.stock_import_instruction_text()
@@ -16527,6 +16641,8 @@ class MainWindow(QMainWindow):
                 text_box.setPlainText(self.cover_orders_import_instruction_text())
             elif tab_name == "Item Costs":
                 text_box.setPlainText(self.yu_cost_import_instruction_text())
+            elif tab_name == "Items":
+                text_box.setPlainText(self.item_master_import_instruction_text())
             else:
                 text_box.setPlainText(self.placeholder_import_instruction_text(tab_name))
             tabs.addTab(text_box, tab_name)
@@ -16545,6 +16661,14 @@ class MainWindow(QMainWindow):
             sales_status.setReadOnly(True)
             sales_status.setOpenLinks(False)
             sales_status.setPlainText(self.get_meta_value("sales_last_import_display", "No sales import yet."))
+
+        item_master_status = getattr(self.ui, "lastUpdateItemMaster_textBrowser", None)
+        if item_master_status is not None:
+            item_master_status.setReadOnly(True)
+            item_master_status.setOpenLinks(False)
+            item_master_status.setPlainText(
+                self.get_meta_value("item_master_last_import_display", "No item master import yet.")
+            )
 
         stock_status = getattr(self.ui, "lastUPdateStock_textBrowser_2", None)
         if stock_status is not None:
@@ -17426,111 +17550,263 @@ class MainWindow(QMainWindow):
             self._data_quality_mark_issue_fixed(issue, f"Created item {item_number}.")
 
     def _data_quality_fix_duplicate_items(self, issue):
+        """Merge duplicate item-master rows without discarding populated fields.
+
+        Version 1.6.2 keyed the merge by item-number text. Exact duplicate rows have
+        identical text, so no alias was produced and no merge occurred. Worse, a
+        generic delete could retain the poorer row. This implementation addresses
+        rows by item_master_id, fills every blank writable field from the other rows,
+        updates true aliases in reference tables, deletes only the selected physical
+        duplicate rows, and verifies that one master record remains.
+        """
+        self.ensure_item_master_identity_column()
+
         clean_key = self.item_clean_key(issue.get("reference"))
         rows = self.fetch_item_rows_by_clean_key(clean_key)
         if len(rows) < 2:
-            # The issue details may list the aliases even if the reference itself
-            # is not the best lookup value.
             aliases = [part.strip() for part in str(issue.get("details") or "").split(",") if part.strip()]
+            candidate_keys = {self.item_clean_key(alias) for alias in aliases if self.item_clean_key(alias)}
             combined = []
-            seen = set()
-            for alias in aliases:
-                for row in self._data_quality_find_item_rows(alias):
-                    key = str(row.get("item_number") or "").casefold()
-                    if key and key not in seen:
-                        seen.add(key)
-                        combined.append(row)
+            seen_ids = set()
+            for candidate_key in candidate_keys:
+                for row in self.fetch_item_rows_by_clean_key(candidate_key):
+                    row_id = row.get(ITEM_MASTER_ID_COLUMN)
+                    if row_id is None or row_id in seen_ids:
+                        continue
+                    seen_ids.add(row_id)
+                    combined.append(row)
             rows = combined
+
         if len(rows) < 2:
-            QMessageBox.information(self, "Duplicate items", "The duplicate records could not be found. Refresh the scan first.")
+            QMessageBox.information(
+                self,
+                "Duplicate items",
+                "The duplicate records could not be found. Refresh the scan first.",
+            )
             return
+
+        if any(row.get(ITEM_MASTER_ID_COLUMN) is None for row in rows):
+            QMessageBox.critical(
+                self,
+                "Duplicate items",
+                "The item-master row identifier is missing. Restart the Widget and try again.",
+            )
+            return
+
+        supplier_columns = self.get_items_supplier_column_names()
+
+        def row_supplier(row):
+            return next(
+                (str(row.get(column) or "").strip() for column in supplier_columns if str(row.get(column) or "").strip()),
+                "",
+            )
+
+        def row_description(row):
+            return str(row.get("item_name") or row.get("description") or "").strip()
+
+        def row_label(row):
+            row_id = row.get(ITEM_MASTER_ID_COLUMN)
+            number = str(row.get("item_number") or "").strip()
+            supplier = row_supplier(row) or "No supplier"
+            populated = sum(
+                1 for key, value in row.items()
+                if key != ITEM_MASTER_ID_COLUMN
+                and value is not None
+                and (not isinstance(value, str) or value.strip())
+            )
+            return f"ID {row_id} | {number} | {supplier} | {populated} populated fields"
 
         dialog = QDialog(self)
         dialog.setWindowTitle("Resolve Duplicate Item Numbers")
-        dialog.resize(760, 520)
+        dialog.resize(880, 620)
         layout, form = self._data_quality_dialog_intro(dialog, issue)
+
         canonical_combo = QComboBox(dialog)
-        item_numbers = [str(row.get("item_number") or "").strip() for row in rows]
-        canonical_combo.addItems(item_numbers)
+        for row in rows:
+            canonical_combo.addItem(row_label(row), row.get(ITEM_MASTER_ID_COLUMN))
         form.addRow("Keep as canonical", canonical_combo)
+
         preview = QTextBrowser(dialog)
-        preview.setMinimumHeight(240)
+        preview.setMinimumHeight(330)
         layout.addWidget(preview)
+
         warning = QLabel(
-            "This updates item-number references in every database table that has an item_number column, "
-            "copies blank core fields into the kept item, and deletes the other item-master records.", dialog
+            "Blank fields in the kept record will be filled from the other records, including supplier data. "
+            "Conflicting nonblank values remain on the selected canonical record and are reported after the merge. "
+            "Only the duplicate physical rows are deleted.",
+            dialog,
         )
         warning.setWordWrap(True)
         layout.addWidget(warning)
 
         def update_preview():
+            selected_id = canonical_combo.currentData()
             lines = []
-            supplier_columns = self.get_items_supplier_column_names()
             for row in rows:
+                row_id = row.get(ITEM_MASTER_ID_COLUMN)
+                marker = "KEEP" if row_id == selected_id else "MERGE"
                 number = str(row.get("item_number") or "")
-                description = str(row.get("item_name") or row.get("description") or "")
-                supplier = next((str(row.get(c) or "").strip() for c in supplier_columns if str(row.get(c) or "").strip()), "")
+                supplier = row_supplier(row) or "-"
+                description = row_description(row) or "-"
                 cost = row.get(ITEM_COST_VALUE_COLUMN)
-                marker = "KEEP" if number == canonical_combo.currentText() else "MERGE"
-                lines.append(f"{marker}: {number}\n  {description}\n  Supplier: {supplier or '-'} | Cost: {cost if cost not in (None, '') else '-'}")
+                yu_cost = row.get(YU_COST_VALUE_COLUMN)
+                lines.append(
+                    f"{marker}: ID {row_id} | {number}\n"
+                    f"  Description: {description}\n"
+                    f"  Supplier: {supplier}\n"
+                    f"  Latest cost: {cost if cost not in (None, '') else '-'} | "
+                    f"YU cost: {yu_cost if yu_cost not in (None, '') else '-'}"
+                )
             preview.setPlainText("\n\n".join(lines))
 
-        canonical_combo.currentTextChanged.connect(update_preview)
+        canonical_combo.currentIndexChanged.connect(update_preview)
         update_preview()
+
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel, parent=dialog)
         layout.addWidget(buttons)
         buttons.rejected.connect(dialog.reject)
+        merge_result = {}
 
         def save():
-            canonical = canonical_combo.currentText().strip()
-            aliases = [number for number in item_numbers if number != canonical]
+            try:
+                canonical_id = int(canonical_combo.currentData())
+            except Exception:
+                QMessageBox.warning(dialog, "Canonical item required", "Choose the item-master row to keep.")
+                return
+
+            canonical_row = next(
+                (dict(row) for row in rows if int(row.get(ITEM_MASTER_ID_COLUMN)) == canonical_id),
+                None,
+            )
+            if canonical_row is None:
+                QMessageBox.critical(dialog, "Merge failed", "The selected canonical row could not be resolved.")
+                return
+
+            alias_rows = [row for row in rows if int(row.get(ITEM_MASTER_ID_COLUMN)) != canonical_id]
+            canonical_number = str(canonical_row.get("item_number") or "").strip()
+            if not canonical_number:
+                QMessageBox.warning(dialog, "Invalid canonical item", "The kept row must have an item number.")
+                return
+
             reply = QMessageBox.question(
                 dialog,
                 "Confirm item merge",
-                f"Keep {canonical} and merge/delete:\n\n" + "\n".join(aliases) +
-                "\n\nThis changes historical item references. Continue?",
+                f"Keep:\n{row_label(canonical_row)}\n\n"
+                f"Merge and delete {len(alias_rows)} other physical item-master row(s).\n\n"
+                "Blank data, including supplier information, will be copied into the kept row. Continue?",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )
             if reply != QMessageBox.Yes:
                 return
-            canonical_row = next(row for row in rows if str(row.get("item_number") or "").strip() == canonical)
-            core_columns = [
-                "item_name", "description", "roll", "per_roll", "carton", "pallet", "planning_status",
-                ITEM_COST_VALUE_COLUMN, ITEM_COST_DATE_COLUMN, YU_COST_VALUE_COLUMN, YU_COST_DATE_COLUMN,
-            ] + self.get_items_supplier_column_names()
+
+            metadata_rows = self.db_all(
+                """
+                SELECT
+                    c.name AS column_name,
+                    ty.name AS data_type,
+                    c.is_identity,
+                    c.is_computed
+                FROM sys.columns c
+                INNER JOIN sys.types ty ON c.user_type_id = ty.user_type_id
+                WHERE c.object_id = OBJECT_ID('dbo.items')
+                ORDER BY c.column_id
+                """
+            )
+            writable_columns = []
+            for meta in metadata_rows:
+                column_name = str(meta.get("column_name") or "")
+                data_type = str(meta.get("data_type") or "").lower()
+                if not column_name:
+                    continue
+                if bool(meta.get("is_identity")) or bool(meta.get("is_computed")):
+                    continue
+                if data_type in {"timestamp", "rowversion"}:
+                    continue
+                if column_name.lower() in {ITEM_MASTER_ID_COLUMN.lower(), "item_number"}:
+                    continue
+                writable_columns.append(column_name)
+
             table_rows = self.db_all(
                 "SELECT DISTINCT c.TABLE_NAME FROM INFORMATION_SCHEMA.COLUMNS c "
                 "JOIN INFORMATION_SCHEMA.TABLES t ON t.TABLE_SCHEMA = c.TABLE_SCHEMA AND t.TABLE_NAME = c.TABLE_NAME "
                 "WHERE c.TABLE_SCHEMA = 'dbo' AND c.COLUMN_NAME = 'item_number' AND t.TABLE_TYPE = 'BASE TABLE'"
             )
-            reference_tables = [str(row["TABLE_NAME"]) for row in table_rows if str(row["TABLE_NAME"]).lower() != "items"]
+            reference_tables = [
+                str(row["TABLE_NAME"])
+                for row in table_rows
+                if str(row["TABLE_NAME"]).lower() != "items"
+            ]
+
+            merged_fields = []
+            conflict_fields = set()
+            deleted_rows = 0
+            references_updated = 0
+
+            def is_blank(value):
+                return value is None or (isinstance(value, str) and not value.strip())
+
+            def values_equal(left, right):
+                if isinstance(left, str) or isinstance(right, str):
+                    return str(left or "").strip() == str(right or "").strip()
+                return left == right
+
             try:
                 cur = self.db_conn.cursor()
-                for alias in aliases:
-                    alias_row = next(row for row in rows if str(row.get("item_number") or "").strip() == alias)
-                    for column in core_columns:
+                for alias_row in alias_rows:
+                    alias_id = int(alias_row.get(ITEM_MASTER_ID_COLUMN))
+                    alias_number = str(alias_row.get("item_number") or "").strip()
+
+                    for column in writable_columns:
                         current = canonical_row.get(column)
                         incoming = alias_row.get(column)
-                        current_blank = current is None or (isinstance(current, str) and not current.strip())
-                        incoming_present = incoming is not None and (not isinstance(incoming, str) or incoming.strip())
-                        if current_blank and incoming_present and column.lower() in {str(c).lower() for c in self.get_table_columns("items")}:
+                        if is_blank(current) and not is_blank(incoming):
                             cur.execute(
-                                f"UPDATE items SET {self.db_identifier(column)} = ? "
-                                f"WHERE {self.item_exact_sql_expr('item_number')} = {self.item_exact_sql_expr('?')}",
-                                (incoming, canonical),
+                                f"UPDATE dbo.items SET {self.db_identifier(column)} = ? "
+                                f"WHERE {self.db_identifier(ITEM_MASTER_ID_COLUMN)} = ?",
+                                (incoming, canonical_id),
                             )
                             canonical_row[column] = incoming
-                    for table_name in reference_tables:
-                        cur.execute(
-                            f"UPDATE {self.db_identifier(table_name)} SET {self.db_identifier('item_number')} = ? "
-                            f"WHERE {self.item_exact_sql_expr(self.db_identifier('item_number'))} = {self.item_exact_sql_expr('?')}",
-                            (canonical, alias),
-                        )
+                            merged_fields.append(column)
+                        elif not is_blank(current) and not is_blank(incoming) and not values_equal(current, incoming):
+                            conflict_fields.add(column)
+
+                    if alias_number and self.item_exact_key(alias_number) != self.item_exact_key(canonical_number):
+                        for table_name in reference_tables:
+                            cur.execute(
+                                f"UPDATE {self.db_identifier(table_name)} "
+                                f"SET {self.db_identifier('item_number')} = ? "
+                                f"WHERE {self.item_exact_sql_expr(self.db_identifier('item_number'))} = "
+                                f"{self.item_exact_sql_expr('?')}",
+                                (canonical_number, alias_number),
+                            )
+                            try:
+                                if cur.rowcount and cur.rowcount > 0:
+                                    references_updated += int(cur.rowcount)
+                            except Exception:
+                                pass
+
                     cur.execute(
-                        f"DELETE FROM items WHERE {self.item_exact_sql_expr('item_number')} = {self.item_exact_sql_expr('?')}",
-                        (alias,),
+                        f"DELETE FROM dbo.items WHERE {self.db_identifier(ITEM_MASTER_ID_COLUMN)} = ?",
+                        (alias_id,),
                     )
+                    if cur.rowcount != 1:
+                        raise RuntimeError(
+                            f"Expected to delete item-master row ID {alias_id}, but SQL Server reported {cur.rowcount}."
+                        )
+                    deleted_rows += 1
+
+                remaining_row = self.db_one(
+                    f"SELECT COUNT(*) AS row_count FROM dbo.items "
+                    f"WHERE {self.item_clean_sql_expr('item_number')} = ?",
+                    (self.item_clean_key(canonical_number),),
+                )
+                remaining_count = int(remaining_row["row_count"] if remaining_row else 0)
+                if remaining_count != 1:
+                    raise RuntimeError(
+                        f"Merge verification failed: expected one canonical item row, found {remaining_count}."
+                    )
+
                 self.db_conn.commit()
             except Exception as exc:
                 try:
@@ -17539,13 +17815,36 @@ class MainWindow(QMainWindow):
                     pass
                 QMessageBox.critical(dialog, "Merge failed", str(exc))
                 return
+
+            merge_result.update({
+                "canonical_number": canonical_number,
+                "deleted_rows": deleted_rows,
+                "references_updated": references_updated,
+                "merged_fields": sorted(set(merged_fields), key=str.casefold),
+                "conflict_fields": sorted(conflict_fields, key=str.casefold),
+            })
             dialog.accept()
 
         buttons.accepted.connect(save)
         if dialog.exec() == QDialog.Accepted:
             self.load_reference_lists()
             self.setup_item_autocomplete()
-            self._data_quality_mark_issue_fixed(issue, "Duplicate item records merged.")
+            self.setup_supplier_autocomplete()
+
+            merged_fields = merge_result.get("merged_fields") or []
+            conflicts = merge_result.get("conflict_fields") or []
+            summary_lines = [
+                f"Canonical item: {merge_result.get('canonical_number', '')}",
+                f"Duplicate rows deleted: {merge_result.get('deleted_rows', 0)}",
+                f"Historical references updated: {merge_result.get('references_updated', 0)}",
+                "Fields copied into blanks: " + (", ".join(merged_fields) if merged_fields else "none"),
+            ]
+            if conflicts:
+                summary_lines.append(
+                    "Conflicting nonblank fields kept from the selected canonical row: " + ", ".join(conflicts)
+                )
+            QMessageBox.information(self, "Duplicate item merge complete", "\n".join(summary_lines))
+            self._data_quality_mark_issue_fixed(issue, "Duplicate item records merged and verified.")
 
     def _data_quality_fix_blank_item_number(self, issue):
         row = self.row_to_dict(self.db_one(
@@ -17798,6 +18097,7 @@ class MainWindow(QMainWindow):
             "Orders - Item Purchases": Path("Orders") / "Purchases",
             "Cover Orders": Path("Cover Orders"),
             "Item Costs": Path("Item Costs"),
+            "Item Master": Path("Item Master"),
             "Processed": Path("Processed"),
             "Failed": Path("Failed"),
         }
@@ -17817,7 +18117,8 @@ class MainWindow(QMainWindow):
                 "Orders\\ToDo\\         Orders To Be Received report\n"
                 "Orders\\Purchases\\    Item Purchases export\n"
                 "Cover Orders\\         Sales Orders export containing COVER ORDER rows\n"
-                "Item Costs\\           Item Number / Price / Date / Description export\n\n"
+                "Item Costs\\           Item Number / Price / Date / Description export\n"
+                "Item Master\\          Complete MYOB Items export (for example ITEMWHOLE.TXT)\n\n"
                 "Successful imports can be moved to Processed automatically.\n",
                 encoding="utf-8",
             )
@@ -17854,6 +18155,8 @@ class MainWindow(QMainWindow):
             return ""
         if "cover orders" in joined or "cover order" in name:
             return "cover_orders"
+        if "item master" in joined or name.startswith("itemwhole") or "item whole" in name:
+            return "item_master"
         if "item costs" in joined or "item cost" in name or name.startswith("itempur"):
             return "item_costs"
         if "orders/to do" in joined or "orders/todo" in joined or "to do" in name or "todo" in name or "tdlord" in name:
@@ -17962,7 +18265,7 @@ class MainWindow(QMainWindow):
         return {
             "sales": "Sales", "stock": "Stock", "orders_todo": "Orders - To Do",
             "orders_purchase": "Orders - Purchases", "cover_orders": "Cover Orders",
-            "item_costs": "Item Costs"
+            "item_costs": "Item Costs", "item_master": "Item Master"
         }.get(kind, kind)
 
     def populate_watched_import_table(self):
@@ -18039,7 +18342,7 @@ class MainWindow(QMainWindow):
         for candidate in sorted([row for row in ready if row.get("kind") == "item_costs"], key=lambda row: row.get("modified") or datetime.min):
             groups.append(("item_costs", [candidate]))
         # These imports represent snapshots/replacements, so use only the newest file.
-        for kind in ("sales", "stock", "cover_orders"):
+        for kind in ("item_master", "sales", "stock", "cover_orders"):
             candidate = self.newest_watched_candidate(ready, kind)
             if candidate:
                 groups.append((kind, [candidate]))
@@ -18056,7 +18359,7 @@ class MainWindow(QMainWindow):
             for _kind, candidates in groups
             for candidate in candidates
         }
-        snapshot_kinds = {"sales", "stock", "cover_orders", "orders_todo", "orders_purchase"}
+        snapshot_kinds = {"item_master", "sales", "stock", "cover_orders", "orders_todo", "orders_purchase"}
         for candidate in ready:
             fingerprint = str(candidate.get("fingerprint") or "")
             if candidate.get("kind") in snapshot_kinds and fingerprint not in selected_fingerprints:
@@ -18122,7 +18425,14 @@ class MainWindow(QMainWindow):
             if all(str(history.get(str(candidate.get("fingerprint") or ""), {}).get("status") or "") == "Imported" for candidate in candidates):
                 return True, "Already imported by another user."
             paths = [str(candidate.get("path")) for candidate in candidates]
-            if kind == "sales":
+            if kind == "item_master":
+                result = self.import_item_master_file(paths[0], progress=None)
+                message = (
+                    f"{result.get('inserted_count', 0):,} added, "
+                    f"{result.get('text_updated_count', 0):,} text field(s) filled"
+                )
+                self._update_watched_import_meta("item_master", candidates[0], message, result=result)
+            elif kind == "sales":
                 count = self.import_sales_file(paths[0], progress=None)
                 message = f"{count:,} new sales row(s)"
                 self._update_watched_import_meta("sales", candidates[0], message)
@@ -18136,7 +18446,11 @@ class MainWindow(QMainWindow):
                 self._update_watched_import_meta("cover_orders", candidates[0], message)
             elif kind == "item_costs":
                 result = self.import_yu_cost_file(paths[0], progress=None, force_all_costs=False)
-                message = f"{result.get('updated_count', 0):,} cost(s), {result.get('description_updated_count', 0):,} description(s)"
+                message = (
+                    f"{result.get('updated_count', 0):,} cost(s), "
+                    f"{result.get('description_updated_count', 0):,} description(s), "
+                    f"{result.get('supplier_updated_count', 0):,} supplier(s)"
+                )
                 self._update_watched_import_meta("item_costs", candidates[0], message, result=result)
             elif kind == "orders":
                 todo = next(candidate for candidate in candidates if candidate.get("kind") == "orders_todo")
@@ -18176,7 +18490,13 @@ class MainWindow(QMainWindow):
         now_text = datetime.now().strftime("%d/%m/%Y %H:%M")
         now_iso = datetime.now().isoformat(timespec="seconds")
         file_name = candidate.get("path").name
-        if kind == "sales":
+        if kind == "item_master":
+            display = f"Last import: {now_text}\nFile: {file_name}\n{message}"
+            self.set_meta_value("item_master_last_import_display", display)
+            self.set_meta_value("item_master_last_import_iso", now_iso)
+            if getattr(self.ui, "lastUpdateItemMaster_textBrowser", None):
+                self.ui.lastUpdateItemMaster_textBrowser.setPlainText(display)
+        elif kind == "sales":
             display = f"Last import: {now_text}\nFile: {file_name}\n{message}"
             self.set_meta_value("sales_last_import_display", display)
             self.set_meta_value("sales_last_import_iso", now_iso)
@@ -22676,7 +22996,7 @@ class MainWindow(QMainWindow):
         return (invoice_no, customer_name, item_number, quantity_value, cover_date, journal_memo)
 
     def import_yu_costs_from_dialog(self):
-        if not self.show_import_instructions_dialog("yu_costs", "Item cost and description import instructions"):
+        if not self.show_import_instructions_dialog("yu_costs", "Item cost, description and supplier import instructions"):
             return
 
         force_all_costs = bool(
@@ -22705,7 +23025,8 @@ class MainWindow(QMainWindow):
                 "For every matching item, the newest positive cost in the selected file will overwrite "
                 "the stored cost even when the database currently has a newer date.\n\n"
                 "Use this only with a full and current MYOB purchase-history export. Missing descriptions "
-                "will still be filled only when the Widget description is blank.\n\n"
+                "will still be filled only when the Widget description is blank. When Co./Last Name is present, "
+                "the newest supplier in the file will also replace the stored item supplier.\n\n"
                 "Continue?",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
@@ -22716,7 +23037,7 @@ class MainWindow(QMainWindow):
         progress_text = (
             "Rebuilding all matching item costs..."
             if force_all_costs
-            else "Importing item costs and descriptions..."
+            else "Importing item costs, descriptions and suppliers..."
         )
         progress = self.create_import_progress_dialog(progress_text, file_path)
         try:
@@ -22728,7 +23049,7 @@ class MainWindow(QMainWindow):
             self.update_import_progress(progress, 94, "Refreshing item displays...")
         except Exception as exc:
             self.close_import_progress(progress)
-            QMessageBox.critical(self, "Item import failed", f"Could not import item costs and descriptions.\n\n{exc}")
+            QMessageBox.critical(self, "Item import failed", f"Could not import item costs, descriptions and suppliers.\n\n{exc}")
             return
 
         source_date = result.get("source_max_date")
@@ -22741,6 +23062,7 @@ class MainWindow(QMainWindow):
             f"Export through: {source_date_text}\n"
             f"Item costs updated: {result.get('updated_count', 0):,}\n"
             f"Descriptions added: {result.get('description_updated_count', 0):,}\n"
+            f"Suppliers updated: {result.get('supplier_updated_count', 0):,}\n"
             f"Already current: {result.get('unchanged_count', 0):,}\n"
             f"Older rows skipped: {result.get('older_count', 0):,}\n"
             f"YU costs mirrored: {result.get('yu_updated_count', 0):,}\n"
@@ -22754,6 +23076,7 @@ class MainWindow(QMainWindow):
         if status is not None:
             status.setPlainText(display_text)
 
+        self.load_reference_lists()
         self.rerun_item_if_ready()
         self.rerun_order_analysis_if_ready()
         self.refresh_dashboard()
@@ -22766,10 +23089,11 @@ class MainWindow(QMainWindow):
         parser_stats = result.get("parser_stats", {})
         QMessageBox.information(
             self,
-            "Item costs and descriptions imported",
+            "Item costs, descriptions and suppliers imported",
             f"Mode: {import_mode_text}\n"
             f"Updated {result.get('updated_count', 0):,} item cost(s).\n"
-            f"Added {result.get('description_updated_count', 0):,} missing description(s).\n\n"
+            f"Added {result.get('description_updated_count', 0):,} missing description(s).\n"
+            f"Updated {result.get('supplier_updated_count', 0):,} last-purchased supplier(s).\n\n"
             f"Export through: {source_date_text}\n"
             f"Matched items in file: {result.get('matched_item_count', 0):,}\n"
             f"Already current: {result.get('unchanged_count', 0):,}\n"
@@ -22781,6 +23105,10 @@ class MainWindow(QMainWindow):
             f"MYOB control/backslash rows ignored: {parser_stats.get('backslash_rows', 0):,}\n"
             f"Zero/negative costs ignored: {parser_stats.get('zero_or_negative_rows', 0):,}.\n"
             f"Description column present: {'Yes' if parser_stats.get('source_has_description') else 'No'}\n"
+            f"Supplier column present: {'Yes' if parser_stats.get('source_has_supplier') else 'No'}\n"
+            f"Supplier already current: {result.get('supplier_unchanged_count', 0):,}\n"
+            f"Older supplier rows protected: {result.get('supplier_older_count', 0):,}\n"
+            f"Matched items without source supplier: {result.get('supplier_unavailable_count', 0):,}\n"
             f"Matched items still missing a source description: {result.get('description_unavailable_count', 0):,}."
         )
 
@@ -22814,7 +23142,7 @@ class MainWindow(QMainWindow):
         return None, "unknown"
 
     def import_yu_cost_file(self, file_path, progress=None, force_all_costs=False):
-        """Import latest positive purchase costs and fill missing descriptions.
+        """Import latest positive purchase costs, missing descriptions, and suppliers.
 
         The legacy method name is retained so existing button wiring and patches
         continue to work. Generic fields are updated for all items. YU-specific
@@ -22836,6 +23164,7 @@ class MainWindow(QMainWindow):
         self.update_import_progress(progress, 35, "Matching purchase rows to the item master...")
         exact_candidates, clean_candidates = self._build_yu_cost_item_lookup()
         supplier_columns = self.get_items_supplier_column_names()
+        supplier_column = supplier_columns[0] if supplier_columns else None
         item_columns = {str(name).lower(): name for name in self.get_table_columns("items")}
         description_columns = []
         for candidate in ("item_name", "description"):
@@ -22958,6 +23287,81 @@ class MainWindow(QMainWindow):
         elif source_has_description:
             description_unavailable_count = len(latest_by_item)
 
+        supplier_updated_count = 0
+        supplier_unchanged_count = 0
+        supplier_older_count = 0
+        supplier_unavailable_count = 0
+        supplier_target_missing = bool(source_has_supplier and not supplier_column)
+        suppliers_to_register = set()
+
+        if source_has_supplier and supplier_column:
+            self.update_import_progress(progress, 83, "Updating last purchased suppliers...")
+            supplier_updates = []
+            for item_number, (_candidate_key, record, item_row) in latest_by_item.items():
+                source_supplier = str(record.get("supplier_name") or "").strip()
+                if not source_supplier:
+                    supplier_unavailable_count += 1
+                    continue
+
+                incoming_date = record["source_date"]
+                stored_date = self.parse_date_value(item_row.get(ITEM_COST_DATE_COLUMN))
+                if not force_all_costs and stored_date is not None and stored_date > incoming_date:
+                    supplier_older_count += 1
+                    continue
+
+                suppliers_to_register.add(source_supplier)
+                current_supplier = next(
+                    (
+                        str(item_row.get(column_name) or "").strip()
+                        for column_name in supplier_columns
+                        if str(item_row.get(column_name) or "").strip()
+                    ),
+                    "",
+                )
+                if current_supplier.casefold() == source_supplier.casefold():
+                    supplier_unchanged_count += 1
+                    continue
+
+                supplier_updates.append((source_supplier, item_number))
+
+            if supplier_updates:
+                cur.executemany(
+                    f"UPDATE items SET {self.db_identifier(supplier_column)} = ? WHERE item_number = ?",
+                    supplier_updates,
+                )
+                supplier_updated_count = len(supplier_updates)
+
+            if suppliers_to_register and self.has_table("supplier_master"):
+                for supplier_name in sorted(suppliers_to_register, key=str.casefold):
+                    if self.db_engine == "sqlserver":
+                        cur.execute(
+                            """
+                            IF NOT EXISTS (
+                                SELECT 1
+                                FROM supplier_master
+                                WHERE UPPER(LTRIM(RTRIM(COALESCE(supplier_name, '')))) =
+                                      UPPER(LTRIM(RTRIM(?)))
+                            )
+                                INSERT INTO supplier_master (supplier_name) VALUES (?);
+                            """,
+                            (supplier_name, supplier_name),
+                        )
+                    else:
+                        cur.execute(
+                            "SELECT 1 FROM supplier_master "
+                            "WHERE UPPER(TRIM(COALESCE(supplier_name, ''))) = UPPER(TRIM(?)) LIMIT 1",
+                            (supplier_name,),
+                        )
+                        if cur.fetchone() is None:
+                            cur.execute(
+                                "INSERT INTO supplier_master (supplier_name) VALUES (?)",
+                                (supplier_name,),
+                            )
+        elif source_has_supplier:
+            supplier_unavailable_count = len(latest_by_item)
+        else:
+            supplier_unavailable_count = 0
+
         yu_updates = []
         yu_unchanged_count = 0
         yu_older_count = 0
@@ -22989,7 +23393,7 @@ class MainWindow(QMainWindow):
             )
         self.db_conn.commit()
 
-        self.update_import_progress(progress, 90, "Item cost and description import complete.")
+        self.update_import_progress(progress, 90, "Item cost, description and supplier import complete.")
         return {
             "updated_count": len(updates),
             "unchanged_count": unchanged_count,
@@ -23000,12 +23404,388 @@ class MainWindow(QMainWindow):
             "description_updated_count": description_updated_count,
             "description_unavailable_count": description_unavailable_count,
             "description_source_has_column": source_has_description,
+            "supplier_updated_count": supplier_updated_count,
+            "supplier_unchanged_count": supplier_unchanged_count,
+            "supplier_older_count": supplier_older_count,
+            "supplier_unavailable_count": supplier_unavailable_count,
+            "supplier_source_has_column": source_has_supplier,
+            "supplier_target_missing": supplier_target_missing,
             "yu_updated_count": len(yu_updates),
             "yu_unchanged_count": yu_unchanged_count,
             "yu_older_count": yu_older_count,
             "source_max_date": parsed["source_max_date"],
             "parser_stats": parser_stats,
             "force_all_costs": bool(force_all_costs),
+        }
+
+    def import_item_master_from_dialog(self):
+        if not self.show_import_instructions_dialog(
+            "item_master",
+            "Item master import instructions",
+        ):
+            return
+
+        filters = (
+            "MYOB item files (*.txt *.csv *.xlsx *.xlsm);;"
+            "Text files (*.txt *.csv);;Excel files (*.xlsx *.xlsm);;All files (*.*)"
+        )
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choose MYOB item master export",
+            str(self.base_dir),
+            filters,
+        )
+        if not file_path:
+            return
+
+        progress = self.create_import_progress_dialog("Updating item master...", file_path)
+        try:
+            result = self.import_item_master_file(file_path, progress=progress)
+            self.update_import_progress(progress, 94, "Refreshing item lists...")
+            self.load_reference_lists()
+            self.refresh_dashboard()
+            self.rerun_item_if_ready()
+            self.rerun_order_analysis_if_ready()
+        except Exception as exc:
+            self.close_import_progress(progress)
+            QMessageBox.critical(
+                self,
+                "Item master import failed",
+                f"Could not import the MYOB item master.\n\n{exc}",
+            )
+            return
+
+        display_text = (
+            f"Last import: {datetime.now().strftime('%d/%m/%Y %H:%M')}\n"
+            f"File: {Path(file_path).name}\n"
+            f"New items added: {result.get('inserted_count', 0):,}\n"
+            f"Existing items matched: {result.get('matched_count', 0):,}\n"
+            f"Names/descriptions filled: {result.get('text_updated_count', 0):,}\n"
+            f"Standard costs refreshed: {result.get('standard_cost_updated_count', 0):,}\n"
+            f"Ambiguous groups skipped: {result.get('ambiguous_count', 0):,}"
+        )
+        self.set_meta_value("item_master_last_import_display", display_text)
+        self.set_meta_value("item_master_last_import_iso", datetime.now().isoformat(timespec="seconds"))
+        status = getattr(self.ui, "lastUpdateItemMaster_textBrowser", None)
+        if status is not None:
+            status.setPlainText(display_text)
+
+        self.close_import_progress(progress)
+        QMessageBox.information(
+            self,
+            "Item master updated",
+            f"Source item rows: {result.get('source_item_count', 0):,}\n"
+            f"New item records added: {result.get('inserted_count', 0):,}\n"
+            f"Existing item records matched: {result.get('matched_count', 0):,}\n"
+            f"Blank names/descriptions filled: {result.get('text_updated_count', 0):,}\n"
+            f"Standard costs refreshed: {result.get('standard_cost_updated_count', 0):,}\n\n"
+            f"Backslash/control rows skipped: {result.get('control_row_count', 0):,}\n"
+            f"Equivalent source duplicates collapsed: {result.get('source_duplicate_count', 0):,}\n"
+            f"Conflicting source/database groups skipped: {result.get('ambiguous_count', 0):,}\n\n"
+            "Item-number matching ignored spaces, tabs, non-breaking spaces, and case. "
+            "Existing Widget item numbers were retained. Supplier data was not changed because "
+            "the MYOB item export does not contain a supplier field.",
+        )
+
+    def _item_master_text_compare_key(self, value):
+        return " ".join(str(value or "").split()).casefold()
+
+    def _item_master_cost_value(self, value):
+        text = str(value or "").strip()
+        if not text:
+            return None
+        text = text.replace("$", "").replace(",", "").strip()
+        try:
+            return Decimal(text)
+        except (InvalidOperation, ValueError):
+            return None
+
+    def _item_master_source_rows(self, file_path):
+        path = Path(file_path)
+        suffix = path.suffix.lower()
+        raw_rows = []
+
+        if suffix in {".txt", ".csv"}:
+            encodings = ("utf-8-sig", "cp1252", "latin-1")
+            last_error = None
+            for encoding in encodings:
+                try:
+                    with path.open("r", encoding=encoding, newline="") as handle:
+                        all_rows = list(csv.reader(handle))
+                    raw_rows = all_rows
+                    break
+                except UnicodeDecodeError as exc:
+                    last_error = exc
+            if not raw_rows and last_error is not None:
+                raise ValueError(f"Could not decode the text file: {last_error}")
+        elif suffix in {".xlsx", ".xlsm"}:
+            if load_workbook is None:
+                raise ValueError("Excel import is unavailable because openpyxl is not installed.")
+            workbook = load_workbook(filename=str(path), read_only=True, data_only=True)
+            try:
+                sheet = workbook.active
+                raw_rows = [list(row) for row in sheet.iter_rows(values_only=True)]
+            finally:
+                workbook.close()
+        else:
+            raise ValueError("Unsupported file type. Choose TXT, CSV, XLSX, or XLSM.")
+
+        if not raw_rows:
+            raise ValueError("The selected item file is empty.")
+
+        header_index = None
+        headers = None
+        column_map = None
+        aliases = {
+            "item_number": {"itemnumber", "itemno", "item"},
+            "item_name": {"itemname", "name"},
+            "description": {"description", "itemdescription"},
+            "standard_cost": {"standardcost"},
+        }
+        for index, values in enumerate(raw_rows[:40]):
+            candidate_headers = ["" if value is None else str(value) for value in values]
+            normalized = {self.normalize_header(value): position for position, value in enumerate(candidate_headers)}
+            if any(key in normalized for key in aliases["item_number"]) and any(
+                key in normalized for key in aliases["item_name"]
+            ):
+                resolved = {}
+                for field_name, options in aliases.items():
+                    position = next((normalized[key] for key in options if key in normalized), None)
+                    if position is not None:
+                        resolved[field_name] = position
+                header_index = index
+                headers = candidate_headers
+                column_map = resolved
+                break
+
+        if header_index is None or column_map is None:
+            raise ValueError("Could not find Item Number and Item Name headings in the selected file.")
+
+        records = []
+        control_rows = 0
+        blank_rows = 0
+        for line_number, values in enumerate(raw_rows[header_index + 1:], start=header_index + 2):
+            def field(name):
+                position = column_map.get(name)
+                if position is None or position >= len(values):
+                    return ""
+                return "" if values[position] is None else str(values[position])
+
+            raw_item_number = field("item_number").strip()
+            if not raw_item_number:
+                blank_rows += 1
+                continue
+            if raw_item_number.startswith("\\"):
+                control_rows += 1
+                continue
+
+            item_name = field("item_name").strip()
+            description = field("description").strip()
+            standard_cost_text = field("standard_cost").strip()
+            standard_cost = self._item_master_cost_value(standard_cost_text)
+            clean_key = self.item_clean_key(raw_item_number)
+            if not clean_key:
+                blank_rows += 1
+                continue
+
+            records.append({
+                "line_number": line_number,
+                "raw_item_number": raw_item_number,
+                "clean_key": clean_key,
+                "item_name": item_name,
+                "description": description,
+                "standard_cost": standard_cost,
+                "standard_cost_present": bool(standard_cost_text),
+            })
+
+        if not records:
+            raise ValueError("The selected file did not contain any normal item rows.")
+
+        return {
+            "records": records,
+            "control_rows": control_rows,
+            "blank_rows": blank_rows,
+        }
+
+    def _collapse_item_master_source_rows(self, records):
+        grouped = {}
+        for record in records:
+            grouped.setdefault(record["clean_key"], []).append(record)
+
+        collapsed = []
+        equivalent_duplicates = 0
+        conflicts = {}
+        for clean_key, group in grouped.items():
+            if len(group) == 1:
+                collapsed.append(group[0])
+                continue
+
+            signatures = {
+                (
+                    self._item_master_text_compare_key(row.get("item_name")),
+                    self._item_master_text_compare_key(row.get("description")),
+                    str(row.get("standard_cost")) if row.get("standard_cost_present") else "",
+                )
+                for row in group
+            }
+            if len(signatures) == 1:
+                chosen = sorted(
+                    group,
+                    key=lambda row: (
+                        " " in str(row.get("raw_item_number") or ""),
+                        len(str(row.get("raw_item_number") or "")),
+                        int(row.get("line_number") or 0),
+                    ),
+                )[0]
+                collapsed.append(chosen)
+                equivalent_duplicates += len(group) - 1
+            else:
+                conflicts[clean_key] = group
+
+        return collapsed, equivalent_duplicates, conflicts
+
+    def import_item_master_file(self, file_path, progress=None):
+        self.update_import_progress(progress, 5, "Preparing item-master fields...")
+        self.ensure_item_master_import_columns()
+        self.ensure_item_master_identity_column()
+
+        self.update_import_progress(progress, 12, "Reading MYOB item list...")
+        parsed = self._item_master_source_rows(file_path)
+        source_records, source_duplicate_count, source_conflicts = self._collapse_item_master_source_rows(
+            parsed["records"]
+        )
+
+        self.update_import_progress(progress, 30, "Indexing the current Widget item master...")
+        item_columns = {str(name).lower(): name for name in self.get_table_columns("items")}
+        item_number_column = item_columns.get("item_number")
+        if not item_number_column:
+            raise ValueError("The items table has no item_number column.")
+        item_name_column = item_columns.get("item_name")
+        description_column = item_columns.get("description")
+        standard_cost_column = item_columns.get(ITEM_STANDARD_COST_COLUMN.lower())
+
+        existing_rows = [self.row_to_dict(row) for row in self.db_all("SELECT * FROM items")]
+        existing_by_clean = {}
+        for row in existing_rows:
+            raw_item = str(row.get(item_number_column) or "").strip()
+            if not raw_item:
+                continue
+            existing_by_clean.setdefault(self.item_clean_key(raw_item), []).append(row)
+
+        inserted_count = 0
+        matched_count = 0
+        text_updated_count = 0
+        standard_cost_updated_count = 0
+        ambiguous_count = len(source_conflicts)
+        cur = self.db_conn.cursor()
+        total = max(1, len(source_records))
+
+        self.update_import_progress(progress, 42, f"Applying {len(source_records):,} item-master rows...")
+        for index, record in enumerate(source_records, start=1):
+            if index == 1 or index % 100 == 0 or index == total:
+                self.update_import_progress(
+                    progress,
+                    42 + int((index / total) * 43),
+                    f"Updating item master... {index:,}/{total:,}",
+                )
+
+            clean_key = record["clean_key"]
+            matches = existing_by_clean.get(clean_key, [])
+            if len(matches) > 1:
+                ambiguous_count += 1
+                continue
+
+            source_name = str(record.get("item_name") or "").strip()
+            source_description = str(record.get("description") or "").strip()
+            fallback_description = source_description or source_name
+            standard_cost = record.get("standard_cost")
+            standard_cost_present = bool(record.get("standard_cost_present"))
+
+            if not matches:
+                stored_item_number = self.canonicalize_import_item_number(record["raw_item_number"])
+                insert_columns = [item_number_column]
+                insert_values = [stored_item_number]
+                if item_name_column and source_name:
+                    insert_columns.append(item_name_column)
+                    insert_values.append(source_name)
+                if description_column and fallback_description:
+                    insert_columns.append(description_column)
+                    insert_values.append(fallback_description)
+                if standard_cost_column and standard_cost_present and standard_cost is not None:
+                    insert_columns.append(standard_cost_column)
+                    insert_values.append(float(standard_cost))
+
+                column_sql = ", ".join(self.db_identifier(column) for column in insert_columns)
+                placeholders = ", ".join("?" for _ in insert_values)
+                cur.execute(
+                    f"INSERT INTO items ({column_sql}) VALUES ({placeholders})",
+                    insert_values,
+                )
+                inserted_count += 1
+                new_row = {item_number_column: stored_item_number}
+                if item_name_column:
+                    new_row[item_name_column] = source_name
+                if description_column:
+                    new_row[description_column] = fallback_description
+                if standard_cost_column and standard_cost_present:
+                    new_row[standard_cost_column] = float(standard_cost or 0)
+                existing_by_clean[clean_key] = [new_row]
+                continue
+
+            matched_count += 1
+            existing = matches[0]
+            assignments = []
+            values = []
+            filled_text = False
+
+            if item_name_column and source_name and not str(existing.get(item_name_column) or "").strip():
+                assignments.append(f"{self.db_identifier(item_name_column)} = ?")
+                values.append(source_name)
+                filled_text = True
+            if (
+                description_column
+                and fallback_description
+                and not str(existing.get(description_column) or "").strip()
+            ):
+                assignments.append(f"{self.db_identifier(description_column)} = ?")
+                values.append(fallback_description)
+                filled_text = True
+            if standard_cost_column and standard_cost_present and standard_cost is not None:
+                current_cost = self._item_master_cost_value(existing.get(standard_cost_column))
+                if current_cost != standard_cost:
+                    assignments.append(f"{self.db_identifier(standard_cost_column)} = ?")
+                    values.append(float(standard_cost))
+                    standard_cost_updated_count += 1
+
+            if assignments:
+                master_id_column = item_columns.get(ITEM_MASTER_ID_COLUMN.lower())
+                if master_id_column and existing.get(master_id_column) is not None:
+                    where_sql = f"{self.db_identifier(master_id_column)} = ?"
+                    values.append(existing.get(master_id_column))
+                else:
+                    where_sql = f"{self.db_identifier(item_number_column)} = ?"
+                    values.append(existing.get(item_number_column))
+                cur.execute(
+                    f"UPDATE items SET {', '.join(assignments)} WHERE {where_sql}",
+                    values,
+                )
+                if filled_text:
+                    text_updated_count += 1
+
+        self.update_import_progress(progress, 88, "Committing item-master changes...")
+        self.db_conn.commit()
+        self.update_import_progress(progress, 92, "Item master import complete.")
+        return {
+            "source_item_count": len(parsed["records"]),
+            "inserted_count": inserted_count,
+            "matched_count": matched_count,
+            "text_updated_count": text_updated_count,
+            "standard_cost_updated_count": standard_cost_updated_count,
+            "control_row_count": parsed["control_rows"],
+            "blank_row_count": parsed["blank_rows"],
+            "source_duplicate_count": source_duplicate_count,
+            "source_conflict_count": len(source_conflicts),
+            "ambiguous_count": ambiguous_count,
         }
 
     def import_stock_from_dialog(self):
