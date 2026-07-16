@@ -17,6 +17,7 @@ except Exception:
     shiboken_is_valid = None
 import os
 import tempfile
+import shutil
 import json
 import subprocess
 import warnings
@@ -82,6 +83,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QColorDialog,
     QProgressDialog,
+    QProgressBar,
     QCheckBox,
     QTableView,
     QFormLayout,
@@ -118,7 +120,7 @@ from yu_order_workflow import YUOrderEntryDialog, load_yu_review_module
 TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
 TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
 TABLE_FORMAT_SETTINGS_PREFIX = "table_format"
-APP_VERSION = "1.5.5"
+APP_VERSION = "1.6.2"
 APP_DESIGNER = "Bradley Mayze"
 YU_SUPPLIER_DISPLAY_NAME = "Yuchang Textile Factory"
 # Generic latest purchase-cost fields. These apply to every item in the item master.
@@ -1803,6 +1805,9 @@ class SQLServerBackend:
 
     def commit(self):
         self._connection.commit()
+
+    def rollback(self):
+        self._connection.rollback()
 
     def close(self):
         self._connection.close()
@@ -5326,7 +5331,7 @@ class Ui_MainWindow(object):
         self.verticalLayout_4 = QVBoxLayout(self.frame_7)
         self.verticalLayout_4.setObjectName("verticalLayout_4")
         self.verticalLayout_4.setContentsMargins(0, 0, 0, 0)
-        self.verticalLayout_4.setSpacing(8)
+        self.verticalLayout_4.setSpacing(6)
         self.verticalLayout_28.addWidget(self.frame_7)
 
         self.homeGuide_button = self._nav_button("Home / Guide", "homeGuide_button")
@@ -5338,6 +5343,7 @@ class Ui_MainWindow(object):
         self.orderAnalasys_button = self._nav_button("Order Analysis", "orderAnalasys_button")
         self.leftShipments_button = self._nav_button("Shipments", "leftShipments_button")
         self.sabaReview_button = self._nav_button("SABA Review", "sabaReview_button")
+        self.dataQuality_button = self._nav_button("Data Quality", "dataQuality_button")
         self.updateData_button = self._nav_button("Update Data", "updateData_button")
 
         self.verticalLayout_28.addStretch(1)
@@ -5368,7 +5374,7 @@ class Ui_MainWindow(object):
     def _nav_button(self, text, object_name):
         button = QPushButton(text, self.frame_7)
         button.setObjectName(object_name)
-        button.setMinimumHeight(46)
+        button.setMinimumHeight(42)
         button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.verticalLayout_4.addWidget(button)
         return button
@@ -5388,6 +5394,7 @@ class Ui_MainWindow(object):
         self._build_order_analysis_page()
         self._build_shipments_page()
         self._build_saba_review_page()
+        self._build_data_quality_page()
         self._build_update_data_page()
 
     # ------------------------------------------------------------------
@@ -5821,7 +5828,7 @@ class Ui_MainWindow(object):
         quality_layout = QVBoxLayout(quality_frame)
         quality_layout.setContentsMargins(12, 12, 12, 12)
         quality_layout.setSpacing(8)
-        quality_layout.addLayout(section_header(quality_frame, "Data quality / workflow checks", "Open Update Data", "dashboardOpenUpdateDataQuality_button"))
+        quality_layout.addLayout(section_header(quality_frame, "Data quality / workflow checks", "Open Data Quality", "dashboardOpenUpdateDataQuality_button"))
 
         quality_grid = QGridLayout()
         quality_grid.setContentsMargins(0, 0, 0, 0)
@@ -5919,6 +5926,12 @@ class Ui_MainWindow(object):
         add_guide_tab("Order Analysis", self._order_analysis_guide_html(), "orderAnalysisGuide_textBrowser")
         add_guide_tab("Shipments", self._shipments_guide_html(), "shipmentsGuide_textBrowser")
         add_guide_tab("SABA Review", self._saba_review_guide_html(), "sabaReviewGuide_textBrowser")
+        add_guide_tab("Data Quality", self._guide_page_html(
+            "Data Quality Centre",
+            "Scan the Widget database and current YU template for records that need correction.",
+            ["Press Refresh Checks when you want to scan; opening the page no longer starts one automatically.", "Use Cancel Scan to stop a long check.", "Double-click Suggested action or press Fix Selected to repair supported issues.", "Double-click another column to open Item Summary."],
+            ["Missing item-master rows can still have sales history.", "Critical duplicate item numbers should be resolved before importing or exporting orders."],
+        ), "dataQualityGuide_textBrowser")
         add_guide_tab("Update Data", self._update_data_guide_html(), "updateDataGuide_textBrowser")
 
         layout.addWidget(self.homeGuide_tabs, 1)
@@ -6088,6 +6101,7 @@ class Ui_MainWindow(object):
             [
                 "Choose the import section that matches the file you are updating.",
                 "Check the instructions tab on the right before importing.",
+                "Use the Watched Folder tab to queue or automatically import recognised exports from standard subfolders.",
                 "For sales imports, use MYOB AccountRight Import/Export Assistant data.",
                 "Use <b>Update Cover Orders</b> for cover order exports with Invoice No., Co./Last Name, Item Number, Quantity, Date, and Journal Memo.",
                 "Use <b>Update Costs & Descriptions</b> for MYOB Item Purchases exports containing Item Number, Description, Price, and Date.",
@@ -7336,6 +7350,98 @@ class Ui_MainWindow(object):
         saba_table_layout.addWidget(self.sabaSales_table, 1)
         layout.addWidget(self.sabaTable_frame, 1)
 
+
+    def _build_data_quality_page(self):
+        self.dataQuality_page, layout = self._page("dataQuality_page", "Data Quality Centre")
+        intro = QLabel(
+            "Find missing item records, descriptions, costs, suppliers, duplicate item numbers, and references that do not match the item master.",
+            self.dataQuality_page,
+        )
+        intro.setProperty("role", "pageSubtitle")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        toolbar, toolbar_layout = self._panel(self.dataQuality_page, "dataQualityToolbar_frame", QHBoxLayout)
+        toolbar.setProperty("role", "toolbarCard")
+        self.dataQualityRefresh_button = QPushButton("Refresh Checks", toolbar)
+        self.dataQualityRefresh_button.setObjectName("dataQualityRefresh_button")
+        self.dataQualityCancel_button = QPushButton("Cancel Scan", toolbar)
+        self.dataQualityCancel_button.setObjectName("dataQualityCancel_button")
+        self.dataQualityCancel_button.setEnabled(False)
+        self.dataQualityCategory_combo = QComboBox(toolbar)
+        self.dataQualityCategory_combo.setObjectName("dataQualityCategory_combo")
+        self.dataQualityCategory_combo.addItems([
+            "All categories", "Item master", "Sales", "Stock", "Orders", "YU template"
+        ])
+        self.dataQualitySeverity_combo = QComboBox(toolbar)
+        self.dataQualitySeverity_combo.setObjectName("dataQualitySeverity_combo")
+        self.dataQualitySeverity_combo.addItems(["All severities", "Critical", "High", "Medium", "Info"])
+        self.dataQualitySearch_edit = QLineEdit(toolbar)
+        self.dataQualitySearch_edit.setObjectName("dataQualitySearch_edit")
+        self.dataQualitySearch_edit.setPlaceholderText("Search item number, issue, or details")
+        self.dataQualityOpenItem_button = QPushButton("Open Item", toolbar)
+        self.dataQualityOpenItem_button.setObjectName("dataQualityOpenItem_button")
+        self.dataQualityFix_button = QPushButton("Fix Selected", toolbar)
+        self.dataQualityFix_button.setObjectName("dataQualityFix_button")
+        self.dataQualityExport_button = QPushButton("Export CSV", toolbar)
+        self.dataQualityExport_button.setObjectName("dataQualityExport_button")
+        toolbar_layout.addWidget(self.dataQualityRefresh_button)
+        toolbar_layout.addWidget(self.dataQualityCancel_button)
+        toolbar_layout.addWidget(self.dataQualityCategory_combo)
+        toolbar_layout.addWidget(self.dataQualitySeverity_combo)
+        toolbar_layout.addWidget(self.dataQualitySearch_edit, 1)
+        toolbar_layout.addWidget(self.dataQualityOpenItem_button)
+        toolbar_layout.addWidget(self.dataQualityFix_button)
+        toolbar_layout.addWidget(self.dataQualityExport_button)
+        layout.addWidget(toolbar)
+
+        self.dataQualityProgress_bar = QProgressBar(self.dataQuality_page)
+        self.dataQualityProgress_bar.setObjectName("dataQualityProgress_bar")
+        self.dataQualityProgress_bar.setRange(0, 100)
+        self.dataQualityProgress_bar.setValue(0)
+        self.dataQualityProgress_bar.setTextVisible(True)
+        self.dataQualityProgress_bar.setFormat("Ready")
+        self.dataQualityProgress_bar.setMinimumHeight(24)
+        layout.addWidget(self.dataQualityProgress_bar)
+
+        summary_row = QHBoxLayout()
+        self.dataQualitySummary_labels = {}
+        for key, title in (("critical", "Critical"), ("high", "High"), ("medium", "Medium"), ("total", "Total issues")):
+            frame, frame_layout = self._panel(self.dataQuality_page, f"dataQuality_{key}_frame", QVBoxLayout)
+            frame.setProperty("role", "metricCard")
+            title_label = QLabel(title, frame)
+            title_label.setProperty("role", "metricTitle")
+            value_label = QLabel("0", frame)
+            value_label.setProperty("role", "metricValue")
+            value_label.setAlignment(Qt.AlignCenter)
+            frame_layout.addWidget(title_label)
+            frame_layout.addWidget(value_label)
+            summary_row.addWidget(frame, 1)
+            self.dataQualitySummary_labels[key] = value_label
+        layout.addLayout(summary_row)
+
+        self.dataQuality_table = self._table_widget(self.dataQuality_page, "dataQuality_table")
+        self.dataQuality_table.setColumnCount(6)
+        self.dataQuality_table.setHorizontalHeaderLabels([
+            "Severity", "Category", "Item / Reference", "Issue", "Details", "Suggested action"
+        ])
+        self.dataQuality_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.dataQuality_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.dataQuality_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.dataQuality_table.verticalHeader().setVisible(False)
+        header = self.dataQuality_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.Stretch)
+        header.setSectionResizeMode(5, QHeaderView.Stretch)
+        layout.addWidget(self.dataQuality_table, 1)
+
+        self.dataQualityStatus_label = QLabel("Press Refresh Checks to scan the current database.", self.dataQuality_page)
+        self.dataQualityStatus_label.setWordWrap(True)
+        layout.addWidget(self.dataQualityStatus_label)
+
     def _build_update_data_page(self):
         self.update_page, layout = self._page("update_page", "Update Data")
         update_row = QHBoxLayout()
@@ -7416,6 +7522,82 @@ class Ui_MainWindow(object):
             else:
                 placeholder.setPlainText(f"{title} import instructions will be added here.")
             self.updateDataInstructions_tabs.addTab(placeholder, title)
+
+        self.watchedImports_page = QWidget(self.updateDataInstructions_tabs)
+        self.watchedImports_page.setObjectName("watchedImports_page")
+        watch_layout = QVBoxLayout(self.watchedImports_page)
+        watch_layout.setContentsMargins(12, 12, 12, 12)
+        watch_layout.setSpacing(10)
+
+        watch_intro = QLabel(
+            "Drop MYOB exports into named subfolders. The Widget detects new files, prevents duplicate imports, and can import them automatically or from this queue.",
+            self.watchedImports_page,
+        )
+        watch_intro.setWordWrap(True)
+        watch_layout.addWidget(watch_intro)
+
+        folder_row = QHBoxLayout()
+        self.watchedImportFolder_label = QLineEdit(self.watchedImports_page)
+        self.watchedImportFolder_label.setObjectName("watchedImportFolder_label")
+        self.watchedImportFolder_label.setReadOnly(True)
+        self.watchedImportFolder_label.setPlaceholderText("No watched folder selected")
+        self.watchedImportChoose_button = QPushButton("Choose Folder", self.watchedImports_page)
+        self.watchedImportChoose_button.setObjectName("watchedImportChoose_button")
+        self.watchedImportOpen_button = QPushButton("Open Folder", self.watchedImports_page)
+        self.watchedImportOpen_button.setObjectName("watchedImportOpen_button")
+        folder_row.addWidget(self.watchedImportFolder_label, 1)
+        folder_row.addWidget(self.watchedImportChoose_button)
+        folder_row.addWidget(self.watchedImportOpen_button)
+        watch_layout.addLayout(folder_row)
+
+        options_row = QHBoxLayout()
+        self.watchedImportEnabled_checkBox = QCheckBox("Enable folder monitoring", self.watchedImports_page)
+        self.watchedImportEnabled_checkBox.setObjectName("watchedImportEnabled_checkBox")
+        self.watchedImportAuto_checkBox = QCheckBox("Auto-import ready files", self.watchedImports_page)
+        self.watchedImportAuto_checkBox.setObjectName("watchedImportAuto_checkBox")
+        self.watchedImportArchive_checkBox = QCheckBox("Move successful files to Processed", self.watchedImports_page)
+        self.watchedImportArchive_checkBox.setObjectName("watchedImportArchive_checkBox")
+        options_row.addWidget(self.watchedImportEnabled_checkBox)
+        options_row.addWidget(self.watchedImportAuto_checkBox)
+        options_row.addWidget(self.watchedImportArchive_checkBox)
+        options_row.addStretch(1)
+        watch_layout.addLayout(options_row)
+
+        action_row = QHBoxLayout()
+        self.watchedImportScan_button = QPushButton("Scan Now", self.watchedImports_page)
+        self.watchedImportScan_button.setObjectName("watchedImportScan_button")
+        self.watchedImportSelected_button = QPushButton("Import Selected", self.watchedImports_page)
+        self.watchedImportSelected_button.setObjectName("watchedImportSelected_button")
+        self.watchedImportAll_button = QPushButton("Import All Ready", self.watchedImports_page)
+        self.watchedImportAll_button.setObjectName("watchedImportAll_button")
+        action_row.addWidget(self.watchedImportScan_button)
+        action_row.addWidget(self.watchedImportSelected_button)
+        action_row.addWidget(self.watchedImportAll_button)
+        action_row.addStretch(1)
+        watch_layout.addLayout(action_row)
+
+        self.watchedImport_table = self._table_widget(self.watchedImports_page, "watchedImport_table")
+        self.watchedImport_table.setColumnCount(6)
+        self.watchedImport_table.setHorizontalHeaderLabels([
+            "Type", "File", "Modified", "Size", "Status", "Details"
+        ])
+        self.watchedImport_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.watchedImport_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.watchedImport_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.watchedImport_table.verticalHeader().setVisible(False)
+        watch_header = self.watchedImport_table.horizontalHeader()
+        watch_header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        watch_header.setSectionResizeMode(1, QHeaderView.Stretch)
+        watch_header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        watch_header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        watch_header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        watch_header.setSectionResizeMode(5, QHeaderView.Stretch)
+        watch_layout.addWidget(self.watchedImport_table, 1)
+
+        self.watchedImportStatus_label = QLabel("Choose a root folder to begin.", self.watchedImports_page)
+        self.watchedImportStatus_label.setWordWrap(True)
+        watch_layout.addWidget(self.watchedImportStatus_label)
+        self.updateDataInstructions_tabs.addTab(self.watchedImports_page, "Watched Folder")
         update_row.addWidget(self.updateDataInstructions_tabs, 1)
 
     # ------------------------------------------------------------------
@@ -7611,6 +7793,14 @@ class MainWindow(QMainWindow):
         self.collaboration_labels = {}
         self.collaboration_loaded_revisions = {}
         self._collaboration_busy = False
+        self.data_quality_issues = []
+        self._data_quality_scan_running = False
+        self._data_quality_cancel_requested = False
+        self._watched_import_rows = []
+        self._watched_fingerprint_cache = {}
+        self._watched_import_busy = False
+        self.watched_import_timer = None
+        self.watched_import_scan_interval_ms = 30000
 
         self.setup_navigation()
         self.add_left_shipments_nav_button()
@@ -7619,6 +7809,7 @@ class MainWindow(QMainWindow):
 
         self.open_database()
         self.ensure_app_meta_table()
+        self.ensure_watched_import_history_table()
         self.ensure_collaboration_tables()
         self.ensure_to_order_lines_table()
         self.ensure_on_order_lines_table()
@@ -7648,6 +7839,8 @@ class MainWindow(QMainWindow):
         self.setup_frozen_column_tables()
         self.setup_customer_summary_layout()
         self.setup_update_page()
+        self.setup_data_quality_centre()
+        self.setup_watched_import_folder()
         self.setup_dashboard()
         self.setup_order_table()
         self.setup_on_order_page()
@@ -8535,6 +8728,7 @@ class MainWindow(QMainWindow):
             ("orderAnalasys_button", "orderAnalysy_page"),
             ("leftShipments_button", "shipments_page"),
             ("sabaReview_button", "sabaReview_page"),
+            ("dataQuality_button", "dataQuality_page"),
             ("updateData_button", "update_page"),
         ]
 
@@ -8673,9 +8867,21 @@ class MainWindow(QMainWindow):
         to_order_page = getattr(self.ui, "toOrderSheet_page", None)
         build_container_page = getattr(self.ui, "buildContainer_page", None)
         shipments_page = getattr(self.ui, "shipments_page", None)
+        data_quality_page = getattr(self.ui, "dataQuality_page", None)
+
+        if current_page is not data_quality_page and getattr(self, "_data_quality_scan_running", False):
+            # Leaving the page is treated as a cancellation request so a scan
+            # never continues invisibly in the background.
+            self._data_quality_cancel_requested = True
 
         if current_page is shipments_page:
             self.open_shipments_window()
+            return
+
+        if current_page is data_quality_page:
+            # Data Quality scans are deliberately manual. The checks can be
+            # expensive on a large live database and should not restart every
+            # time the user visits the page.
             return
 
         if current_page in {to_order_page, build_container_page}:
@@ -13159,6 +13365,116 @@ class MainWindow(QMainWindow):
             )
         self.db_conn.commit()
 
+
+    def ensure_watched_import_history_table(self):
+        if self.db_conn is None:
+            return
+        cur = self.db_conn.cursor()
+        if self.db_engine == "sqlserver":
+            cur.execute(
+                """
+                IF OBJECT_ID('dbo.watched_import_history', 'U') IS NULL
+                BEGIN
+                    CREATE TABLE dbo.watched_import_history (
+                        history_id INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+                        fingerprint NVARCHAR(128) NOT NULL UNIQUE,
+                        import_type NVARCHAR(40) NOT NULL,
+                        file_name NVARCHAR(260) NOT NULL,
+                        original_path NVARCHAR(1000) NULL,
+                        file_size BIGINT NULL,
+                        modified_iso NVARCHAR(40) NULL,
+                        status NVARCHAR(30) NOT NULL,
+                        processed_at NVARCHAR(40) NULL,
+                        message NVARCHAR(MAX) NULL,
+                        archived_path NVARCHAR(1000) NULL
+                    )
+                END
+                """
+            )
+        else:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS watched_import_history (
+                    history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    fingerprint TEXT NOT NULL UNIQUE,
+                    import_type TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    original_path TEXT,
+                    file_size INTEGER,
+                    modified_iso TEXT,
+                    status TEXT NOT NULL,
+                    processed_at TEXT,
+                    message TEXT,
+                    archived_path TEXT
+                )
+                """
+            )
+        self.db_conn.commit()
+
+    def watched_import_history_lookup(self):
+        self.ensure_watched_import_history_table()
+        rows = self.db_all(
+            "SELECT fingerprint, import_type, file_name, status, processed_at, message, archived_path FROM watched_import_history"
+        )
+        return {str(row["fingerprint"]): self.row_to_dict(row) for row in rows}
+
+    def record_watched_import_history(self, candidate, status, message="", archived_path=""):
+        self.ensure_watched_import_history_table()
+        cur = self.db_conn.cursor()
+        values = (
+            str(candidate.get("fingerprint") or ""),
+            str(candidate.get("kind") or ""),
+            str(candidate.get("path").name if candidate.get("path") else candidate.get("file_name") or ""),
+            str(candidate.get("path") or candidate.get("original_path") or ""),
+            int(candidate.get("size") or 0),
+            str(candidate.get("modified_iso") or ""),
+            str(status or ""),
+            datetime.now().isoformat(timespec="seconds"),
+            str(message or ""),
+            str(archived_path or ""),
+        )
+        if self.db_engine == "sqlserver":
+            cur.execute(
+                """
+                UPDATE watched_import_history
+                SET import_type = ?, file_name = ?, original_path = ?, file_size = ?, modified_iso = ?,
+                    status = ?, processed_at = ?, message = ?, archived_path = ?
+                WHERE fingerprint = ?
+                """,
+                (values[1], values[2], values[3], values[4], values[5], values[6], values[7], values[8], values[9], values[0]),
+            )
+            if int(getattr(cur, "rowcount", 0) or 0) == 0:
+                cur.execute(
+                    """
+                    INSERT INTO watched_import_history (
+                        fingerprint, import_type, file_name, original_path, file_size, modified_iso,
+                        status, processed_at, message, archived_path
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    values,
+                )
+        else:
+            cur.execute(
+                """
+                INSERT INTO watched_import_history (
+                    fingerprint, import_type, file_name, original_path, file_size, modified_iso,
+                    status, processed_at, message, archived_path
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(fingerprint) DO UPDATE SET
+                    import_type=excluded.import_type,
+                    file_name=excluded.file_name,
+                    original_path=excluded.original_path,
+                    file_size=excluded.file_size,
+                    modified_iso=excluded.modified_iso,
+                    status=excluded.status,
+                    processed_at=excluded.processed_at,
+                    message=excluded.message,
+                    archived_path=excluded.archived_path
+                """,
+                values,
+            )
+        self.db_conn.commit()
+
     def get_meta_value(self, key, default=""):
         try:
             self.ensure_app_meta_table()
@@ -14825,7 +15141,7 @@ class MainWindow(QMainWindow):
         connect_once(getattr(self.ui, "dashboardRefresh_button", None), "_dashboard_connected", self.refresh_dashboard)
         connect_once(getattr(self.ui, "dashboardEditUser_button", None), "_dashboard_user_connected", self.edit_collaboration_user_name)
         connect_once(getattr(self.ui, "dashboardOpenUpdateData_button", None), "_dashboard_nav_connected", lambda: switch_to_page("update_page"))
-        connect_once(getattr(self.ui, "dashboardOpenUpdateDataQuality_button", None), "_dashboard_nav_connected", lambda: switch_to_page("update_page"))
+        connect_once(getattr(self.ui, "dashboardOpenUpdateDataQuality_button", None), "_dashboard_nav_connected", lambda: switch_to_page("dataQuality_page"))
         connect_once(getattr(self.ui, "dashboardOpenOrderAnalysis_button", None), "_dashboard_nav_connected", lambda: switch_to_page("orderAnalysy_page"))
         connect_once(getattr(self.ui, "dashboardOpenShipments_button", None), "_dashboard_nav_connected", self.open_shipments_window)
 
@@ -16262,6 +16578,1660 @@ class MainWindow(QMainWindow):
             freight_box.setToolTip("Double-click a row to toggle Charge Freight, Card on File, or Send Proforma for the current customer.")
 
         self.setup_update_data_instruction_tabs()
+
+
+    # ------------------------------------------------------------------
+    # Data Quality Centre
+    # ------------------------------------------------------------------
+    def setup_data_quality_centre(self):
+        refresh_button = getattr(self.ui, "dataQualityRefresh_button", None)
+        if refresh_button is not None:
+            refresh_button.clicked.connect(self.refresh_data_quality_centre)
+        cancel_button = getattr(self.ui, "dataQualityCancel_button", None)
+        if cancel_button is not None:
+            cancel_button.clicked.connect(self.cancel_data_quality_scan)
+        category_combo = getattr(self.ui, "dataQualityCategory_combo", None)
+        if category_combo is not None:
+            category_combo.currentIndexChanged.connect(self.apply_data_quality_filters)
+        severity_combo = getattr(self.ui, "dataQualitySeverity_combo", None)
+        if severity_combo is not None:
+            severity_combo.currentIndexChanged.connect(self.apply_data_quality_filters)
+        search_edit = getattr(self.ui, "dataQualitySearch_edit", None)
+        if search_edit is not None:
+            search_edit.textChanged.connect(self.apply_data_quality_filters)
+        open_button = getattr(self.ui, "dataQualityOpenItem_button", None)
+        if open_button is not None:
+            open_button.clicked.connect(self.open_selected_data_quality_item)
+        fix_button = getattr(self.ui, "dataQualityFix_button", None)
+        if fix_button is not None:
+            fix_button.clicked.connect(self.fix_selected_data_quality_issue)
+        export_button = getattr(self.ui, "dataQualityExport_button", None)
+        if export_button is not None:
+            export_button.clicked.connect(self.export_data_quality_csv)
+        table = getattr(self.ui, "dataQuality_table", None)
+        if table is not None:
+            table.cellDoubleClicked.connect(self.handle_data_quality_double_click)
+
+    def _data_quality_add_issue(self, issues, severity, category, reference, issue, details, action):
+        issues.append({
+            "severity": str(severity),
+            "category": str(category),
+            "reference": str(reference or ""),
+            "issue": str(issue),
+            "details": str(details or ""),
+            "action": str(action or ""),
+        })
+
+    def _data_quality_item_lookup(self, item_rows):
+        exact = {}
+        clean = {}
+        for row in item_rows:
+            item_number = str(row.get("item_number") or "").strip()
+            if not item_number:
+                continue
+            exact.setdefault(self.item_exact_key(item_number), []).append(row)
+            if not self.row_is_fasteners_item(row):
+                clean.setdefault(self.item_clean_key(item_number), []).append(row)
+        return exact, clean
+
+    def _data_quality_resolve_item(self, raw_item_number, exact, clean):
+        raw = str(raw_item_number or "").strip()
+        if not raw or raw.startswith("\\"):
+            return None, "ignored"
+        exact_rows = exact.get(self.item_exact_key(raw), [])
+        if len(exact_rows) == 1:
+            return exact_rows[0], "exact"
+        if len(exact_rows) > 1:
+            return None, "ambiguous"
+        clean_rows = clean.get(self.item_clean_key(raw), [])
+        if len(clean_rows) == 1:
+            return clean_rows[0], "canonical"
+        if len(clean_rows) > 1:
+            return None, "ambiguous"
+        return None, "missing"
+
+    def cancel_data_quality_scan(self):
+        if not getattr(self, "_data_quality_scan_running", False):
+            return
+        self._data_quality_cancel_requested = True
+        cancel_button = getattr(self.ui, "dataQualityCancel_button", None)
+        if cancel_button is not None:
+            cancel_button.setEnabled(False)
+            cancel_button.setText("Cancelling...")
+        status = getattr(self.ui, "dataQualityStatus_label", None)
+        if status is not None:
+            status.setText("Cancelling data quality scan after the current database step...")
+        QApplication.processEvents()
+
+    def _check_data_quality_cancel(self):
+        if getattr(self, "_data_quality_cancel_requested", False):
+            raise InterruptedError("Data quality scan cancelled")
+
+    def _set_data_quality_progress(self, value, message=""):
+        progress = getattr(self.ui, "dataQualityProgress_bar", None)
+        status = getattr(self.ui, "dataQualityStatus_label", None)
+        try:
+            numeric_value = max(0, min(100, int(value)))
+        except Exception:
+            numeric_value = 0
+        message = str(message or "").strip()
+        if progress is not None:
+            progress.setValue(numeric_value)
+            progress.setFormat(f"{numeric_value}% — {message}" if message else f"{numeric_value}%")
+        if status is not None and message:
+            status.setText(message)
+        QApplication.processEvents()
+
+    def collect_data_quality_issues(self, progress_callback=None):
+        issues = []
+
+        def report(value, message):
+            self._check_data_quality_cancel()
+            if callable(progress_callback):
+                progress_callback(value, message)
+
+        report(1, "Checking database connection and item master...")
+        if self.db_conn is None or not self.has_table("items"):
+            self._data_quality_add_issue(
+                issues, "Critical", "Item master", "items", "Item master unavailable",
+                "The items table is missing or the database is not open.", "Restore or reconnect the Widget database."
+            )
+            report(98, "Data quality checks complete.")
+            return issues
+
+        report(5, "Loading item master...")
+        item_rows = [self.row_to_dict(row) for row in self.db_all("SELECT * FROM items")]
+        item_columns = {str(name).lower(): name for name in self.get_table_columns("items")}
+        exact, clean = self._data_quality_item_lookup(item_rows)
+        report(12, f"Loaded {len(item_rows):,} item-master row(s).")
+
+        # Duplicate normal-item canonical keys.
+        duplicate_groups = {}
+        item_total = max(1, len(item_rows))
+        for index, row in enumerate(item_rows, start=1):
+            if self.row_is_fasteners_item(row):
+                continue
+            item_number = str(row.get("item_number") or "").strip()
+            key = self.item_clean_key(item_number)
+            if key:
+                duplicate_groups.setdefault(key, []).append(item_number)
+            if index == item_total or index % 250 == 0:
+                report(12 + int((index / item_total) * 8), f"Checking duplicate item numbers... {index:,}/{item_total:,}")
+        for key, numbers in sorted(duplicate_groups.items()):
+            unique_numbers = sorted(set(numbers), key=str.casefold)
+            if len(unique_numbers) > 1:
+                self._data_quality_add_issue(
+                    issues, "Critical", "Item master", unique_numbers[0], "Duplicate canonical item number",
+                    ", ".join(unique_numbers), "Merge the aliases or approve one canonical item number."
+                )
+
+        supplier_columns = self.get_items_supplier_column_names()
+        description_columns = [item_columns.get(name) for name in ("item_name", "description") if item_columns.get(name)]
+        recent_sales_keys = set()
+        if self.has_table("sales"):
+            report(22, "Loading items sold during the last 12 months...")
+            try:
+                cutoff = (date.today() - timedelta(days=365)).isoformat()
+                for row in self.db_all("SELECT DISTINCT item_number FROM sales WHERE sale_date >= ?", (cutoff,)):
+                    value = str(row["item_number"] or "").strip()
+                    if value:
+                        recent_sales_keys.add(self.item_clean_key(value))
+            except Exception:
+                pass
+
+        report(28, "Checking descriptions, costs, suppliers, and carton quantities...")
+        for index, row in enumerate(item_rows, start=1):
+            item_number = str(row.get("item_number") or "").strip()
+            if not item_number:
+                self._data_quality_add_issue(
+                    issues, "Critical", "Item master", "(blank)", "Blank item number",
+                    "An item-master row has no item number.", "Correct or remove the invalid item-master row."
+                )
+                continue
+            descriptions = [str(row.get(column) or "").strip() for column in description_columns]
+            if description_columns and not any(descriptions):
+                self._data_quality_add_issue(
+                    issues, "High", "Item master", item_number, "Missing description",
+                    "Both item_name and description are blank.", "Add a clear item description or re-run the MYOB description import."
+                )
+            cost_value = _parse_yu_cost_price(row.get(ITEM_COST_VALUE_COLUMN))
+            if cost_value is None or cost_value <= 0:
+                self._data_quality_add_issue(
+                    issues, "Medium", "Item master", item_number, "Missing latest purchase cost",
+                    "No positive last purchase cost is stored.", "Import a current MYOB purchase-history file or enter the cost."
+                )
+            if supplier_columns and not any(str(row.get(column) or "").strip() for column in supplier_columns):
+                self._data_quality_add_issue(
+                    issues, "Medium", "Item master", item_number, "Missing supplier",
+                    "No supplier is assigned in the item master.", "Assign the normal purchasing supplier."
+                )
+            carton_column = item_columns.get("carton")
+            if carton_column and self.item_clean_key(item_number) in recent_sales_keys:
+                carton_value = self.parse_float(row.get(carton_column))
+                if carton_value <= 0:
+                    self._data_quality_add_issue(
+                        issues, "Info", "Item master", item_number, "Missing carton quantity",
+                        "The item sold in the last 12 months but has no positive carton quantity.",
+                        "Enter the supplier carton/pack quantity for ordering and container calculations."
+                    )
+            if index == item_total or index % 100 == 0:
+                report(28 + int((index / item_total) * 32), f"Checking item master... {index:,}/{item_total:,}")
+
+        reference_tables = [
+            ("sales", "Sales", "High"),
+            ("stock", "Stock", "High"),
+            ("orders", "Orders", "High"),
+            ("to_order_lines", "Orders", "High"),
+            ("on_order_lines", "Orders", "High"),
+            ("container_lines", "Orders", "High"),
+        ]
+
+        def scan_reference_table(table_name, category, severity):
+            if not self.has_table(table_name) or "item_number" not in {str(c).lower() for c in self.get_table_columns(table_name)}:
+                return
+            rows = self.db_all(f"SELECT DISTINCT item_number FROM {table_name}")
+            seen = set()
+            for row_index, db_row in enumerate(rows, start=1):
+                if row_index % 250 == 0:
+                    self._check_data_quality_cancel()
+                raw = str(db_row["item_number"] or "").strip()
+                key = self.item_exact_key(raw)
+                if not raw or raw.startswith("\\") or key in seen:
+                    continue
+                seen.add(key)
+                _matched, status = self._data_quality_resolve_item(raw, exact, clean)
+                if status == "missing":
+                    self._data_quality_add_issue(
+                        issues, severity, category, raw, "Item missing from item master",
+                        f"{table_name} contains this item but dbo.items does not.",
+                        "Create the item-master record, then refresh costs and descriptions."
+                    )
+                elif status == "ambiguous":
+                    self._data_quality_add_issue(
+                        issues, "Critical", category, raw, "Ambiguous item number",
+                        f"{table_name} matches more than one item-master record.",
+                        "Resolve the canonical item-number collision."
+                    )
+
+        for index, (table_name, category, severity) in enumerate(reference_tables, start=1):
+            phase_start = 60 + int(((index - 1) / len(reference_tables)) * 20)
+            report(phase_start, f"Checking {table_name} references...")
+            scan_reference_table(table_name, category, severity)
+            report(60 + int((index / len(reference_tables)) * 20), f"Checked {table_name} references.")
+
+        # Validate the live YU template by item number in column A.
+        report(82, "Checking the live YU template...")
+        template_path = str(self.settings.value("yu/template_path", "") or "").strip()
+        if template_path and Path(template_path).exists() and load_workbook is not None:
+            workbook = None
+            try:
+                workbook = load_workbook(filename=template_path, read_only=True, data_only=True)
+                sheet = workbook["Sheet1"] if "Sheet1" in workbook.sheetnames else workbook[workbook.sheetnames[0]]
+                template_items = {}
+                template_total = max(1, int(sheet.max_row or 0))
+                for row_index in range(1, template_total + 1):
+                    item_number = str(sheet.cell(row=row_index, column=1).value or "").strip()
+                    if item_number and not item_number.startswith("\\"):
+                        template_items.setdefault(self.item_exact_key(item_number), []).append((item_number, row_index))
+                    if row_index == template_total or row_index % 100 == 0:
+                        report(82 + int((row_index / template_total) * 12), f"Scanning YU template... row {row_index:,}/{template_total:,}")
+                for entries in template_items.values():
+                    if len(entries) > 1:
+                        item_number = entries[0][0]
+                        rows_text = ", ".join(str(entry[1]) for entry in entries)
+                        self._data_quality_add_issue(
+                            issues, "Critical", "YU template", item_number, "Duplicate column A mapping",
+                            f"The item appears on rows {rows_text}.", "Keep the item number on only one supplier detail row."
+                        )
+                    matched, status = self._data_quality_resolve_item(entries[0][0], exact, clean)
+                    if status == "missing":
+                        self._data_quality_add_issue(
+                            issues, "High", "YU template", entries[0][0], "Template item missing from item master",
+                            f"Column A row {entries[0][1]} does not match dbo.items.",
+                            "Create or correct the item-master record."
+                        )
+            except Exception as exc:
+                self._data_quality_add_issue(
+                    issues, "Medium", "YU template", Path(template_path).name, "Could not scan YU template",
+                    str(exc), "Close the workbook if it is locked, then refresh the checks."
+                )
+            finally:
+                if workbook is not None:
+                    try:
+                        workbook.close()
+                    except Exception:
+                        pass
+        else:
+            report(94, "No YU template is configured; skipping template checks.")
+
+        report(97, "Sorting and preparing issue list...")
+        severity_order = {"Critical": 0, "High": 1, "Medium": 2, "Info": 3}
+        issues.sort(key=lambda row: (severity_order.get(row["severity"], 9), row["category"], row["reference"].casefold(), row["issue"]))
+        report(98, f"Data quality checks complete — {len(issues):,} issue(s) found.")
+        return issues
+
+    def refresh_data_quality_centre(self):
+        if getattr(self, "_data_quality_scan_running", False):
+            return
+
+        status = getattr(self.ui, "dataQualityStatus_label", None)
+        progress = getattr(self.ui, "dataQualityProgress_bar", None)
+        refresh_button = getattr(self.ui, "dataQualityRefresh_button", None)
+        cancel_button = getattr(self.ui, "dataQualityCancel_button", None)
+
+        self._data_quality_scan_running = True
+        self._data_quality_cancel_requested = False
+        if refresh_button is not None:
+            refresh_button.setEnabled(False)
+            refresh_button.setText("Scanning...")
+        if cancel_button is not None:
+            cancel_button.setEnabled(True)
+            cancel_button.setText("Cancel Scan")
+        if progress is not None:
+            progress.setRange(0, 100)
+            progress.setValue(0)
+            progress.setFormat("0% — Starting scan...")
+        self._set_data_quality_progress(0, "Starting data quality scan...")
+
+        try:
+            new_issues = self.collect_data_quality_issues(self._set_data_quality_progress)
+            self._check_data_quality_cancel()
+            self._set_data_quality_progress(99, "Populating results table...")
+            self.data_quality_issues = new_issues
+            self.apply_data_quality_filters()
+            completion_text = (
+                f"Last scan: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')} — "
+                f"{len(self.data_quality_issues):,} issue(s) found. "
+                "Double-click Suggested action to fix an issue."
+            )
+            if status is not None:
+                status.setText(completion_text)
+            if progress is not None:
+                progress.setValue(100)
+                progress.setFormat(f"Complete — {len(self.data_quality_issues):,} issue(s)")
+        except InterruptedError:
+            if status is not None:
+                status.setText(
+                    "Data quality scan cancelled. Existing results were kept. "
+                    "Press Refresh Checks when you are ready to scan again."
+                )
+            if progress is not None:
+                progress.setFormat("Cancelled")
+        except Exception as exc:
+            if status is not None:
+                status.setText(f"Data quality scan failed: {exc}")
+            if progress is not None:
+                progress.setValue(0)
+                progress.setFormat("Scan failed")
+        finally:
+            self._data_quality_scan_running = False
+            self._data_quality_cancel_requested = False
+            if refresh_button is not None:
+                refresh_button.setEnabled(True)
+                refresh_button.setText("Refresh Checks")
+            if cancel_button is not None:
+                cancel_button.setEnabled(False)
+                cancel_button.setText("Cancel Scan")
+            QApplication.processEvents()
+
+    def apply_data_quality_filters(self, *_args):
+        table = getattr(self.ui, "dataQuality_table", None)
+        if table is None:
+            return
+        category_text = str(getattr(self.ui, "dataQualityCategory_combo", None).currentText() if getattr(self.ui, "dataQualityCategory_combo", None) else "All categories")
+        severity_text = str(getattr(self.ui, "dataQualitySeverity_combo", None).currentText() if getattr(self.ui, "dataQualitySeverity_combo", None) else "All severities")
+        search_text = str(getattr(self.ui, "dataQualitySearch_edit", None).text() if getattr(self.ui, "dataQualitySearch_edit", None) else "").strip().casefold()
+        visible = []
+        for issue in self.data_quality_issues:
+            if category_text != "All categories" and issue["category"] != category_text:
+                continue
+            if severity_text != "All severities" and issue["severity"] != severity_text:
+                continue
+            haystack = " ".join(str(issue.get(key) or "") for key in ("severity", "category", "reference", "issue", "details", "action")).casefold()
+            if search_text and search_text not in haystack:
+                continue
+            visible.append(issue)
+
+        table.setSortingEnabled(False)
+        table.setRowCount(len(visible))
+        severity_colors = {
+            "Critical": (QColor("#8B1E1E"), QColor("#FFFFFF")),
+            "High": (QColor("#A64B00"), QColor("#FFFFFF")),
+            "Medium": (QColor("#8A6D00"), QColor("#FFFFFF")),
+            "Info": (QColor("#245A7A"), QColor("#FFFFFF")),
+        }
+        for row_index, issue in enumerate(visible):
+            values = [issue["severity"], issue["category"], issue["reference"], issue["issue"], issue["details"], issue["action"]]
+            for column_index, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setData(Qt.UserRole, dict(issue))
+                if column_index == 0 and issue["severity"] in severity_colors:
+                    bg, fg = severity_colors[issue["severity"]]
+                    item.setBackground(QBrush(bg))
+                    item.setForeground(QBrush(fg))
+                table.setItem(row_index, column_index, item)
+        table.setSortingEnabled(True)
+
+        counts = Counter(issue["severity"] for issue in self.data_quality_issues)
+        labels = getattr(self.ui, "dataQualitySummary_labels", {}) or {}
+        for key, severity in (("critical", "Critical"), ("high", "High"), ("medium", "Medium")):
+            if labels.get(key) is not None:
+                labels[key].setText(f"{counts.get(severity, 0):,}")
+        if labels.get("total") is not None:
+            labels["total"].setText(f"{len(self.data_quality_issues):,}")
+
+    def selected_data_quality_issue(self):
+        table = getattr(self.ui, "dataQuality_table", None)
+        if table is None:
+            return None
+        row_index = table.currentRow()
+        if row_index < 0:
+            return None
+        item = table.item(row_index, 0)
+        data = item.data(Qt.UserRole) if item is not None else None
+        return dict(data) if isinstance(data, dict) else None
+
+    def open_selected_data_quality_item(self):
+        issue = self.selected_data_quality_issue()
+        if not issue:
+            QMessageBox.information(self, "Data Quality", "Select an issue row first.")
+            return
+        item_number = str(issue.get("reference") or "").strip()
+        if not item_number or item_number in {"(blank)", "items"}:
+            QMessageBox.information(self, "Data Quality", "This issue does not have an item number to open.")
+            return
+        item_edit = getattr(self.ui, "enterItem", None)
+        item_page = getattr(self.ui, "itemSummary_page", None)
+        if item_edit is None or item_page is None:
+            return
+        item_edit.setText(item_number)
+        self.ui.stackedWidget.setCurrentWidget(item_page)
+        self.load_item_summary()
+
+    def handle_data_quality_double_click(self, _row, column):
+        # The Suggested action column is deliberately interactive. Other
+        # columns retain the quick jump to Item Summary.
+        if int(column) == 5:
+            self.fix_selected_data_quality_issue()
+        else:
+            self.open_selected_data_quality_item()
+
+    def _data_quality_mark_issue_fixed(self, issue, message):
+        removed = False
+        remaining = []
+        for existing in self.data_quality_issues:
+            if not removed and existing == issue:
+                removed = True
+                continue
+            remaining.append(existing)
+        self.data_quality_issues = remaining
+        self.apply_data_quality_filters()
+        status = getattr(self.ui, "dataQualityStatus_label", None)
+        if status is not None:
+            status.setText(
+                f"{message} The selected issue was removed from this result list. "
+                "Press Refresh Checks to confirm all related issues are resolved."
+            )
+
+    def _data_quality_dialog_intro(self, dialog, issue):
+        layout = QVBoxLayout(dialog)
+        title = QLabel(str(issue.get("issue") or "Data quality issue"), dialog)
+        title.setProperty("role", "sectionTitle")
+        layout.addWidget(title)
+        summary = QLabel(
+            f"{issue.get('category', '')} • {issue.get('reference', '')}\n"
+            f"{issue.get('details', '')}",
+            dialog,
+        )
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+        form = QFormLayout()
+        layout.addLayout(form)
+        return layout, form
+
+    def _data_quality_find_item_rows(self, item_number):
+        item_number = str(item_number or "").strip()
+        if not item_number:
+            return []
+        exact = self.fetch_item_row_by_exact_number(item_number)
+        if exact:
+            return [exact]
+        return self.fetch_item_rows_by_clean_key(self.item_clean_key(item_number))
+
+    def _data_quality_current_supplier(self, row):
+        for column in self.get_items_supplier_column_names():
+            value = str(row.get(column) or "").strip()
+            if value:
+                return value
+        return ""
+
+    def _data_quality_update_item_fields(self, item_number, values):
+        columns = {str(name).lower(): name for name in self.get_table_columns("items")}
+        assignments = []
+        params = []
+        for requested_column, value in values.items():
+            actual = columns.get(str(requested_column).lower())
+            if not actual:
+                continue
+            assignments.append(f"{self.db_identifier(actual)} = ?")
+            params.append(value)
+        if not assignments:
+            raise RuntimeError("No compatible item-master fields were found to update.")
+        params.append(item_number)
+        cur = self.db_conn.cursor()
+        cur.execute(
+            f"UPDATE items SET {', '.join(assignments)} "
+            f"WHERE {self.item_exact_sql_expr('item_number')} = {self.item_exact_sql_expr('?')}",
+            tuple(params),
+        )
+        self.db_conn.commit()
+
+    def _data_quality_fix_missing_description(self, issue):
+        rows = self._data_quality_find_item_rows(issue.get("reference"))
+        if len(rows) != 1:
+            return self._data_quality_fix_duplicate_items(issue)
+        row = rows[0]
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Fix Missing Description")
+        dialog.resize(620, 220)
+        layout, form = self._data_quality_dialog_intro(dialog, issue)
+        description_edit = QLineEdit(dialog)
+        description_edit.setText(str(row.get("item_name") or row.get("description") or "").strip())
+        description_edit.setPlaceholderText("Enter the customer-facing item description")
+        form.addRow("Description", description_edit)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel, parent=dialog)
+        layout.addWidget(buttons)
+        buttons.rejected.connect(dialog.reject)
+
+        def save():
+            description = description_edit.text().strip()
+            if not description:
+                QMessageBox.warning(dialog, "Description required", "Enter a description before saving.")
+                return
+            try:
+                self._data_quality_update_item_fields(
+                    str(row.get("item_number") or issue.get("reference")),
+                    {"item_name": description, "description": description},
+                )
+            except Exception as exc:
+                QMessageBox.critical(dialog, "Update failed", str(exc))
+                return
+            dialog.accept()
+
+        buttons.accepted.connect(save)
+        if dialog.exec() == QDialog.Accepted:
+            self.load_reference_lists()
+            self._data_quality_mark_issue_fixed(issue, "Description updated.")
+
+    def _data_quality_fix_missing_cost(self, issue):
+        rows = self._data_quality_find_item_rows(issue.get("reference"))
+        if len(rows) != 1:
+            return self._data_quality_fix_duplicate_items(issue)
+        row = rows[0]
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Fix Missing Purchase Cost")
+        dialog.resize(620, 300)
+        layout, form = self._data_quality_dialog_intro(dialog, issue)
+        cost_edit = QLineEdit(dialog)
+        cost_edit.setValidator(QDoubleValidator(0.000001, 999999999.0, 6, cost_edit))
+        current_cost = _parse_yu_cost_price(row.get(ITEM_COST_VALUE_COLUMN))
+        if current_cost is not None and current_cost > 0:
+            cost_edit.setText(f"{current_cost:.6f}".rstrip("0").rstrip("."))
+        cost_edit.setPlaceholderText("0.000000")
+        form.addRow("Latest unit cost", cost_edit)
+        date_edit = QDateEdit(dialog)
+        date_edit.setCalendarPopup(True)
+        date_edit.setDisplayFormat("dd/MM/yyyy")
+        stored_date = self.parse_date_value(row.get(ITEM_COST_DATE_COLUMN))
+        if stored_date:
+            date_edit.setDate(QDate(stored_date.year, stored_date.month, stored_date.day))
+        else:
+            date_edit.setDate(QDate.currentDate())
+        form.addRow("Purchase date", date_edit)
+        yu_check = QCheckBox("Also update the Yuchang-specific cost", dialog)
+        yu_check.setChecked(self.item_row_is_yu_supplier(row))
+        layout.addWidget(yu_check)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel, parent=dialog)
+        layout.addWidget(buttons)
+        buttons.rejected.connect(dialog.reject)
+
+        def save():
+            try:
+                cost = float(cost_edit.text().strip())
+            except Exception:
+                cost = 0.0
+            if cost <= 0:
+                QMessageBox.warning(dialog, "Cost required", "Enter a positive purchase cost.")
+                return
+            qdate = date_edit.date()
+            cost_date = date(qdate.year(), qdate.month(), qdate.day()).isoformat()
+            values = {
+                ITEM_COST_VALUE_COLUMN: cost,
+                ITEM_COST_DATE_COLUMN: cost_date,
+            }
+            if yu_check.isChecked():
+                values[YU_COST_VALUE_COLUMN] = cost
+                values[YU_COST_DATE_COLUMN] = cost_date
+            try:
+                self._data_quality_update_item_fields(
+                    str(row.get("item_number") or issue.get("reference")), values
+                )
+            except Exception as exc:
+                QMessageBox.critical(dialog, "Update failed", str(exc))
+                return
+            dialog.accept()
+
+        buttons.accepted.connect(save)
+        if dialog.exec() == QDialog.Accepted:
+            self._data_quality_mark_issue_fixed(issue, "Purchase cost updated.")
+
+    def _data_quality_fix_missing_supplier(self, issue):
+        rows = self._data_quality_find_item_rows(issue.get("reference"))
+        if len(rows) != 1:
+            return self._data_quality_fix_duplicate_items(issue)
+        row = rows[0]
+        supplier_columns = self.get_items_supplier_column_names()
+        if not supplier_columns:
+            QMessageBox.warning(self, "Supplier field unavailable", "No supplier field exists in dbo.items.")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Fix Missing Supplier")
+        dialog.resize(620, 260)
+        layout, form = self._data_quality_dialog_intro(dialog, issue)
+        supplier_combo = QComboBox(dialog)
+        supplier_combo.setEditable(True)
+        supplier_combo.addItems(sorted({str(v).strip() for v in self.supplier_names if str(v).strip()}, key=str.casefold))
+        supplier_combo.setCurrentText(self._data_quality_current_supplier(row))
+        form.addRow("Supplier", supplier_combo)
+        field_combo = QComboBox(dialog)
+        field_combo.addItems(supplier_columns)
+        form.addRow("Store in field", field_combo)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel, parent=dialog)
+        layout.addWidget(buttons)
+        buttons.rejected.connect(dialog.reject)
+
+        def save():
+            supplier = supplier_combo.currentText().strip()
+            if not supplier:
+                QMessageBox.warning(dialog, "Supplier required", "Choose or enter a supplier.")
+                return
+            try:
+                self._data_quality_update_item_fields(
+                    str(row.get("item_number") or issue.get("reference")),
+                    {field_combo.currentText(): supplier},
+                )
+            except Exception as exc:
+                QMessageBox.critical(dialog, "Update failed", str(exc))
+                return
+            dialog.accept()
+
+        buttons.accepted.connect(save)
+        if dialog.exec() == QDialog.Accepted:
+            self.load_reference_lists()
+            self.setup_supplier_autocomplete()
+            self._data_quality_mark_issue_fixed(issue, "Supplier assigned.")
+
+    def _data_quality_fix_missing_carton(self, issue):
+        rows = self._data_quality_find_item_rows(issue.get("reference"))
+        if len(rows) != 1:
+            return self._data_quality_fix_duplicate_items(issue)
+        row = rows[0]
+        if "carton" not in {str(c).lower() for c in self.get_table_columns("items")}:
+            QMessageBox.warning(self, "Carton field unavailable", "The items table does not have a carton field.")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Fix Missing Carton Quantity")
+        dialog.resize(620, 240)
+        layout, form = self._data_quality_dialog_intro(dialog, issue)
+        carton_edit = QLineEdit(dialog)
+        carton_edit.setValidator(QDoubleValidator(0.001, 999999999.0, 3, carton_edit))
+        current = self.parse_float(row.get("carton"))
+        if current > 0:
+            carton_edit.setText(f"{current:g}")
+        form.addRow("Units per carton", carton_edit)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel, parent=dialog)
+        layout.addWidget(buttons)
+        buttons.rejected.connect(dialog.reject)
+
+        def save():
+            try:
+                carton = float(carton_edit.text().strip())
+            except Exception:
+                carton = 0.0
+            if carton <= 0:
+                QMessageBox.warning(dialog, "Carton quantity required", "Enter a positive carton quantity.")
+                return
+            try:
+                self._data_quality_update_item_fields(
+                    str(row.get("item_number") or issue.get("reference")), {"carton": carton}
+                )
+            except Exception as exc:
+                QMessageBox.critical(dialog, "Update failed", str(exc))
+                return
+            dialog.accept()
+
+        buttons.accepted.connect(save)
+        if dialog.exec() == QDialog.Accepted:
+            self._data_quality_mark_issue_fixed(issue, "Carton quantity updated.")
+
+    def _data_quality_suggest_description(self, item_number):
+        item_number = str(item_number or "").strip()
+        for table_name, date_column in (("sales", "sale_date"), ("orders", "order_date"), ("on_order_lines", "ready_date")):
+            if not self.has_table(table_name):
+                continue
+            columns = {str(name).lower(): name for name in self.get_table_columns(table_name)}
+            if "item_number" not in columns or "description" not in columns:
+                continue
+            order_sql = f" ORDER BY {self.db_identifier(columns[date_column])} DESC" if date_column in columns else ""
+            try:
+                row = self.row_to_dict(self.db_one(
+                    f"SELECT TOP 1 {self.db_identifier(columns['description'])} AS description "
+                    f"FROM {self.db_identifier(table_name)} "
+                    f"WHERE {self.item_exact_sql_expr(self.db_identifier(columns['item_number']))} = {self.item_exact_sql_expr('?')} "
+                    f"AND NULLIF(LTRIM(RTRIM(COALESCE({self.db_identifier(columns['description'])}, ''))), '') IS NOT NULL"
+                    f"{order_sql}",
+                    (item_number,),
+                ))
+            except Exception:
+                row = {}
+            value = str(row.get("description") or "").strip()
+            if value:
+                return value
+        return ""
+
+    def _data_quality_fix_missing_item(self, issue):
+        item_number = str(issue.get("reference") or "").strip()
+        if not item_number or item_number in {"(blank)", "items"}:
+            QMessageBox.warning(self, "Invalid item number", "This issue does not provide a usable item number.")
+            return
+        existing = self._data_quality_find_item_rows(item_number)
+        if existing:
+            if len(existing) > 1:
+                return self._data_quality_fix_duplicate_items(issue)
+            QMessageBox.information(self, "Item already exists", "The item now exists. Refresh the checks to update the result list.")
+            self._data_quality_mark_issue_fixed(issue, "Item already exists.")
+            return
+
+        columns = {str(name).lower(): name for name in self.get_table_columns("items")}
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Create Missing Item")
+        dialog.resize(680, 470)
+        layout, form = self._data_quality_dialog_intro(dialog, issue)
+        number_edit = QLineEdit(item_number, dialog)
+        number_edit.setReadOnly(True)
+        form.addRow("Item number", number_edit)
+        description_edit = QLineEdit(dialog)
+        description_edit.setText(self._data_quality_suggest_description(item_number))
+        description_edit.setPlaceholderText("Enter item description")
+        form.addRow("Description", description_edit)
+        supplier_combo = QComboBox(dialog)
+        supplier_combo.setEditable(True)
+        supplier_combo.addItems(sorted({str(v).strip() for v in self.supplier_names if str(v).strip()}, key=str.casefold))
+        if issue.get("category") == "YU template":
+            supplier_combo.setCurrentText("Yuchang Textile Factory")
+        form.addRow("Supplier", supplier_combo)
+        carton_edit = QLineEdit(dialog)
+        carton_edit.setValidator(QDoubleValidator(0.0, 999999999.0, 3, carton_edit))
+        form.addRow("Units per carton", carton_edit)
+        cost_edit = QLineEdit(dialog)
+        cost_edit.setValidator(QDoubleValidator(0.0, 999999999.0, 6, cost_edit))
+        form.addRow("Latest unit cost", cost_edit)
+        cost_date_edit = QDateEdit(dialog)
+        cost_date_edit.setCalendarPopup(True)
+        cost_date_edit.setDisplayFormat("dd/MM/yyyy")
+        cost_date_edit.setDate(QDate.currentDate())
+        form.addRow("Cost date", cost_date_edit)
+        yu_check = QCheckBox("Store the entered cost as the Yuchang cost as well", dialog)
+        yu_check.setChecked(issue.get("category") == "YU template")
+        layout.addWidget(yu_check)
+        note = QLabel(
+            "Only fields present in the current items table will be written. "
+            "Leave optional values blank if they are not yet known.", dialog
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel, parent=dialog)
+        layout.addWidget(buttons)
+        buttons.rejected.connect(dialog.reject)
+
+        def save():
+            description = description_edit.text().strip()
+            supplier = supplier_combo.currentText().strip()
+            try:
+                carton = float(carton_edit.text().strip()) if carton_edit.text().strip() else None
+            except Exception:
+                carton = None
+            try:
+                cost = float(cost_edit.text().strip()) if cost_edit.text().strip() else None
+            except Exception:
+                cost = None
+            values = {"item_number": item_number}
+            if description:
+                values["item_name"] = description
+                values["description"] = description
+            supplier_columns = self.get_items_supplier_column_names()
+            if supplier and supplier_columns:
+                values[supplier_columns[0]] = supplier
+            if carton is not None and carton > 0:
+                values["carton"] = carton
+            if cost is not None and cost > 0:
+                qdate = cost_date_edit.date()
+                cost_date = date(qdate.year(), qdate.month(), qdate.day()).isoformat()
+                values[ITEM_COST_VALUE_COLUMN] = cost
+                values[ITEM_COST_DATE_COLUMN] = cost_date
+                if yu_check.isChecked():
+                    values[YU_COST_VALUE_COLUMN] = cost
+                    values[YU_COST_DATE_COLUMN] = cost_date
+            if "planning_status" in columns:
+                values.setdefault("planning_status", PLANNING_STATUS_ACTIVE)
+
+            actual_values = []
+            actual_columns = []
+            for requested, value in values.items():
+                actual = columns.get(str(requested).lower())
+                if actual and actual not in actual_columns:
+                    actual_columns.append(actual)
+                    actual_values.append(value)
+            if columns.get("item_number") not in actual_columns:
+                QMessageBox.critical(dialog, "Create failed", "The items table has no item_number column.")
+                return
+            placeholders = ", ".join("?" for _ in actual_columns)
+            try:
+                cur = self.db_conn.cursor()
+                cur.execute(
+                    f"INSERT INTO items ({', '.join(self.db_identifier(c) for c in actual_columns)}) "
+                    f"VALUES ({placeholders})",
+                    tuple(actual_values),
+                )
+                self.db_conn.commit()
+            except Exception as exc:
+                try:
+                    self.db_conn.rollback()
+                except Exception:
+                    pass
+                QMessageBox.critical(
+                    dialog,
+                    "Create failed",
+                    "The item could not be created. A required item-master field may be missing.\n\n"
+                    f"{exc}",
+                )
+                return
+            dialog.accept()
+
+        buttons.accepted.connect(save)
+        if dialog.exec() == QDialog.Accepted:
+            self.load_reference_lists()
+            self.setup_item_autocomplete()
+            self.setup_supplier_autocomplete()
+            self._data_quality_mark_issue_fixed(issue, f"Created item {item_number}.")
+
+    def _data_quality_fix_duplicate_items(self, issue):
+        clean_key = self.item_clean_key(issue.get("reference"))
+        rows = self.fetch_item_rows_by_clean_key(clean_key)
+        if len(rows) < 2:
+            # The issue details may list the aliases even if the reference itself
+            # is not the best lookup value.
+            aliases = [part.strip() for part in str(issue.get("details") or "").split(",") if part.strip()]
+            combined = []
+            seen = set()
+            for alias in aliases:
+                for row in self._data_quality_find_item_rows(alias):
+                    key = str(row.get("item_number") or "").casefold()
+                    if key and key not in seen:
+                        seen.add(key)
+                        combined.append(row)
+            rows = combined
+        if len(rows) < 2:
+            QMessageBox.information(self, "Duplicate items", "The duplicate records could not be found. Refresh the scan first.")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Resolve Duplicate Item Numbers")
+        dialog.resize(760, 520)
+        layout, form = self._data_quality_dialog_intro(dialog, issue)
+        canonical_combo = QComboBox(dialog)
+        item_numbers = [str(row.get("item_number") or "").strip() for row in rows]
+        canonical_combo.addItems(item_numbers)
+        form.addRow("Keep as canonical", canonical_combo)
+        preview = QTextBrowser(dialog)
+        preview.setMinimumHeight(240)
+        layout.addWidget(preview)
+        warning = QLabel(
+            "This updates item-number references in every database table that has an item_number column, "
+            "copies blank core fields into the kept item, and deletes the other item-master records.", dialog
+        )
+        warning.setWordWrap(True)
+        layout.addWidget(warning)
+
+        def update_preview():
+            lines = []
+            supplier_columns = self.get_items_supplier_column_names()
+            for row in rows:
+                number = str(row.get("item_number") or "")
+                description = str(row.get("item_name") or row.get("description") or "")
+                supplier = next((str(row.get(c) or "").strip() for c in supplier_columns if str(row.get(c) or "").strip()), "")
+                cost = row.get(ITEM_COST_VALUE_COLUMN)
+                marker = "KEEP" if number == canonical_combo.currentText() else "MERGE"
+                lines.append(f"{marker}: {number}\n  {description}\n  Supplier: {supplier or '-'} | Cost: {cost if cost not in (None, '') else '-'}")
+            preview.setPlainText("\n\n".join(lines))
+
+        canonical_combo.currentTextChanged.connect(update_preview)
+        update_preview()
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel, parent=dialog)
+        layout.addWidget(buttons)
+        buttons.rejected.connect(dialog.reject)
+
+        def save():
+            canonical = canonical_combo.currentText().strip()
+            aliases = [number for number in item_numbers if number != canonical]
+            reply = QMessageBox.question(
+                dialog,
+                "Confirm item merge",
+                f"Keep {canonical} and merge/delete:\n\n" + "\n".join(aliases) +
+                "\n\nThis changes historical item references. Continue?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+            canonical_row = next(row for row in rows if str(row.get("item_number") or "").strip() == canonical)
+            core_columns = [
+                "item_name", "description", "roll", "per_roll", "carton", "pallet", "planning_status",
+                ITEM_COST_VALUE_COLUMN, ITEM_COST_DATE_COLUMN, YU_COST_VALUE_COLUMN, YU_COST_DATE_COLUMN,
+            ] + self.get_items_supplier_column_names()
+            table_rows = self.db_all(
+                "SELECT DISTINCT c.TABLE_NAME FROM INFORMATION_SCHEMA.COLUMNS c "
+                "JOIN INFORMATION_SCHEMA.TABLES t ON t.TABLE_SCHEMA = c.TABLE_SCHEMA AND t.TABLE_NAME = c.TABLE_NAME "
+                "WHERE c.TABLE_SCHEMA = 'dbo' AND c.COLUMN_NAME = 'item_number' AND t.TABLE_TYPE = 'BASE TABLE'"
+            )
+            reference_tables = [str(row["TABLE_NAME"]) for row in table_rows if str(row["TABLE_NAME"]).lower() != "items"]
+            try:
+                cur = self.db_conn.cursor()
+                for alias in aliases:
+                    alias_row = next(row for row in rows if str(row.get("item_number") or "").strip() == alias)
+                    for column in core_columns:
+                        current = canonical_row.get(column)
+                        incoming = alias_row.get(column)
+                        current_blank = current is None or (isinstance(current, str) and not current.strip())
+                        incoming_present = incoming is not None and (not isinstance(incoming, str) or incoming.strip())
+                        if current_blank and incoming_present and column.lower() in {str(c).lower() for c in self.get_table_columns("items")}:
+                            cur.execute(
+                                f"UPDATE items SET {self.db_identifier(column)} = ? "
+                                f"WHERE {self.item_exact_sql_expr('item_number')} = {self.item_exact_sql_expr('?')}",
+                                (incoming, canonical),
+                            )
+                            canonical_row[column] = incoming
+                    for table_name in reference_tables:
+                        cur.execute(
+                            f"UPDATE {self.db_identifier(table_name)} SET {self.db_identifier('item_number')} = ? "
+                            f"WHERE {self.item_exact_sql_expr(self.db_identifier('item_number'))} = {self.item_exact_sql_expr('?')}",
+                            (canonical, alias),
+                        )
+                    cur.execute(
+                        f"DELETE FROM items WHERE {self.item_exact_sql_expr('item_number')} = {self.item_exact_sql_expr('?')}",
+                        (alias,),
+                    )
+                self.db_conn.commit()
+            except Exception as exc:
+                try:
+                    self.db_conn.rollback()
+                except Exception:
+                    pass
+                QMessageBox.critical(dialog, "Merge failed", str(exc))
+                return
+            dialog.accept()
+
+        buttons.accepted.connect(save)
+        if dialog.exec() == QDialog.Accepted:
+            self.load_reference_lists()
+            self.setup_item_autocomplete()
+            self._data_quality_mark_issue_fixed(issue, "Duplicate item records merged.")
+
+    def _data_quality_fix_blank_item_number(self, issue):
+        row = self.row_to_dict(self.db_one(
+            "SELECT TOP 1 * FROM items WHERE item_number IS NULL OR LTRIM(RTRIM(item_number)) = ''"
+        ))
+        if not row:
+            self._data_quality_mark_issue_fixed(issue, "No blank item record remains.")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Assign Blank Item Number")
+        dialog.resize(660, 360)
+        layout, form = self._data_quality_dialog_intro(dialog, issue)
+        item_edit = QLineEdit(dialog)
+        form.addRow("New item number", item_edit)
+        preview = QTextBrowser(dialog)
+        preview.setPlainText("\n".join(
+            f"{key}: {value}" for key, value in row.items()
+            if key != "item_number" and value not in (None, "")
+        ) or "The first blank item record has no other populated values.")
+        layout.addWidget(preview)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel, parent=dialog)
+        layout.addWidget(buttons)
+        buttons.rejected.connect(dialog.reject)
+
+        def save():
+            item_number = item_edit.text().strip()
+            if not item_number:
+                QMessageBox.warning(dialog, "Item number required", "Enter an item number.")
+                return
+            if self._data_quality_find_item_rows(item_number):
+                QMessageBox.warning(dialog, "Item exists", "That item number already exists.")
+                return
+            try:
+                cur = self.db_conn.cursor()
+                cur.execute(
+                    "UPDATE TOP (1) items SET item_number = ? "
+                    "WHERE item_number IS NULL OR LTRIM(RTRIM(item_number)) = ''",
+                    (item_number,),
+                )
+                self.db_conn.commit()
+            except Exception as exc:
+                try:
+                    self.db_conn.rollback()
+                except Exception:
+                    pass
+                QMessageBox.critical(dialog, "Update failed", str(exc))
+                return
+            dialog.accept()
+
+        buttons.accepted.connect(save)
+        if dialog.exec() == QDialog.Accepted:
+            self.load_reference_lists()
+            self.setup_item_autocomplete()
+            self._data_quality_mark_issue_fixed(issue, "Blank item number assigned.")
+
+    def _data_quality_fix_yu_duplicate_mapping(self, issue):
+        template_path = str(self.settings.value("yu/template_path", "") or "").strip()
+        if not template_path or not Path(template_path).exists():
+            return self._data_quality_fix_yu_template_path(issue)
+        item_number = str(issue.get("reference") or "").strip()
+        workbook = None
+        try:
+            workbook = load_workbook(template_path, read_only=True, data_only=False)
+            sheet = workbook["Sheet1"] if "Sheet1" in workbook.sheetnames else workbook[workbook.sheetnames[0]]
+            matching_rows = [
+                row_index for row_index in range(1, int(sheet.max_row or 0) + 1)
+                if self.item_exact_key(sheet.cell(row=row_index, column=1).value) == self.item_exact_key(item_number)
+            ]
+        except Exception as exc:
+            QMessageBox.critical(self, "Template read failed", str(exc))
+            return
+        finally:
+            if workbook is not None:
+                try:
+                    workbook.close()
+                except Exception:
+                    pass
+        if len(matching_rows) < 2:
+            self._data_quality_mark_issue_fixed(issue, "The template no longer contains a duplicate mapping.")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Fix Duplicate YU Mapping")
+        dialog.resize(620, 300)
+        layout, form = self._data_quality_dialog_intro(dialog, issue)
+        keep_combo = QComboBox(dialog)
+        keep_combo.addItems([str(row) for row in matching_rows])
+        form.addRow("Keep item number on row", keep_combo)
+        clear_label = QLabel(dialog)
+        clear_label.setWordWrap(True)
+        layout.addWidget(clear_label)
+
+        def update_label():
+            keep = int(keep_combo.currentText())
+            clear_rows = [str(row) for row in matching_rows if row != keep]
+            clear_label.setText("Column A will be cleared on row(s): " + ", ".join(clear_rows))
+
+        keep_combo.currentTextChanged.connect(update_label)
+        update_label()
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel, parent=dialog)
+        layout.addWidget(buttons)
+        buttons.rejected.connect(dialog.reject)
+
+        def save():
+            keep = int(keep_combo.currentText())
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            source = Path(template_path)
+            backup = source.with_name(f"{source.stem}_backup_{timestamp}{source.suffix}")
+            editable = None
+            try:
+                shutil.copy2(source, backup)
+                editable = load_workbook(
+                    source,
+                    read_only=False,
+                    data_only=False,
+                    keep_vba=source.suffix.lower() == ".xlsm",
+                )
+                sheet = editable["Sheet1"] if "Sheet1" in editable.sheetnames else editable[editable.sheetnames[0]]
+                for row_index in matching_rows:
+                    if row_index != keep:
+                        sheet.cell(row=row_index, column=1).value = None
+                editable.save(source)
+            except Exception as exc:
+                QMessageBox.critical(dialog, "Template update failed", f"{exc}\n\nClose the workbook in Excel and try again.")
+                return
+            finally:
+                if editable is not None:
+                    try:
+                        editable.close()
+                    except Exception:
+                        pass
+            QMessageBox.information(dialog, "Template updated", f"Backup created:\n{backup}")
+            dialog.accept()
+
+        buttons.accepted.connect(save)
+        if dialog.exec() == QDialog.Accepted:
+            self._data_quality_mark_issue_fixed(issue, "Duplicate YU template mapping corrected.")
+
+    def _data_quality_fix_yu_template_path(self, issue):
+        current = str(self.settings.value("yu/template_path", "") or "").strip()
+        start = str(Path(current).parent) if current else str(Path(__file__).resolve().parent)
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Choose Yuchang workbook template", start, "Excel Files (*.xlsx *.xlsm)"
+        )
+        if not file_path:
+            return
+        self.settings.setValue("yu/template_path", file_path)
+        self._data_quality_mark_issue_fixed(issue, "YU template path updated.")
+
+    def fix_selected_data_quality_issue(self):
+        issue = self.selected_data_quality_issue()
+        if not issue:
+            QMessageBox.information(self, "Data Quality", "Select an issue row first.")
+            return
+        issue_name = str(issue.get("issue") or "")
+        if issue_name == "Missing description":
+            return self._data_quality_fix_missing_description(issue)
+        if issue_name == "Missing latest purchase cost":
+            return self._data_quality_fix_missing_cost(issue)
+        if issue_name == "Missing supplier":
+            return self._data_quality_fix_missing_supplier(issue)
+        if issue_name == "Missing carton quantity":
+            return self._data_quality_fix_missing_carton(issue)
+        if issue_name in {"Item missing from item master", "Template item missing from item master"}:
+            return self._data_quality_fix_missing_item(issue)
+        if issue_name in {"Duplicate canonical item number", "Ambiguous item number"}:
+            return self._data_quality_fix_duplicate_items(issue)
+        if issue_name == "Blank item number":
+            return self._data_quality_fix_blank_item_number(issue)
+        if issue_name == "Duplicate column A mapping":
+            return self._data_quality_fix_yu_duplicate_mapping(issue)
+        if issue_name == "Could not scan YU template":
+            return self._data_quality_fix_yu_template_path(issue)
+        QMessageBox.information(
+            self,
+            "Manual action required",
+            f"This issue cannot be safely repaired automatically.\n\n"
+            f"Suggested action:\n{issue.get('action', '')}",
+        )
+
+    def export_data_quality_csv(self):
+        if not self.data_quality_issues:
+            QMessageBox.information(self, "Data Quality", "There are no scanned issues to export.")
+            return
+        default_dir = Path.home() / "Documents" / "Windsor Widget Exports"
+        default_dir.mkdir(parents=True, exist_ok=True)
+        default_name = default_dir / f"data_quality_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        file_path, _ = QFileDialog.getSaveFileName(self, "Export Data Quality CSV", str(default_name), "CSV files (*.csv)")
+        if not file_path:
+            return
+        with Path(file_path).open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=["severity", "category", "reference", "issue", "details", "action"])
+            writer.writeheader()
+            writer.writerows(self.data_quality_issues)
+        QMessageBox.information(self, "Data Quality", f"Exported {len(self.data_quality_issues):,} issue(s).")
+
+    # ------------------------------------------------------------------
+    # Watched import folder
+    # ------------------------------------------------------------------
+    def setup_watched_import_folder(self):
+        folder = str(self.settings.value("watched_import/root", "") or "").strip()
+        enabled = str(self.settings.value("watched_import/enabled", "false") or "false").lower() in {"1", "true", "yes"}
+        auto_import = str(self.settings.value("watched_import/auto", "false") or "false").lower() in {"1", "true", "yes"}
+        archive = str(self.settings.value("watched_import/archive", "true") or "true").lower() in {"1", "true", "yes"}
+        if getattr(self.ui, "watchedImportFolder_label", None) is not None:
+            self.ui.watchedImportFolder_label.setText(folder)
+        if getattr(self.ui, "watchedImportEnabled_checkBox", None) is not None:
+            self.ui.watchedImportEnabled_checkBox.setChecked(enabled)
+            self.ui.watchedImportEnabled_checkBox.toggled.connect(self.save_watched_import_settings)
+        if getattr(self.ui, "watchedImportAuto_checkBox", None) is not None:
+            self.ui.watchedImportAuto_checkBox.setChecked(auto_import)
+            self.ui.watchedImportAuto_checkBox.toggled.connect(self.save_watched_import_settings)
+        if getattr(self.ui, "watchedImportArchive_checkBox", None) is not None:
+            self.ui.watchedImportArchive_checkBox.setChecked(archive)
+            self.ui.watchedImportArchive_checkBox.toggled.connect(self.save_watched_import_settings)
+        if getattr(self.ui, "watchedImportChoose_button", None) is not None:
+            self.ui.watchedImportChoose_button.clicked.connect(self.choose_watched_import_folder)
+        if getattr(self.ui, "watchedImportOpen_button", None) is not None:
+            self.ui.watchedImportOpen_button.clicked.connect(self.open_watched_import_folder)
+        if getattr(self.ui, "watchedImportScan_button", None) is not None:
+            self.ui.watchedImportScan_button.clicked.connect(lambda: self.scan_watched_import_folder(auto_trigger=False))
+        if getattr(self.ui, "watchedImportSelected_button", None) is not None:
+            self.ui.watchedImportSelected_button.clicked.connect(self.import_selected_watched_file)
+        if getattr(self.ui, "watchedImportAll_button", None) is not None:
+            self.ui.watchedImportAll_button.clicked.connect(lambda: self.import_all_ready_watched_files(silent=False))
+        if getattr(self.ui, "watchedImport_table", None) is not None:
+            self.ui.watchedImport_table.cellDoubleClicked.connect(lambda _row, _column: self.import_selected_watched_file())
+
+        if folder:
+            self.ensure_watched_import_folders(Path(folder))
+        if self.watched_import_timer is None:
+            self.watched_import_timer = QTimer(self)
+            self.watched_import_timer.setInterval(self.watched_import_scan_interval_ms)
+            self.watched_import_timer.timeout.connect(lambda: self.scan_watched_import_folder(auto_trigger=True))
+            self.watched_import_timer.start()
+        QTimer.singleShot(800, lambda: self.scan_watched_import_folder(auto_trigger=False))
+
+    def save_watched_import_settings(self, *_args):
+        folder = str(getattr(self.ui, "watchedImportFolder_label", None).text() if getattr(self.ui, "watchedImportFolder_label", None) else "").strip()
+        self.settings.setValue("watched_import/root", folder)
+        self.settings.setValue("watched_import/enabled", bool(getattr(self.ui, "watchedImportEnabled_checkBox", None) and self.ui.watchedImportEnabled_checkBox.isChecked()))
+        self.settings.setValue("watched_import/auto", bool(getattr(self.ui, "watchedImportAuto_checkBox", None) and self.ui.watchedImportAuto_checkBox.isChecked()))
+        self.settings.setValue("watched_import/archive", bool(getattr(self.ui, "watchedImportArchive_checkBox", None) and self.ui.watchedImportArchive_checkBox.isChecked()))
+
+    def watched_import_folder_map(self):
+        return {
+            "Sales": Path("Sales"),
+            "Stock": Path("Stock"),
+            "Orders - To Do List": Path("Orders") / "ToDo",
+            "Orders - Item Purchases": Path("Orders") / "Purchases",
+            "Cover Orders": Path("Cover Orders"),
+            "Item Costs": Path("Item Costs"),
+            "Processed": Path("Processed"),
+            "Failed": Path("Failed"),
+        }
+
+    def ensure_watched_import_folders(self, root):
+        root = Path(root)
+        root.mkdir(parents=True, exist_ok=True)
+        for relative in self.watched_import_folder_map().values():
+            (root / relative).mkdir(parents=True, exist_ok=True)
+        readme = root / "README - Watched Imports.txt"
+        if not readme.exists():
+            readme.write_text(
+                "WINDSOR WIDGET WATCHED IMPORT FOLDER\n\n"
+                "Place exports in these folders:\n"
+                "Sales\\                MYOB sales exports\n"
+                "Stock\\                MYOB stock exports\n"
+                "Orders\\ToDo\\         Orders To Be Received report\n"
+                "Orders\\Purchases\\    Item Purchases export\n"
+                "Cover Orders\\         Sales Orders export containing COVER ORDER rows\n"
+                "Item Costs\\           Item Number / Price / Date / Description export\n\n"
+                "Successful imports can be moved to Processed automatically.\n",
+                encoding="utf-8",
+            )
+
+    def choose_watched_import_folder(self):
+        current = str(getattr(self.ui, "watchedImportFolder_label", None).text() if getattr(self.ui, "watchedImportFolder_label", None) else self.base_dir)
+        folder = QFileDialog.getExistingDirectory(self, "Choose watched import root folder", current or str(self.base_dir))
+        if not folder:
+            return
+        self.ensure_watched_import_folders(Path(folder))
+        self.ui.watchedImportFolder_label.setText(folder)
+        self.ui.watchedImportEnabled_checkBox.setChecked(True)
+        self.save_watched_import_settings()
+        self.scan_watched_import_folder(auto_trigger=False)
+
+    def open_watched_import_folder(self):
+        folder = str(getattr(self.ui, "watchedImportFolder_label", None).text() if getattr(self.ui, "watchedImportFolder_label", None) else "").strip()
+        if not folder:
+            QMessageBox.information(self, "Watched imports", "Choose a watched folder first.")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+
+    def classify_watched_import_path(self, path, root):
+        path = Path(path)
+        root = Path(root)
+        try:
+            relative = path.relative_to(root)
+            parts = [part.casefold().replace("_", " ").replace("-", " ") for part in relative.parts[:-1]]
+        except Exception:
+            parts = []
+        joined = "/".join(parts)
+        name = path.stem.casefold().replace("_", " ").replace("-", " ")
+        if "processed" in joined or "failed" in joined:
+            return ""
+        if "cover orders" in joined or "cover order" in name:
+            return "cover_orders"
+        if "item costs" in joined or "item cost" in name or name.startswith("itempur"):
+            return "item_costs"
+        if "orders/to do" in joined or "orders/todo" in joined or "to do" in name or "todo" in name or "tdlord" in name:
+            return "orders_todo"
+        if "orders/purchases" in joined or ("orders" in joined and "purchase" in name):
+            return "orders_purchase"
+        if "sales" in joined or "sales" in name:
+            return "sales"
+        if "stock" in joined or "stock" in name:
+            return "stock"
+        if "purchase" in name and "order" in name:
+            return "orders_purchase"
+        return ""
+
+    def watched_file_fingerprint(self, path):
+        path = Path(path)
+        stat = path.stat()
+        cache_key = (stat.st_size, stat.st_mtime_ns)
+        cached = self._watched_fingerprint_cache.get(str(path))
+        if cached and cached.get("key") == cache_key:
+            return cached.get("fingerprint", "")
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        fingerprint = digest.hexdigest()
+        self._watched_fingerprint_cache[str(path)] = {"key": cache_key, "fingerprint": fingerprint}
+        return fingerprint
+
+    def scan_watched_import_folder(self, auto_trigger=False):
+        if self._watched_import_busy:
+            return
+        enabled = bool(getattr(self.ui, "watchedImportEnabled_checkBox", None) and self.ui.watchedImportEnabled_checkBox.isChecked())
+        if auto_trigger and not enabled:
+            return
+        root_text = str(getattr(self.ui, "watchedImportFolder_label", None).text() if getattr(self.ui, "watchedImportFolder_label", None) else "").strip()
+        status_label = getattr(self.ui, "watchedImportStatus_label", None)
+        table = getattr(self.ui, "watchedImport_table", None)
+        if not root_text:
+            if status_label is not None:
+                status_label.setText("Choose a watched import root folder.")
+            if table is not None:
+                table.setRowCount(0)
+            return
+        root = Path(root_text)
+        if not root.exists():
+            if status_label is not None:
+                status_label.setText("The watched folder no longer exists.")
+            return
+        self.ensure_watched_import_folders(root)
+        history = self.watched_import_history_lookup()
+        candidates = []
+        allowed = {".txt", ".csv", ".xlsx", ".xlsm"}
+        now_ts = datetime.now().timestamp()
+        for path in root.rglob("*"):
+            if not path.is_file() or path.suffix.lower() not in allowed:
+                continue
+            kind = self.classify_watched_import_path(path, root)
+            if not kind:
+                continue
+            try:
+                stat = path.stat()
+                stable = now_ts - stat.st_mtime >= 5
+                fingerprint = self.watched_file_fingerprint(path)
+            except Exception as exc:
+                candidates.append({"path": path, "kind": kind, "size": 0, "modified": None, "modified_iso": "", "stable": False, "fingerprint": "", "status": "Unreadable", "details": str(exc)})
+                continue
+            history_row = history.get(fingerprint, {})
+            history_status = str(history_row.get("status") or "")
+            if history_status in {"Imported", "Superseded"}:
+                display_status = history_status
+                details = str(history_row.get("message") or history_row.get("processed_at") or "")
+            elif not stable:
+                display_status = "Waiting"
+                details = "File is still being written or was modified in the last 5 seconds."
+            elif history_status == "Failed":
+                display_status = "Failed - retry"
+                details = str(history_row.get("message") or "")
+            else:
+                display_status = "Ready"
+                details = "New file"
+            candidates.append({
+                "path": path,
+                "kind": kind,
+                "size": stat.st_size,
+                "modified": datetime.fromtimestamp(stat.st_mtime),
+                "modified_iso": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+                "stable": stable,
+                "fingerprint": fingerprint,
+                "status": display_status,
+                "details": details,
+            })
+        candidates.sort(key=lambda row: (row.get("modified") or datetime.min), reverse=True)
+        self._watched_import_rows = candidates
+        self.populate_watched_import_table()
+        ready_count = sum(1 for row in candidates if row.get("status") in {"Ready", "Failed - retry"})
+        if status_label is not None:
+            status_label.setText(
+                f"Last scan: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')} — "
+                f"{ready_count:,} ready file(s), {len(candidates):,} recognised file(s)."
+            )
+        if auto_trigger and enabled and bool(getattr(self.ui, "watchedImportAuto_checkBox", None) and self.ui.watchedImportAuto_checkBox.isChecked()) and ready_count:
+            self.import_all_ready_watched_files(silent=True)
+
+    def watched_import_kind_label(self, kind):
+        return {
+            "sales": "Sales", "stock": "Stock", "orders_todo": "Orders - To Do",
+            "orders_purchase": "Orders - Purchases", "cover_orders": "Cover Orders",
+            "item_costs": "Item Costs"
+        }.get(kind, kind)
+
+    def populate_watched_import_table(self):
+        table = getattr(self.ui, "watchedImport_table", None)
+        if table is None:
+            return
+        table.setSortingEnabled(False)
+        table.setRowCount(len(self._watched_import_rows))
+        for row_index, candidate in enumerate(self._watched_import_rows):
+            modified = candidate.get("modified")
+            size = int(candidate.get("size") or 0)
+            values = [
+                self.watched_import_kind_label(candidate.get("kind")),
+                str(candidate.get("path").name if candidate.get("path") else ""),
+                modified.strftime("%d/%m/%Y %H:%M:%S") if isinstance(modified, datetime) else "",
+                f"{size / 1024:,.1f} KB" if size < 1024 * 1024 else f"{size / (1024 * 1024):,.1f} MB",
+                str(candidate.get("status") or ""),
+                str(candidate.get("details") or ""),
+            ]
+            for column_index, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setData(Qt.UserRole, dict(candidate))
+                table.setItem(row_index, column_index, item)
+        table.setSortingEnabled(True)
+
+    def selected_watched_import_candidate(self):
+        table = getattr(self.ui, "watchedImport_table", None)
+        if table is None or table.currentRow() < 0:
+            return None
+        item = table.item(table.currentRow(), 0)
+        data = item.data(Qt.UserRole) if item is not None else None
+        return dict(data) if isinstance(data, dict) else None
+
+    def ready_watched_candidates(self):
+        return [row for row in self._watched_import_rows if row.get("stable") and row.get("status") in {"Ready", "Failed - retry"}]
+
+    def newest_watched_candidate(self, candidates, kind):
+        matches = [row for row in candidates if row.get("kind") == kind]
+        if not matches:
+            return None
+        return max(matches, key=lambda row: row.get("modified") or datetime.min)
+
+    def import_selected_watched_file(self):
+        candidate = self.selected_watched_import_candidate()
+        if not candidate:
+            QMessageBox.information(self, "Watched imports", "Select a ready file first.")
+            return
+        if candidate.get("status") == "Imported":
+            QMessageBox.information(self, "Watched imports", "This exact file content has already been imported.")
+            return
+        ready = self.ready_watched_candidates()
+        kind = candidate.get("kind")
+        if kind in {"orders_todo", "orders_purchase"}:
+            todo = candidate if kind == "orders_todo" else self.newest_watched_candidate(ready, "orders_todo")
+            purchase = candidate if kind == "orders_purchase" else self.newest_watched_candidate(ready, "orders_purchase")
+            if not todo or not purchase:
+                QMessageBox.warning(self, "Watched imports", "Orders require both a To Do List report and an Item Purchases export.")
+                return
+            self.process_watched_import_group("orders", [todo, purchase], silent=False)
+        else:
+            self.process_watched_import_group(kind, [candidate], silent=False)
+        self.scan_watched_import_folder(auto_trigger=False)
+
+    def import_all_ready_watched_files(self, silent=False):
+        if self._watched_import_busy:
+            return
+        ready = self.ready_watched_candidates()
+        if not ready:
+            if not silent:
+                QMessageBox.information(self, "Watched imports", "No ready files were found.")
+            return
+        groups = []
+        # Cost files are safe incrementally, process oldest first.
+        for candidate in sorted([row for row in ready if row.get("kind") == "item_costs"], key=lambda row: row.get("modified") or datetime.min):
+            groups.append(("item_costs", [candidate]))
+        # These imports represent snapshots/replacements, so use only the newest file.
+        for kind in ("sales", "stock", "cover_orders"):
+            candidate = self.newest_watched_candidate(ready, kind)
+            if candidate:
+                groups.append((kind, [candidate]))
+        todo = self.newest_watched_candidate(ready, "orders_todo")
+        purchase = self.newest_watched_candidate(ready, "orders_purchase")
+        if todo and purchase:
+            groups.append(("orders", [todo, purchase]))
+        elif todo or purchase:
+            if not silent:
+                QMessageBox.warning(self, "Watched imports", "The orders queue is waiting for its matching To Do List or Item Purchases file.")
+
+        selected_fingerprints = {
+            str(candidate.get("fingerprint") or "")
+            for _kind, candidates in groups
+            for candidate in candidates
+        }
+        snapshot_kinds = {"sales", "stock", "cover_orders", "orders_todo", "orders_purchase"}
+        for candidate in ready:
+            fingerprint = str(candidate.get("fingerprint") or "")
+            if candidate.get("kind") in snapshot_kinds and fingerprint not in selected_fingerprints:
+                self.record_watched_import_history(
+                    candidate,
+                    "Superseded",
+                    "A newer export of the same type was selected. This older snapshot was not imported.",
+                )
+
+        results = []
+        for kind, candidates in groups:
+            ok, message = self.process_watched_import_group(kind, candidates, silent=True)
+            results.append((kind, ok, message))
+        self.scan_watched_import_folder(auto_trigger=False)
+        if not silent:
+            summary = "\n".join(f"{self.watched_import_kind_label(kind)}: {'OK' if ok else 'FAILED'} — {message}" for kind, ok, message in results)
+            QMessageBox.information(self, "Watched imports", summary or "No complete import groups were ready.")
+
+    def acquire_watched_import_lock(self, candidates):
+        if self.db_engine != "sqlserver":
+            return True, ""
+        fingerprint_text = "|".join(sorted(str(candidate.get("fingerprint") or "") for candidate in candidates))
+        lock_name = "WindsorWidgetWatchedImport:" + hashlib.sha256(fingerprint_text.encode("utf-8")).hexdigest()
+        cur = self.db_conn.cursor()
+        cur.execute(
+            """
+            SET NOCOUNT ON;
+            DECLARE @result INT;
+            EXEC @result = sp_getapplock
+                @Resource = ?,
+                @LockMode = 'Exclusive',
+                @LockOwner = 'Session',
+                @LockTimeout = 0;
+            SELECT @result AS lock_result;
+            """,
+            (lock_name,),
+        )
+        row = cur.fetchone()
+        result = int(row["lock_result"] if row is not None else -999)
+        return result >= 0, lock_name
+
+    def release_watched_import_lock(self, lock_name):
+        if self.db_engine != "sqlserver" or not lock_name:
+            return
+        try:
+            cur = self.db_conn.cursor()
+            cur.execute(
+                "EXEC sp_releaseapplock @Resource = ?, @LockOwner = 'Session';",
+                (lock_name,),
+            )
+        except Exception:
+            pass
+
+    def process_watched_import_group(self, kind, candidates, silent=False):
+        if self._watched_import_busy:
+            return False, "Another watched import is already running on this PC."
+        lock_acquired, lock_name = self.acquire_watched_import_lock(candidates)
+        if not lock_acquired:
+            return False, "Another user is already importing the same file(s)."
+        self._watched_import_busy = True
+        try:
+            history = self.watched_import_history_lookup()
+            if all(str(history.get(str(candidate.get("fingerprint") or ""), {}).get("status") or "") == "Imported" for candidate in candidates):
+                return True, "Already imported by another user."
+            paths = [str(candidate.get("path")) for candidate in candidates]
+            if kind == "sales":
+                count = self.import_sales_file(paths[0], progress=None)
+                message = f"{count:,} new sales row(s)"
+                self._update_watched_import_meta("sales", candidates[0], message)
+            elif kind == "stock":
+                count = self.import_stock_file(paths[0], progress=None)
+                message = f"{count:,} stock row(s)"
+                self._update_watched_import_meta("stock", candidates[0], message)
+            elif kind == "cover_orders":
+                count = self.import_cover_orders_file(paths[0], progress=None)
+                message = f"{count:,} cover-order row(s)"
+                self._update_watched_import_meta("cover_orders", candidates[0], message)
+            elif kind == "item_costs":
+                result = self.import_yu_cost_file(paths[0], progress=None, force_all_costs=False)
+                message = f"{result.get('updated_count', 0):,} cost(s), {result.get('description_updated_count', 0):,} description(s)"
+                self._update_watched_import_meta("item_costs", candidates[0], message, result=result)
+            elif kind == "orders":
+                todo = next(candidate for candidate in candidates if candidate.get("kind") == "orders_todo")
+                purchase = next(candidate for candidate in candidates if candidate.get("kind") == "orders_purchase")
+                count = self.import_orders_files(str(todo["path"]), str(purchase["path"]), progress=None)
+                message = f"{count:,} open order row(s)"
+                self._update_watched_import_meta("orders", purchase, message, todo_candidate=todo)
+            else:
+                raise ValueError(f"Unsupported watched import type: {kind}")
+
+            archived_paths = self.archive_watched_import_candidates(candidates)
+            for candidate in candidates:
+                self.record_watched_import_history(candidate, "Imported", message, archived_paths.get(candidate.get("fingerprint"), ""))
+            self.load_reference_lists()
+            self.refresh_dashboard()
+            self.rerun_item_if_ready()
+            self.rerun_order_analysis_if_ready()
+            self.refresh_order_table_on_order_column()
+            if not silent:
+                QMessageBox.information(self, "Watched import complete", f"{self.watched_import_kind_label(kind)} imported.\n\n{message}")
+            return True, message
+        except Exception as exc:
+            message = str(exc)
+            for candidate in candidates:
+                try:
+                    self.record_watched_import_history(candidate, "Failed", message)
+                except Exception:
+                    pass
+            if not silent:
+                QMessageBox.critical(self, "Watched import failed", message)
+            return False, message
+        finally:
+            self._watched_import_busy = False
+            self.release_watched_import_lock(lock_name)
+
+    def _update_watched_import_meta(self, kind, candidate, message, result=None, todo_candidate=None):
+        now_text = datetime.now().strftime("%d/%m/%Y %H:%M")
+        now_iso = datetime.now().isoformat(timespec="seconds")
+        file_name = candidate.get("path").name
+        if kind == "sales":
+            display = f"Last import: {now_text}\nFile: {file_name}\n{message}"
+            self.set_meta_value("sales_last_import_display", display)
+            self.set_meta_value("sales_last_import_iso", now_iso)
+            if getattr(self.ui, "lastUpdateSales_textBrowser", None): self.ui.lastUpdateSales_textBrowser.setPlainText(display)
+        elif kind == "stock":
+            display = f"Last import: {now_text}\nFile: {file_name}\n{message}"
+            self.set_meta_value("stock_last_import_display", display)
+            self.set_meta_value("stock_last_import_iso", now_iso)
+            if getattr(self.ui, "lastUPdateStock_textBrowser_2", None): self.ui.lastUPdateStock_textBrowser_2.setPlainText(display)
+        elif kind == "cover_orders":
+            display = f"Last import: {now_text}\nFile: {file_name}\n{message}"
+            self.set_meta_value("cover_orders_last_import_display", display)
+            self.set_meta_value("cover_orders_last_import_iso", now_iso)
+            if getattr(self.ui, "lastUpdateCoverOrders_textBrowser", None): self.ui.lastUpdateCoverOrders_textBrowser.setPlainText(display)
+        elif kind == "item_costs":
+            source_date = (result or {}).get("source_max_date")
+            source_text = source_date.strftime("%d/%m/%Y") if isinstance(source_date, date) else "Unknown"
+            display = f"Last import: {now_text}\nFile: {file_name}\nMode: Watched incremental\nExport through: {source_text}\n{message}"
+            self.set_meta_value("yu_cost_last_import_display", display)
+            self.set_meta_value("yu_cost_last_import_iso", now_iso)
+            if isinstance(source_date, date): self.set_meta_value("yu_cost_latest_source_date", source_date.isoformat())
+            if getattr(self.ui, "lastUpdateYUCosts_textBrowser", None): self.ui.lastUpdateYUCosts_textBrowser.setPlainText(display)
+        elif kind == "orders":
+            todo_name = todo_candidate.get("path").name if todo_candidate else ""
+            display = f"Last import: {now_text}\nTo Do List: {todo_name}\nItem Purchases: {file_name}\n{message}"
+            self.set_meta_value("orders_last_import_display", display)
+            self.set_meta_value("orders_last_import_iso", now_iso)
+            if getattr(self.ui, "lastUpdateOrders_textBrowser_3", None): self.ui.lastUpdateOrders_textBrowser_3.setPlainText(display)
+
+    def archive_watched_import_candidates(self, candidates):
+        archived = {}
+        should_archive = bool(getattr(self.ui, "watchedImportArchive_checkBox", None) and self.ui.watchedImportArchive_checkBox.isChecked())
+        if not should_archive:
+            return archived
+        root_text = str(getattr(self.ui, "watchedImportFolder_label", None).text() if getattr(self.ui, "watchedImportFolder_label", None) else "").strip()
+        if not root_text:
+            return archived
+        root = Path(root_text)
+        date_folder = root / "Processed" / datetime.now().strftime("%Y-%m-%d")
+        date_folder.mkdir(parents=True, exist_ok=True)
+        for candidate in candidates:
+            source = Path(candidate.get("path"))
+            if not source.exists():
+                continue
+            destination = date_folder / source.name
+            counter = 2
+            while destination.exists():
+                destination = date_folder / f"{source.stem}_{counter}{source.suffix}"
+                counter += 1
+            try:
+                shutil.move(str(source), str(destination))
+                archived[candidate.get("fingerprint")] = str(destination)
+            except Exception:
+                archived[candidate.get("fingerprint")] = ""
+        return archived
 
     def setup_order_table(self):
         table = getattr(self.ui, "order_table", None)
