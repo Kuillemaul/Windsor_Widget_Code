@@ -120,7 +120,7 @@ from yu_order_workflow import YUOrderEntryDialog, load_yu_review_module
 TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
 TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
 TABLE_FORMAT_SETTINGS_PREFIX = "table_format"
-APP_VERSION = "1.6.5"
+APP_VERSION = "1.6.6"
 APP_DESIGNER = "Bradley Mayze"
 YU_SUPPLIER_DISPLAY_NAME = "Yuchang Textile Factory"
 # Generic latest purchase-cost fields. These apply to every item in the item master.
@@ -18142,6 +18142,13 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
 
     def classify_watched_import_path(self, path, root):
+        """Classify a watched import using its folder before its filename.
+
+        MYOB commonly names both purchase-history exports and the purchase half
+        of the open-orders import ITEMPUR.TXT. The containing folder is therefore
+        authoritative. Filename rules are used only as a fallback when the file
+        is outside one of the named watched-import folders.
+        """
         path = Path(path)
         root = Path(root)
         try:
@@ -18151,24 +18158,41 @@ class MainWindow(QMainWindow):
             parts = []
         joined = "/".join(parts)
         name = path.stem.casefold().replace("_", " ").replace("-", " ")
+
         if "processed" in joined or "failed" in joined:
             return ""
-        if "cover orders" in joined or "cover order" in name:
-            return "cover_orders"
-        if "item master" in joined or name.startswith("itemwhole") or "item whole" in name:
-            return "item_master"
-        if "item costs" in joined or "item cost" in name or name.startswith("itempur"):
-            return "item_costs"
-        if "orders/to do" in joined or "orders/todo" in joined or "to do" in name or "todo" in name or "tdlord" in name:
+
+        # Explicit watched folders take priority over ambiguous MYOB filenames.
+        if "orders/to do" in joined or "orders/todo" in joined:
             return "orders_todo"
-        if "orders/purchases" in joined or ("orders" in joined and "purchase" in name):
+        if "orders/purchases" in joined:
             return "orders_purchase"
-        if "sales" in joined or "sales" in name:
+        if "cover orders" in joined:
+            return "cover_orders"
+        if "item costs" in joined:
+            return "item_costs"
+        if "item master" in joined:
+            return "item_master"
+        if "sales" in joined:
             return "sales"
-        if "stock" in joined or "stock" in name:
+        if "stock" in joined:
             return "stock"
+
+        # Filename fallbacks for files placed outside the standard folders.
+        if "cover order" in name:
+            return "cover_orders"
+        if name.startswith("itemwhole") or "item whole" in name:
+            return "item_master"
+        if "to do" in name or "todo" in name or "tdlord" in name:
+            return "orders_todo"
         if "purchase" in name and "order" in name:
             return "orders_purchase"
+        if "item cost" in name or name.startswith("itempur"):
+            return "item_costs"
+        if "sales" in name:
+            return "sales"
+        if "stock" in name:
+            return "stock"
         return ""
 
     def watched_file_fingerprint(self, path):
