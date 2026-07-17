@@ -1,0 +1,20 @@
+--- /mnt/data/Windsor_Widget_MYOB_No_Currency_Fields_v1.6.7/main_patched_status_yu.py	2026-07-16 23:59:51.789540224 +0000
++++ /mnt/data/Windsor_Widget_To_Order_Shipped_v1.6.8/main_patched_status_yu.py	2026-07-17 00:00:52.493369020 +0000
+@@ -120,7 +120,7 @@
+ TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
+ TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
+ TABLE_FORMAT_SETTINGS_PREFIX = "table_format"
+-APP_VERSION = "1.6.7"
++APP_VERSION = "1.6.8"
+ APP_DESIGNER = "Bradley Mayze"
+ YU_SUPPLIER_DISPLAY_NAME = "Yuchang Textile Factory"
+ # Generic latest purchase-cost fields. These apply to every item in the item master.
+@@ -18586,7 +18586,7 @@
+             "Item Number",
+             "Select",
+             "Description",
+-            "On Order",
++            "Shipped",
+             "Qty",
+             "Supplier",
+             "Status",

@@ -12,6 +12,10 @@ try:
 except Exception:
     pyodbc = None
 try:
+    import xlrd
+except Exception:
+    xlrd = None
+try:
     from shiboken6 import isValid as shiboken_is_valid
 except Exception:
     shiboken_is_valid = None
@@ -120,7 +124,7 @@ from yu_order_workflow import YUOrderEntryDialog, load_yu_review_module
 TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
 TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
 TABLE_FORMAT_SETTINGS_PREFIX = "table_format"
-APP_VERSION = "1.6.6"
+APP_VERSION = "1.7.0"
 APP_DESIGNER = "Bradley Mayze"
 YU_SUPPLIER_DISPLAY_NAME = "Yuchang Textile Factory"
 # Generic latest purchase-cost fields. These apply to every item in the item master.
@@ -161,8 +165,6 @@ MYOB_CONTAINER_PO_HEADERS = [
     "Freight Tax Code",
     "Freight Tax Amount",
     "Purchase Status",
-    "Currency Code",
-    "Exchange Rate",
     "Terms - Payment is Due",
     "           - Discount Days",
     "           - Balance Due Days",
@@ -2231,7 +2233,7 @@ class ShipmentUpdateReviewDialog(QDialog):
         return actions
 
 
-class ShipmentsWindow(QMainWindow):
+class LegacyShipmentsWindow(QMainWindow):
     RECORD_ID_ROLE = Qt.UserRole + 500
 
     def __init__(self, main_window):
@@ -3483,6 +3485,1515 @@ class ShipmentsWindow(QMainWindow):
             date_box.setPlainText(text_value)
 
 
+
+
+
+
+class ShipmentEditorDialog(QDialog):
+    """Create or edit one shipment without exposing database row identifiers."""
+
+    def __init__(self, owner, shipment=None, default_destination="", parent=None):
+        super().__init__(parent or owner)
+        self.owner = owner
+        self.shipment = dict(shipment or {})
+        self.setWindowTitle("Edit Shipment" if self.shipment else "New Shipment")
+        self.resize(720, 690)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
+
+        shipment_no = str(self.shipment.get("shipment_uid") or "Assigned when saved")
+        id_row = QHBoxLayout()
+        id_row.addWidget(QLabel("Windsor Shipment No.", self))
+        self.shipment_uid_label = QLabel(shipment_no, self)
+        self.shipment_uid_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        font = self.shipment_uid_label.font()
+        font.setBold(True)
+        self.shipment_uid_label.setFont(font)
+        id_row.addWidget(self.shipment_uid_label, 1)
+        layout.addLayout(id_row)
+
+        form_widget = QWidget(self)
+        form = QGridLayout(form_widget)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(10)
+
+        def line_edit(key, placeholder=""):
+            widget = QLineEdit(form_widget)
+            widget.setText(str(self.shipment.get(key) or ""))
+            if placeholder:
+                widget.setPlaceholderText(placeholder)
+            return widget
+
+        def date_edit(key):
+            widget = QLineEdit(form_widget)
+            widget.setInputMask("00/00/00;_")
+            value = owner.normalise_date_text(self.shipment.get(key))
+            widget.setText(value)
+            widget.setPlaceholderText("dd/mm/yy")
+            return widget
+
+        self.destination_combo = QComboBox(form_widget)
+        self.destination_combo.setEditable(True)
+        self.destination_combo.addItems(SHIPMENT_TYPE_OPTIONS)
+        destination = str(self.shipment.get("shipment_type") or default_destination or "Melbourne")
+        self.destination_combo.setCurrentText(destination)
+
+        self.supplier_combo = QComboBox(form_widget)
+        self.supplier_combo.setEditable(True)
+        self.supplier_combo.addItems(owner.supplier_names)
+        self.supplier_combo.setCurrentText(str(self.shipment.get("supplier_name") or ""))
+        if owner.supplier_names:
+            completer = QCompleter(owner.supplier_names, self.supplier_combo)
+            completer.setCaseSensitivity(Qt.CaseInsensitive)
+            completer.setFilterMode(Qt.MatchContains)
+            self.supplier_combo.setCompleter(completer)
+
+        self.orders_edit = line_edit("order_no", "One or several POs, separated by commas")
+        self.shipment_ref_edit = line_edit("shipment_ref", "Forwarder/job reference — may change")
+        self.container_edit = line_edit("container_no")
+        self.contents_edit = line_edit("product", "Contents, pallets, cones or product group")
+        self.load_edit = line_edit("qty", "40' FCL, 20' FCL, LCL, 4 pallets...")
+        self.vessel_edit = line_edit("vessel")
+
+        self.transport_combo = QComboBox(form_widget)
+        self.transport_combo.setEditable(True)
+        self.transport_combo.addItems(["", "SEA", "AIR", "ROAD", "COURIER"])
+        self.transport_combo.setCurrentText(str(self.shipment.get("transport") or ""))
+
+        self.pack_mode_combo = QComboBox(form_widget)
+        self.pack_mode_combo.setEditable(True)
+        self.pack_mode_combo.addItems(["", "FCL", "LCL", "AIR", "COURIER"])
+        self.pack_mode_combo.setCurrentText(str(self.shipment.get("pack_mode") or ""))
+
+        self.status_combo = QComboBox(form_widget)
+        self.status_combo.addItems(owner.modern_status_options())
+        self.status_combo.setCurrentText(owner.normalise_status_value(self.shipment.get("status")))
+
+        self.entry_date_edit = date_edit("entry_date")
+        if not self.entry_date_edit.text().replace("/", "").replace("_", "").strip():
+            self.entry_date_edit.setText(date.today().strftime("%d/%m/%y"))
+        self.ready_date_edit = date_edit("ready_date")
+        self.etd_edit = date_edit("shipment_date")
+        self.eta_edit = date_edit("due_date")
+
+        fields = [
+            ("Destination", self.destination_combo, "Supplier", self.supplier_combo),
+            ("Order No(s)", self.orders_edit, "Forwarder Ref", self.shipment_ref_edit),
+            ("Transport", self.transport_combo, "Pack Mode", self.pack_mode_combo),
+            ("Load Type", self.load_edit, "Contents", self.contents_edit),
+            ("Container No", self.container_edit, "Vessel", self.vessel_edit),
+            ("Created", self.entry_date_edit, "Status", self.status_combo),
+            ("Ready", self.ready_date_edit, "ETD", self.etd_edit),
+            ("ETA", self.eta_edit, "", None),
+        ]
+        for row, (label1, widget1, label2, widget2) in enumerate(fields):
+            form.addWidget(QLabel(label1, form_widget), row, 0)
+            form.addWidget(widget1, row, 1)
+            if label2 and widget2 is not None:
+                form.addWidget(QLabel(label2, form_widget), row, 2)
+                form.addWidget(widget2, row, 3)
+        form.setColumnStretch(1, 1)
+        form.setColumnStretch(3, 1)
+        layout.addWidget(form_widget)
+
+        layout.addWidget(QLabel("Internal Notes", self))
+        self.internal_notes_edit = QTextEdit(self)
+        self.internal_notes_edit.setPlainText(str(self.shipment.get("internal_notes") or ""))
+        self.internal_notes_edit.setPlaceholderText("Windsor-only notes. Forwarder imports do not overwrite this field.")
+        self.internal_notes_edit.setMinimumHeight(120)
+        layout.addWidget(self.internal_notes_edit, 1)
+
+        self.button_box = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel, parent=self)
+        self.button_box.accepted.connect(self.validate_and_accept)
+        self.button_box.rejected.connect(self.reject)
+        layout.addWidget(self.button_box)
+
+    def clean_date(self, widget):
+        value = (widget.text() or "").replace("_", "").strip()
+        if value in {"", "//"}:
+            return ""
+        return self.owner.normalise_date_text(value)
+
+    def values(self):
+        return {
+            "shipment_type": self.owner.normalise_shipment_type_value(self.destination_combo.currentText()),
+            "supplier_name": self.supplier_combo.currentText().strip(),
+            "order_no": self.orders_edit.text().strip(),
+            "shipment_ref": self.shipment_ref_edit.text().strip(),
+            "transport": self.transport_combo.currentText().strip().upper(),
+            "pack_mode": self.pack_mode_combo.currentText().strip().upper(),
+            "qty": self.load_edit.text().strip(),
+            "product": self.contents_edit.text().strip(),
+            "container_no": self.container_edit.text().strip(),
+            "vessel": self.vessel_edit.text().strip(),
+            "entry_date": self.clean_date(self.entry_date_edit),
+            "ready_date": self.clean_date(self.ready_date_edit),
+            "shipment_date": self.clean_date(self.etd_edit),
+            "due_date": self.clean_date(self.eta_edit),
+            "status": self.owner.normalise_status_value(self.status_combo.currentText()),
+            "internal_notes": self.internal_notes_edit.toPlainText().strip(),
+        }
+
+    def validate_and_accept(self):
+        values = self.values()
+        if not values.get("supplier_name") and not values.get("order_no") and not values.get("shipment_ref"):
+            QMessageBox.warning(self, "Shipment Details", "Enter at least a supplier, order number or forwarder reference.")
+            return
+        for field_name, label in (
+            ("entry_date", "Created"),
+            ("ready_date", "Ready"),
+            ("shipment_date", "ETD"),
+            ("due_date", "ETA"),
+        ):
+            raw = values.get(field_name, "")
+            if raw and self.owner.parse_shipment_date(raw) is None:
+                QMessageBox.warning(self, "Shipment Details", f"{label} must be a valid date such as 17/07/26.")
+                return
+        self.accept()
+
+
+class ModernShipmentUpdateReviewDialog(ShipmentUpdateReviewDialog):
+    def existing_label(self, row_data):
+        if not row_data:
+            return ""
+        values = dict(row_data)
+        shipment_uid = str(values.get("shipment_uid") or "-").strip() or "-"
+        shipment_ref = str(values.get("shipment_ref") or "-").strip() or "-"
+        order_no = str(values.get("order_no") or "-").strip() or "-"
+        shipment_type = str(values.get("shipment_type") or "-").strip() or "-"
+        supplier_name = str(values.get("supplier_name") or "-").strip() or "-"
+        container_no = str(values.get("container_no") or "-").strip() or "-"
+        due_date = str(values.get("due_date") or "-").strip() or "-"
+        return (
+            f"{shipment_uid} | {shipment_type} | PO {order_no} | Ref {shipment_ref} | "
+            f"{supplier_name} | Cont {container_no} | ETA {due_date}"
+        )
+
+
+class ShipmentsWindow(LegacyShipmentsWindow):
+    """Modern shipment register with a stable shipment number and detail-first layout."""
+
+    TABLE_COLUMNS = [
+        ("", "_alert"),
+        ("Shipment No.", "shipment_uid"),
+        ("ETA", "due_date"),
+        ("Status", "status"),
+        ("Destination", "shipment_type"),
+        ("Supplier", "supplier_name"),
+        ("Order No(s)", "order_no"),
+        ("Forwarder Ref", "shipment_ref"),
+        ("Load", "qty"),
+        ("Container", "container_no"),
+        ("Vessel", "vessel"),
+        ("Latest Update", "latest_forwarder_update"),
+    ]
+
+    EDITABLE_FIELDS = [
+        "entry_date", "shipment_type", "order_no", "shipment_ref", "supplier_name",
+        "container_no", "product", "qty", "ready_date", "shipment_date", "due_date",
+        "status", "vessel", "transport", "pack_mode", "internal_notes",
+    ]
+
+    def __init__(self, main_window):
+        self._all_shipments = []
+        self._filtered_shipments = []
+        self._shipment_by_id = {}
+        self._selected_record_id = None
+        self._recent_changed_fields = {}
+        self._modern_ui_ready = False
+        super().__init__(main_window)
+
+    def modern_status_options(self):
+        return ["", "PLANNED", "AWAITING READY", "AWAITING BOOKING", "BOOKED", "IN TRANSIT", "ARRIVED", "CLOSED"]
+
+    def normalise_status_value(self, text):
+        cleaned = re.sub(r"\s+", " ", str(text or "").strip().upper())
+        aliases = {
+            "SHIPPED": "IN TRANSIT",
+            "INTRANSIT": "IN TRANSIT",
+            "ON WATER": "IN TRANSIT",
+            "ON-WATER": "IN TRANSIT",
+            "PENDING": "PLANNED",
+            "WAITING": "AWAITING READY",
+            "WAITING BOOKING": "AWAITING BOOKING",
+            "COMPLETE": "CLOSED",
+        }
+        return aliases.get(cleaned, cleaned)
+
+    def derive_import_status(self, shipment_date, due_date, container_no, vessel, notes):
+        today = date.today()
+        notes_upper = str(notes or "").upper()
+        if "ARRIVED" in notes_upper or "DELIVERED" in notes_upper:
+            return "ARRIVED"
+        if due_date is not None and due_date < today and ("ARRIV" in notes_upper or "DELIVER" in notes_upper):
+            return "ARRIVED"
+        if shipment_date is not None and shipment_date <= today:
+            return "IN TRANSIT"
+        if container_no or vessel:
+            return "BOOKED"
+        return "AWAITING BOOKING"
+
+    def strongest_status(self, import_status, existing_status):
+        ranks = {
+            "": 0, "PLANNED": 1, "AWAITING READY": 2, "AWAITING BOOKING": 3,
+            "BOOKED": 4, "IN TRANSIT": 5, "ARRIVED": 6, "CLOSED": 7,
+        }
+        imported = self.normalise_status_value(import_status)
+        existing = self.normalise_status_value(existing_status)
+        return imported if ranks.get(imported, 0) >= ranks.get(existing, 0) else existing
+
+    def table_widget(self):
+        return getattr(self, "shipments_table", None)
+
+    def shipment_column_index(self, field_name):
+        for index, (_header, candidate) in enumerate(self.TABLE_COLUMNS):
+            if candidate == field_name:
+                return index
+        return -1
+
+    def configure_ui(self):
+        self.ensure_modern_shipment_schema()
+
+        central = QWidget(self)
+        central.setObjectName("modernShipmentsCentral")
+        root = QVBoxLayout(central)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(10)
+
+        self.kpi_layout = QHBoxLayout()
+        self.kpi_layout.setSpacing(8)
+        self.kpi_buttons = {}
+        kpis = [
+            ("needs_attention", "Needs Attention", "Needs Attention"),
+            ("awaiting_booking", "Awaiting Booking", "Awaiting Booking"),
+            ("in_transit", "In Transit", "In Transit"),
+            ("due_14", "Due Next 14 Days", "Due Next 14 Days"),
+            ("arrived", "Arrived / Closed", "Arrived / Closed"),
+            ("missing_info", "Missing Information", "Missing Information"),
+        ]
+        for key, title, view_name in kpis:
+            button = QPushButton(f"{title}\n0", central)
+            button.setObjectName(f"shipmentKpi_{key}")
+            button.setMinimumHeight(58)
+            button.setCursor(Qt.PointingHandCursor)
+            button.clicked.connect(lambda _checked=False, value=view_name: self.set_view_filter(value))
+            self.kpi_layout.addWidget(button, 1)
+            self.kpi_buttons[key] = button
+        root.addLayout(self.kpi_layout)
+
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(8)
+
+        self.view_filter_combo = QComboBox(central)
+        self.view_filter_combo.addItems([
+            "Active", "Needs Attention", "Awaiting Booking", "In Transit", "Due Next 14 Days",
+            "YU Container", "Arrived / Closed", "Missing Information", "All",
+        ])
+        self.view_filter_combo.setMinimumWidth(155)
+        toolbar.addWidget(QLabel("View", central))
+        toolbar.addWidget(self.view_filter_combo)
+
+        self.destination_filter_combo = QComboBox(central)
+        self.destination_filter_combo.addItem("All Destinations")
+        self.destination_filter_combo.addItems(SHIPMENT_TYPE_OPTIONS)
+        self.destination_filter_combo.setMinimumWidth(135)
+        toolbar.addWidget(self.destination_filter_combo)
+
+        self.search_edit = QLineEdit(central)
+        self.search_edit.setPlaceholderText("Search shipment no., supplier, PO, reference, container or vessel")
+        self.search_edit.setClearButtonEnabled(True)
+        toolbar.addWidget(self.search_edit, 1)
+
+        self.refresh_button = QPushButton("Refresh", central)
+        self.add_shipment_button = QPushButton("Add Shipment", central)
+        self.import_update_pushButton = QPushButton("Import Forwarder Update", central)
+        self.export_register_button = QPushButton("Export Register", central)
+        toolbar.addWidget(self.refresh_button)
+        toolbar.addWidget(self.add_shipment_button)
+        toolbar.addWidget(self.import_update_pushButton)
+        toolbar.addWidget(self.export_register_button)
+        root.addLayout(toolbar)
+
+        self.main_splitter = QSplitter(Qt.Horizontal, central)
+        self.main_splitter.setChildrenCollapsible(False)
+
+        table_frame = QFrame(self.main_splitter)
+        table_frame.setObjectName("shipmentTableCard")
+        table_layout = QVBoxLayout(table_frame)
+        table_layout.setContentsMargins(0, 0, 0, 0)
+        table_layout.setSpacing(6)
+
+        self.shipments_table = QTableWidget(table_frame)
+        self.shipments_table.setObjectName("mainshipping_table")
+        self.shipments_table.setColumnCount(len(self.TABLE_COLUMNS))
+        self.shipments_table.setHorizontalHeaderLabels([header for header, _field in self.TABLE_COLUMNS])
+        self.shipments_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.shipments_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.shipments_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.shipments_table.setAlternatingRowColors(True)
+        self.shipments_table.setShowGrid(False)
+        self.shipments_table.verticalHeader().setVisible(False)
+        self.shipments_table.verticalHeader().setDefaultSectionSize(38)
+        self.shipments_table.setWordWrap(False)
+        header = self.shipments_table.horizontalHeader()
+        header.setStretchLastSection(True)
+        for index in range(len(self.TABLE_COLUMNS)):
+            header.setSectionResizeMode(index, QHeaderView.Interactive)
+        widths = [30, 125, 78, 105, 95, 190, 125, 115, 85, 120, 120, 300]
+        for index, width in enumerate(widths):
+            self.shipments_table.setColumnWidth(index, width)
+        table_layout.addWidget(self.shipments_table, 1)
+
+        self.table_summary_label = QLabel("", table_frame)
+        table_layout.addWidget(self.table_summary_label)
+        self.main_splitter.addWidget(table_frame)
+
+        self.detail_scroll = QScrollArea(self.main_splitter)
+        self.detail_scroll.setWidgetResizable(True)
+        self.detail_scroll.setMinimumWidth(360)
+        self.detail_scroll.setMaximumWidth(520)
+        detail = QWidget(self.detail_scroll)
+        detail.setObjectName("shipmentDetailPanel")
+        detail_layout = QVBoxLayout(detail)
+        detail_layout.setContentsMargins(14, 14, 14, 14)
+        detail_layout.setSpacing(10)
+
+        detail_title_row = QHBoxLayout()
+        title = QLabel("Selected Shipment", detail)
+        title.setProperty("role", "sectionTitle")
+        detail_title_row.addWidget(title)
+        detail_title_row.addStretch(1)
+        self.detail_shipment_uid = QLabel("No shipment selected", detail)
+        self.detail_shipment_uid.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        uid_font = self.detail_shipment_uid.font()
+        uid_font.setBold(True)
+        self.detail_shipment_uid.setFont(uid_font)
+        detail_title_row.addWidget(self.detail_shipment_uid)
+        detail_layout.addLayout(detail_title_row)
+
+        fields_grid = QGridLayout()
+        fields_grid.setHorizontalSpacing(10)
+        fields_grid.setVerticalSpacing(6)
+        self.detail_labels = {}
+        detail_fields = [
+            ("Destination", "shipment_type"), ("Status", "status"),
+            ("Supplier", "supplier_name"), ("Order No(s)", "order_no"),
+            ("Forwarder Ref", "shipment_ref"), ("Transport", "transport"),
+            ("Pack Mode", "pack_mode"), ("Load", "qty"),
+            ("Contents", "product"), ("Container", "container_no"),
+            ("Vessel", "vessel"), ("Ready", "ready_date"),
+            ("ETD", "shipment_date"), ("ETA", "due_date"),
+        ]
+        for index, (label_text, field_name) in enumerate(detail_fields):
+            row = index
+            label = QLabel(label_text, detail)
+            value = QLabel("—", detail)
+            value.setWordWrap(True)
+            value.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            fields_grid.addWidget(label, row, 0)
+            fields_grid.addWidget(value, row, 1)
+            self.detail_labels[field_name] = value
+        fields_grid.setColumnStretch(1, 1)
+        detail_layout.addLayout(fields_grid)
+
+        self.issue_label = QLabel("", detail)
+        self.issue_label.setWordWrap(True)
+        detail_layout.addWidget(self.issue_label)
+
+        detail_layout.addWidget(QLabel("Latest Forwarder Update", detail))
+        self.latest_update_browser = QTextBrowser(detail)
+        self.latest_update_browser.setMinimumHeight(72)
+        self.latest_update_browser.setMaximumHeight(120)
+        detail_layout.addWidget(self.latest_update_browser)
+
+        detail_layout.addWidget(QLabel("Forwarder Update History", detail))
+        self.forwarder_history_browser = QTextBrowser(detail)
+        self.forwarder_history_browser.setMinimumHeight(120)
+        detail_layout.addWidget(self.forwarder_history_browser)
+
+        detail_layout.addWidget(QLabel("Internal Notes", detail))
+        self.internal_notes_edit = QTextEdit(detail)
+        self.internal_notes_edit.setPlaceholderText("Windsor-only notes")
+        self.internal_notes_edit.setMinimumHeight(95)
+        detail_layout.addWidget(self.internal_notes_edit)
+        self.save_notes_button = QPushButton("Save Internal Notes", detail)
+        detail_layout.addWidget(self.save_notes_button)
+
+        detail_layout.addWidget(QLabel("Change History", detail))
+        self.change_history_browser = QTextBrowser(detail)
+        self.change_history_browser.setMinimumHeight(110)
+        detail_layout.addWidget(self.change_history_browser)
+
+        action_grid = QGridLayout()
+        self.edit_shipment_button = QPushButton("Edit Shipment", detail)
+        self.mark_arrived_button = QPushButton("Mark Arrived", detail)
+        self.close_shipment_button = QPushButton("Close Shipment", detail)
+        self.open_container_button = QPushButton("Open Container", detail)
+        self.open_vessel_button = QPushButton("Open Vessel", detail)
+        self.delete_shipment_button = QPushButton("Delete", detail)
+        action_grid.addWidget(self.edit_shipment_button, 0, 0)
+        action_grid.addWidget(self.mark_arrived_button, 0, 1)
+        action_grid.addWidget(self.close_shipment_button, 1, 0)
+        action_grid.addWidget(self.open_container_button, 1, 1)
+        action_grid.addWidget(self.open_vessel_button, 2, 0)
+        action_grid.addWidget(self.delete_shipment_button, 2, 1)
+        detail_layout.addLayout(action_grid)
+        detail_layout.addStretch(1)
+
+        self.detail_scroll.setWidget(detail)
+        self.main_splitter.addWidget(self.detail_scroll)
+        self.main_splitter.setStretchFactor(0, 1)
+        self.main_splitter.setStretchFactor(1, 0)
+        self.main_splitter.setSizes([1100, 410])
+        root.addWidget(self.main_splitter, 1)
+
+        self.setCentralWidget(central)
+        self.ui.mainshipping_table = self.shipments_table
+        self.install_table_font_menus()
+        self.apply_modern_shipment_styles()
+        self._modern_ui_ready = True
+
+    def apply_modern_shipment_styles(self):
+        theme = "dark"
+        try:
+            theme = self.main_window.current_theme_name()
+        except Exception:
+            pass
+        if theme == "light":
+            card = "#F4F6F8"
+            border = "#C7CFD9"
+            text = "#1C2733"
+            accent = "#E7EEF7"
+        else:
+            card = "#252C35"
+            border = "#435064"
+            text = "#F0F3F7"
+            accent = "#303B49"
+        self.setStyleSheet(
+            f"""
+            #shipmentTableCard, #shipmentDetailPanel {{ background: {card}; border: 1px solid {border}; border-radius: 7px; }}
+            QPushButton[objectName^='shipmentKpi_'] {{ background: {accent}; color: {text}; border: 1px solid {border}; border-radius: 7px; padding: 6px; font-weight: 600; }}
+            QPushButton[objectName^='shipmentKpi_']:hover {{ border: 1px solid #5AA5E8; }}
+            #mainshipping_table {{ border: 1px solid {border}; border-radius: 4px; }}
+            """
+        )
+
+    def install_table_font_menus(self):
+        table = self.table_widget()
+        if table is None:
+            return
+        table.setProperty("_table_font_settings_token", "shipments_window/modern_register")
+        table.setProperty("_table_font_scope_key", "shipments_window")
+        table.setProperty("_table_font_default_size", current_table_font_size(table))
+        table.setContextMenuPolicy(Qt.CustomContextMenu)
+        table.customContextMenuRequested.connect(self.show_modern_context_menu)
+        apply_saved_table_format(table, settings=self.main_window.settings, scope_key="shipments_window", owner=self)
+
+    def connect_signals(self):
+        self.view_filter_combo.currentTextChanged.connect(lambda _text: self.load_table())
+        self.destination_filter_combo.currentTextChanged.connect(lambda _text: self.load_table())
+        self.search_edit.textChanged.connect(lambda _text: self.load_table())
+        self.refresh_button.clicked.connect(self.refresh_from_database)
+        self.add_shipment_button.clicked.connect(lambda: self.create_new_shipment(""))
+        self.import_update_pushButton.clicked.connect(self.import_shipment_update_workbook)
+        self.export_register_button.clicked.connect(self.export_shipment_register)
+        self.shipments_table.itemSelectionChanged.connect(self.handle_shipment_selection_changed)
+        self.shipments_table.cellDoubleClicked.connect(lambda _row, _col: self.edit_selected_shipment())
+        self.save_notes_button.clicked.connect(self.save_selected_internal_notes)
+        self.edit_shipment_button.clicked.connect(self.edit_selected_shipment)
+        self.mark_arrived_button.clicked.connect(self.mark_selected_arrived)
+        self.close_shipment_button.clicked.connect(self.close_selected_shipment)
+        self.open_container_button.clicked.connect(self.open_selected_container)
+        self.open_vessel_button.clicked.connect(self.open_selected_vessel)
+        self.delete_shipment_button.clicked.connect(self.delete_selected_shipment)
+
+    def refresh_last_updated_display(self):
+        latest_date = None
+        row = self.main_window.db_one(
+            "SELECT meta_value FROM shipments_meta WHERE meta_key = ?",
+            ("last_updated",),
+        )
+        if row is not None:
+            latest_date = self.main_window.parse_date_value(row.get("meta_value"))
+        if latest_date is None:
+            fallback = self.main_window.db_one(f"SELECT MAX(updated_on) AS updated_on FROM {SHIPMENT_TABLE_NAME}")
+            if fallback is not None:
+                latest_date = self.main_window.parse_date_value(fallback.get("updated_on"))
+        if hasattr(self, "table_summary_label"):
+            base = f"Showing {len(self._filtered_shipments):,} of {len(self._all_shipments):,} shipments"
+            if latest_date is not None:
+                base += f"  •  Last updated {latest_date.strftime('%d/%m/%Y')}"
+            self.table_summary_label.setText(base)
+
+    def show_modern_context_menu(self, pos):
+        table = self.table_widget()
+        item = table.itemAt(pos) if table is not None else None
+        if item is not None:
+            table.selectRow(item.row())
+        menu = QMenu(table)
+        edit_action = menu.addAction("Edit Shipment")
+        arrived_action = menu.addAction("Mark Arrived")
+        open_container_action = menu.addAction("Open Container in findTEU")
+        open_vessel_action = menu.addAction("Open Vessel in MarineTraffic")
+        menu.addSeparator()
+        add_table_format_menu(self, menu, table, self.main_window.settings, "shipments_window")
+        chosen = menu.exec(table.viewport().mapToGlobal(pos))
+        if chosen == edit_action:
+            self.edit_selected_shipment()
+        elif chosen == arrived_action:
+            self.mark_selected_arrived()
+        elif chosen == open_container_action:
+            self.open_selected_container()
+        elif chosen == open_vessel_action:
+            self.open_selected_vessel()
+
+    def ensure_modern_shipment_schema(self):
+        if self.main_window.db_conn is None:
+            return
+        columns = {str(name).lower() for name in self.main_window.get_table_columns(SHIPMENT_TABLE_NAME)}
+        desired = {
+            "shipment_uid": ("NVARCHAR(32) NULL", "TEXT"),
+            "transport": ("NVARCHAR(30) NULL", "TEXT"),
+            "pack_mode": ("NVARCHAR(30) NULL", "TEXT"),
+            "internal_notes": ("NVARCHAR(MAX) NULL", "TEXT"),
+            "forwarder_updates": ("NVARCHAR(MAX) NULL", "TEXT"),
+            "latest_forwarder_update": ("NVARCHAR(MAX) NULL", "TEXT"),
+            "last_forwarder_update_at": ("NVARCHAR(30) NULL", "TEXT"),
+            "is_closed": ("BIT NULL", "INTEGER"),
+        }
+        cur = self.main_window.db_conn.cursor()
+        for name, (sql_type, sqlite_type) in desired.items():
+            if name in columns:
+                continue
+            if self.main_window.db_engine == "sqlserver":
+                cur.execute(f"ALTER TABLE {SHIPMENT_TABLE_NAME} ADD [{name}] {sql_type}")
+            else:
+                cur.execute(f"ALTER TABLE {SHIPMENT_TABLE_NAME} ADD COLUMN {name} {sqlite_type}")
+
+        if self.main_window.db_engine == "sqlserver":
+            cur.execute(
+                """
+                IF OBJECT_ID('shipment_change_log', 'U') IS NULL
+                CREATE TABLE shipment_change_log (
+                    id INT IDENTITY(1,1) PRIMARY KEY,
+                    shipment_id INT NULL,
+                    shipment_uid NVARCHAR(32) NULL,
+                    changed_at NVARCHAR(30) NULL,
+                    changed_by NVARCHAR(255) NULL,
+                    source NVARCHAR(50) NULL,
+                    field_name NVARCHAR(100) NULL,
+                    old_value NVARCHAR(MAX) NULL,
+                    new_value NVARCHAR(MAX) NULL
+                )
+                """
+            )
+        else:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS shipment_change_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    shipment_id INTEGER,
+                    shipment_uid TEXT,
+                    changed_at TEXT,
+                    changed_by TEXT,
+                    source TEXT,
+                    field_name TEXT,
+                    old_value TEXT,
+                    new_value TEXT
+                )
+                """
+            )
+        self.main_window.db_conn.commit()
+
+        rows = self.main_window.db_all(
+            f"SELECT id, shipment_uid, notes, forwarder_updates, latest_forwarder_update, status, is_closed FROM {SHIPMENT_TABLE_NAME} ORDER BY id"
+        )
+        for row in rows:
+            record_id = int(row.get("id") or 0)
+            shipment_uid = str(row.get("shipment_uid") or "").strip() or self.shipment_uid_for_id(record_id)
+            legacy_notes = str(row.get("notes") or "").strip()
+            history = str(row.get("forwarder_updates") or "").strip() or legacy_notes
+            latest = str(row.get("latest_forwarder_update") or "").strip() or self.extract_latest_forwarder_update(history)
+            is_closed = 1 if self.normalise_status_value(row.get("status")) == "CLOSED" else int(row.get("is_closed") or 0)
+            cur.execute(
+                f"UPDATE {SHIPMENT_TABLE_NAME} SET shipment_uid = ?, forwarder_updates = ?, latest_forwarder_update = ?, is_closed = ? WHERE id = ?",
+                (shipment_uid, history, latest, is_closed, record_id),
+            )
+        self.main_window.db_conn.commit()
+        try:
+            if self.main_window.db_engine == "sqlserver":
+                cur.execute(
+                    """
+                    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'ux_shipments_shipment_uid')
+                    CREATE UNIQUE INDEX ux_shipments_shipment_uid ON shipments(shipment_uid) WHERE shipment_uid IS NOT NULL
+                    """
+                )
+            else:
+                cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_shipments_shipment_uid ON shipments(shipment_uid)")
+            self.main_window.db_conn.commit()
+        except Exception:
+            self.main_window.db_conn.rollback()
+
+    def shipment_uid_for_id(self, record_id):
+        return f"WT-SHP-{int(record_id or 0):06d}"
+
+    def extract_latest_forwarder_update(self, text):
+        lines = [line.strip(" \t-") for line in str(text or "").splitlines() if line.strip()]
+        lines = [line for line in lines if "shipment update import" not in line.casefold()]
+        if not lines:
+            return ""
+        dated = []
+        patterns = [
+            (re.compile(r"^(\d{1,2})[-/]([A-Za-z]{3})[-/](\d{2,4})"), "%d-%b-%Y"),
+            (re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{2,4})"), "%d/%m/%Y"),
+        ]
+        for index, line in enumerate(lines):
+            parsed_date = None
+            for pattern, fmt in patterns:
+                match = pattern.search(line)
+                if not match:
+                    continue
+                parts = list(match.groups())
+                year = int(parts[-1])
+                if year < 100:
+                    year += 2000
+                parts[-1] = str(year)
+                date_text = "-".join(parts) if "%b" in fmt else "/".join(parts)
+                try:
+                    parsed_date = datetime.strptime(date_text, fmt).date()
+                except Exception:
+                    parsed_date = None
+                break
+            if parsed_date is not None:
+                dated.append((parsed_date, -index, line))
+        if dated:
+            return max(dated)[2]
+        return lines[0]
+
+    def shipment_issue_flags(self, row):
+        issues = []
+        status = self.normalise_status_value(row.get("status"))
+        closed = status in {"ARRIVED", "CLOSED"} or bool(row.get("is_closed"))
+        today = date.today()
+        ready = self.parse_shipment_date(row.get("ready_date"))
+        etd = self.parse_shipment_date(row.get("shipment_date"))
+        eta = self.parse_shipment_date(row.get("due_date"))
+        transport = str(row.get("transport") or "").strip().upper()
+        pack_mode = str(row.get("pack_mode") or "").strip().upper()
+
+        if not str(row.get("supplier_name") or "").strip():
+            issues.append(("high", "Missing supplier"))
+        if not eta and not closed:
+            issues.append(("high", "Missing ETA"))
+        if ready and ready < today and status in {"", "PLANNED", "AWAITING READY", "AWAITING BOOKING"}:
+            issues.append(("high", "Ready date passed without a booking"))
+        if etd and etd < today and status in {"", "PLANNED", "AWAITING READY", "AWAITING BOOKING", "BOOKED"}:
+            issues.append(("high", "ETD passed but shipment is not marked in transit"))
+        if eta and eta < today and not closed:
+            issues.append(("high", "ETA passed without arrival confirmation"))
+        if status in {"BOOKED", "IN TRANSIT"} and not str(row.get("container_no") or "").strip():
+            if transport not in {"AIR", "COURIER"} and pack_mode not in {"LCL", "AIR", "COURIER"}:
+                issues.append(("medium", "Missing container number"))
+        if not str(row.get("shipment_ref") or "").strip() and not str(row.get("order_no") or "").strip():
+            issues.append(("medium", "Missing forwarder reference and order number"))
+        last_update = self.main_window.parse_date_value(row.get("last_forwarder_update_at") or row.get("updated_on"))
+        if not closed and last_update is not None and (today - last_update).days > 7:
+            issues.append(("medium", f"Forwarder update is {(today - last_update).days} days old"))
+        return issues
+
+    def is_yu_shipment(self, row):
+        text = " ".join(str(row.get(key) or "") for key in ("supplier_name", "product", "internal_notes", "order_no"))
+        lowered = text.casefold()
+        return "yuchang" in lowered or re.search(r"\byu\b", lowered) is not None
+
+    def filter_shipments(self, rows):
+        view = self.view_filter_combo.currentText() if self._modern_ui_ready else "Active"
+        destination = self.destination_filter_combo.currentText() if self._modern_ui_ready else "All Destinations"
+        search_text = self.search_edit.text().strip().casefold() if self._modern_ui_ready else ""
+        today = date.today()
+        filtered = []
+        for row in rows:
+            status = self.normalise_status_value(row.get("status"))
+            closed = status in {"ARRIVED", "CLOSED"} or bool(row.get("is_closed"))
+            issues = self.shipment_issue_flags(row)
+            eta = self.parse_shipment_date(row.get("due_date"))
+            matches = True
+            if view == "Active":
+                matches = not closed
+            elif view == "Needs Attention":
+                matches = bool(issues) and not closed
+            elif view == "Awaiting Booking":
+                matches = status in {"", "PLANNED", "AWAITING READY", "AWAITING BOOKING"} and not closed
+            elif view == "In Transit":
+                matches = status == "IN TRANSIT" and not closed
+            elif view == "Due Next 14 Days":
+                matches = eta is not None and 0 <= (eta - today).days <= 14 and not closed
+            elif view == "YU Container":
+                matches = self.is_yu_shipment(row) and not closed
+            elif view == "Arrived / Closed":
+                matches = closed
+            elif view == "Missing Information":
+                matches = any("Missing" in message for _severity, message in issues) and not closed
+            if not matches:
+                continue
+            if destination != "All Destinations" and self.normalise_shipment_type_value(row.get("shipment_type")) != destination:
+                continue
+            if search_text:
+                haystack = " ".join(str(row.get(key) or "") for key in (
+                    "shipment_uid", "supplier_name", "order_no", "shipment_ref", "container_no",
+                    "vessel", "product", "qty", "internal_notes", "forwarder_updates",
+                )).casefold()
+                if search_text not in haystack:
+                    continue
+            filtered.append(row)
+        return filtered
+
+    def shipment_sort_key(self, row):
+        status = self.normalise_status_value(row.get("status"))
+        closed = status in {"ARRIVED", "CLOSED"} or bool(row.get("is_closed"))
+        eta = self.parse_shipment_date(row.get("due_date"))
+        fallback = self.parse_shipment_date(row.get("shipment_date")) or self.parse_shipment_date(row.get("ready_date")) or date.max
+        effective = eta or fallback
+        return (1 if closed else 0, effective, str(row.get("shipment_uid") or ""))
+
+    def load_table(self):
+        table = self.table_widget()
+        if table is None:
+            return
+        selected_uid = ""
+        selected = self.current_selected_shipment()
+        if selected:
+            selected_uid = str(selected.get("shipment_uid") or "")
+
+        rows = self.main_window.db_all(
+            f"""
+            SELECT id, shipment_uid, entry_date, shipment_type, order_no, shipment_ref, supplier_name,
+                   container_no, product, qty, ready_date, shipment_date, due_date, status, vessel, notes,
+                   updated_on, transport, pack_mode, internal_notes, forwarder_updates,
+                   latest_forwarder_update, last_forwarder_update_at, is_closed
+            FROM {SHIPMENT_TABLE_NAME}
+            """
+        )
+        normalised_rows = []
+        for raw in rows:
+            row = dict(raw)
+            row["status"] = self.normalise_status_value(row.get("status"))
+            row["shipment_uid"] = str(row.get("shipment_uid") or "").strip() or self.shipment_uid_for_id(row.get("id"))
+            history = str(row.get("forwarder_updates") or row.get("notes") or "").strip()
+            row["forwarder_updates"] = history
+            row["latest_forwarder_update"] = str(row.get("latest_forwarder_update") or "").strip() or self.extract_latest_forwarder_update(history)
+            normalised_rows.append(row)
+        self._all_shipments = sorted(normalised_rows, key=self.shipment_sort_key)
+        self._shipment_by_id = {int(row.get("id") or 0): row for row in self._all_shipments}
+        self._filtered_shipments = self.filter_shipments(self._all_shipments)
+
+        blocker = QSignalBlocker(table)
+        table.setSortingEnabled(False)
+        table.setRowCount(0)
+        selected_row = -1
+        try:
+            for row_index, row in enumerate(self._filtered_shipments):
+                table.insertRow(row_index)
+                issues = self.shipment_issue_flags(row)
+                values = {
+                    "_alert": "!" if issues else "",
+                    "shipment_uid": row.get("shipment_uid", ""),
+                    "due_date": self.format_display_date(row.get("due_date")) or "Missing ETA",
+                    "status": row.get("status") or "PLANNED",
+                    "shipment_type": row.get("shipment_type", ""),
+                    "supplier_name": row.get("supplier_name", ""),
+                    "order_no": row.get("order_no", ""),
+                    "shipment_ref": row.get("shipment_ref", ""),
+                    "qty": row.get("qty", ""),
+                    "container_no": row.get("container_no", ""),
+                    "vessel": row.get("vessel", ""),
+                    "latest_forwarder_update": row.get("latest_forwarder_update", ""),
+                }
+                for column_index, (_header, field_name) in enumerate(self.TABLE_COLUMNS):
+                    value = str(values.get(field_name, "") or "")
+                    item = SortableTableWidgetItem(value)
+                    item.setData(self.RECORD_ID_ROLE, int(row.get("id") or 0))
+                    if field_name == "due_date":
+                        parsed = self.parse_shipment_date(row.get("due_date"))
+                        item.setData(TABLE_SORT_ROLE, parsed.toordinal() if parsed else 99999999)
+                    else:
+                        item.setData(TABLE_SORT_ROLE, value.casefold())
+                    if field_name in {"_alert", "due_date", "status", "shipment_type", "qty"}:
+                        item.setTextAlignment(Qt.AlignCenter)
+                    if field_name == "latest_forwarder_update":
+                        item.setToolTip(str(row.get("forwarder_updates") or ""))
+                    table.setItem(row_index, column_index, item)
+                self.apply_compact_row_style(table, row_index, row, issues)
+                if selected_uid and selected_uid == row.get("shipment_uid"):
+                    selected_row = row_index
+        finally:
+            del blocker
+        table.setSortingEnabled(True)
+        self.update_kpi_cards(self._all_shipments)
+        self.table_summary_label.setText(f"Showing {len(self._filtered_shipments):,} of {len(self._all_shipments):,} shipments")
+        if selected_row >= 0:
+            table.selectRow(selected_row)
+        elif table.rowCount() > 0:
+            table.selectRow(0)
+        else:
+            self.clear_detail_panel()
+
+    def apply_compact_row_style(self, table, row_index, row, issues):
+        status = self.normalise_status_value(row.get("status")) or "PLANNED"
+        palette = {
+            "PLANNED": (QColor("#59636F"), QColor("#FFFFFF")),
+            "AWAITING READY": (QColor("#7A5A19"), QColor("#FFF4D1")),
+            "AWAITING BOOKING": (QColor("#8A681C"), QColor("#FFF4D1")),
+            "BOOKED": (QColor("#245A86"), QColor("#EAF5FF")),
+            "IN TRANSIT": (QColor("#176B73"), QColor("#E8FFFF")),
+            "ARRIVED": (QColor("#246B42"), QColor("#E9FFF1")),
+            "CLOSED": (QColor("#4A4F57"), QColor("#E7E7E7")),
+        }
+        status_column = self.shipment_column_index("status")
+        status_item = table.item(row_index, status_column)
+        if status_item is not None:
+            background, foreground = palette.get(status, palette["PLANNED"])
+            status_item.setBackground(background)
+            status_item.setForeground(foreground)
+            font = status_item.font()
+            font.setBold(True)
+            status_item.setFont(font)
+
+        alert_item = table.item(row_index, self.shipment_column_index("_alert"))
+        if alert_item is not None and issues:
+            alert_item.setForeground(QColor("#FF5A5F"))
+            font = alert_item.font()
+            font.setBold(True)
+            font.setPointSize(font.pointSize() + 2)
+            alert_item.setFont(font)
+            alert_item.setToolTip("\n".join(message for _severity, message in issues))
+
+        eta_item = table.item(row_index, self.shipment_column_index("due_date"))
+        eta = self.parse_shipment_date(row.get("due_date"))
+        status_closed = status in {"ARRIVED", "CLOSED"}
+        if eta_item is not None and not status_closed:
+            if eta is None or eta < date.today():
+                eta_item.setBackground(QColor("#7B2428"))
+                eta_item.setForeground(QColor("#FFE9EA"))
+            elif (eta - date.today()).days <= 14:
+                eta_item.setBackground(QColor("#735817"))
+                eta_item.setForeground(QColor("#FFF3D0"))
+            font = eta_item.font()
+            font.setBold(True)
+            eta_item.setFont(font)
+
+        changed_fields = self._recent_changed_fields.get(int(row.get("id") or 0), set())
+        for field_name in changed_fields:
+            column = self.shipment_column_index(field_name)
+            if column >= 0:
+                item = table.item(row_index, column)
+                if item is not None:
+                    item.setBackground(QColor("#315D86"))
+                    item.setToolTip((item.toolTip() + "\n" if item.toolTip() else "") + "Changed in the latest import")
+
+    def update_kpi_cards(self, rows):
+        today = date.today()
+        counts = {
+            "needs_attention": 0,
+            "awaiting_booking": 0,
+            "in_transit": 0,
+            "due_14": 0,
+            "arrived": 0,
+            "missing_info": 0,
+        }
+        for row in rows:
+            status = self.normalise_status_value(row.get("status"))
+            closed = status in {"ARRIVED", "CLOSED"} or bool(row.get("is_closed"))
+            issues = self.shipment_issue_flags(row)
+            eta = self.parse_shipment_date(row.get("due_date"))
+            if issues and not closed:
+                counts["needs_attention"] += 1
+            if status in {"", "PLANNED", "AWAITING READY", "AWAITING BOOKING"} and not closed:
+                counts["awaiting_booking"] += 1
+            if status == "IN TRANSIT" and not closed:
+                counts["in_transit"] += 1
+            if eta is not None and 0 <= (eta - today).days <= 14 and not closed:
+                counts["due_14"] += 1
+            if closed:
+                counts["arrived"] += 1
+            if any("Missing" in message for _severity, message in issues) and not closed:
+                counts["missing_info"] += 1
+        titles = {
+            "needs_attention": "Needs Attention", "awaiting_booking": "Awaiting Booking",
+            "in_transit": "In Transit", "due_14": "Due Next 14 Days",
+            "arrived": "Arrived / Closed", "missing_info": "Missing Information",
+        }
+        for key, button in self.kpi_buttons.items():
+            button.setText(f"{titles[key]}\n{counts[key]:,}")
+
+    def set_view_filter(self, value):
+        self.view_filter_combo.setCurrentText(value)
+
+    def current_selected_shipment(self):
+        table = self.table_widget()
+        if table is None or table.currentRow() < 0:
+            return None
+        item = table.item(table.currentRow(), 0)
+        if item is None:
+            return None
+        record_id = item.data(self.RECORD_ID_ROLE)
+        try:
+            return self._shipment_by_id.get(int(record_id))
+        except Exception:
+            return None
+
+    def handle_shipment_selection_changed(self):
+        row = self.current_selected_shipment()
+        if row is None:
+            self.clear_detail_panel()
+            return
+        self._selected_record_id = int(row.get("id") or 0)
+        self.detail_shipment_uid.setText(str(row.get("shipment_uid") or ""))
+        for field_name, label in self.detail_labels.items():
+            value = str(row.get(field_name) or "").strip()
+            if field_name in {"ready_date", "shipment_date", "due_date"}:
+                value = self.format_display_date(value)
+            label.setText(value or "—")
+        issues = self.shipment_issue_flags(row)
+        if issues:
+            self.issue_label.setText("Attention:\n" + "\n".join(f"• {message}" for _severity, message in issues))
+            self.issue_label.setStyleSheet("color: #FF7276; font-weight: 600;")
+        else:
+            self.issue_label.setText("No current exceptions detected.")
+            self.issue_label.setStyleSheet("color: #65C98B;")
+        self.latest_update_browser.setPlainText(str(row.get("latest_forwarder_update") or "No forwarder update on file."))
+        self.forwarder_history_browser.setPlainText(str(row.get("forwarder_updates") or "No forwarder update history on file."))
+        self.internal_notes_edit.setPlainText(str(row.get("internal_notes") or ""))
+        self.load_change_history(row)
+        self.set_detail_buttons_enabled(True)
+
+    def clear_detail_panel(self):
+        self._selected_record_id = None
+        self.detail_shipment_uid.setText("No shipment selected")
+        for label in self.detail_labels.values():
+            label.setText("—")
+        self.issue_label.setText("")
+        self.latest_update_browser.clear()
+        self.forwarder_history_browser.clear()
+        self.internal_notes_edit.clear()
+        self.change_history_browser.clear()
+        self.set_detail_buttons_enabled(False)
+
+    def set_detail_buttons_enabled(self, enabled):
+        for widget in (
+            self.save_notes_button, self.edit_shipment_button, self.mark_arrived_button,
+            self.close_shipment_button, self.open_container_button, self.open_vessel_button,
+            self.delete_shipment_button,
+        ):
+            widget.setEnabled(bool(enabled))
+
+    def load_change_history(self, row):
+        record_id = int(row.get("id") or 0)
+        if self.main_window.db_engine == "sqlserver":
+            sql = """
+                SELECT TOP 30 changed_at, changed_by, source, field_name, old_value, new_value
+                FROM shipment_change_log WHERE shipment_id = ? ORDER BY id DESC
+            """
+        else:
+            sql = """
+                SELECT changed_at, changed_by, source, field_name, old_value, new_value
+                FROM shipment_change_log WHERE shipment_id = ? ORDER BY id DESC LIMIT 30
+            """
+        history = self.main_window.db_all(sql, (record_id,))
+        if not history:
+            self.change_history_browser.setPlainText("No recorded changes yet.")
+            return
+        lines = []
+        for change in history:
+            lines.append(
+                f"{change.get('changed_at') or ''} — {change.get('changed_by') or 'User'} [{change.get('source') or ''}]\n"
+                f"{change.get('field_name') or ''}: {change.get('old_value') or '—'} → {change.get('new_value') or '—'}"
+            )
+        self.change_history_browser.setPlainText("\n\n".join(lines))
+
+    def collaboration_user_name(self):
+        try:
+            return self.main_window.collaboration_display_name()
+        except Exception:
+            return getpass.getuser() or "User"
+
+    def log_shipment_changes(self, record_id, shipment_uid, before, after, source):
+        cur = self.main_window.db_conn.cursor()
+        changed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        changed_by = self.collaboration_user_name()
+        changed_fields = set()
+        keys = sorted(set(before) | set(after))
+        for field_name in keys:
+            old_value = str(before.get(field_name) or "").strip()
+            new_value = str(after.get(field_name) or "").strip()
+            if old_value == new_value:
+                continue
+            changed_fields.add(field_name)
+            cur.execute(
+                """
+                INSERT INTO shipment_change_log (
+                    shipment_id, shipment_uid, changed_at, changed_by, source, field_name, old_value, new_value
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (record_id, shipment_uid, changed_at, changed_by, source, field_name, old_value, new_value),
+            )
+        if changed_fields:
+            self._recent_changed_fields[int(record_id)] = changed_fields
+        return changed_fields
+
+    def insert_shipment_record(self, values, source="Manual"):
+        data = {field: str(values.get(field) or "").strip() for field in self.EDITABLE_FIELDS}
+        data["status"] = self.normalise_status_value(data.get("status"))
+        data["entry_date"] = data.get("entry_date") or date.today().strftime("%d/%m/%y")
+        updated_on = date.today().isoformat()
+        cur = self.main_window.db_conn.cursor()
+        cur.execute(
+            f"""
+            INSERT INTO {SHIPMENT_TABLE_NAME} (
+                shipment_uid, entry_date, shipment_type, order_no, shipment_ref, supplier_name, container_no,
+                product, qty, ready_date, shipment_date, due_date, status, vessel, notes, updated_on,
+                transport, pack_mode, internal_notes, forwarder_updates, latest_forwarder_update,
+                last_forwarder_update_at, is_closed
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                None, data["entry_date"], data["shipment_type"], data["order_no"], data["shipment_ref"],
+                data["supplier_name"], data["container_no"], data["product"], data["qty"], data["ready_date"],
+                data["shipment_date"], data["due_date"], data["status"], data["vessel"], "", updated_on,
+                data["transport"], data["pack_mode"], data["internal_notes"],
+                str(values.get("forwarder_updates") or "").strip(),
+                str(values.get("latest_forwarder_update") or "").strip(),
+                str(values.get("last_forwarder_update_at") or "").strip(),
+                1 if data["status"] == "CLOSED" else 0,
+            ),
+        )
+        if self.main_window.db_engine == "sqlserver":
+            row = cur.execute("SELECT CAST(SCOPE_IDENTITY() AS INT) AS new_id").fetchone()
+            record_id = int(row.get("new_id") if row else 0)
+        else:
+            record_id = int(getattr(cur, "lastrowid", 0) or 0)
+        shipment_uid = self.shipment_uid_for_id(record_id)
+        cur.execute(f"UPDATE {SHIPMENT_TABLE_NAME} SET shipment_uid = ? WHERE id = ?", (shipment_uid, record_id))
+        after = dict(data)
+        after["shipment_uid"] = shipment_uid
+        self.log_shipment_changes(record_id, shipment_uid, {}, after, source)
+        self.main_window.db_conn.commit()
+        self.mark_shipments_changed(updated_on)
+        return record_id, shipment_uid
+
+    def update_shipment_record(self, record_id, values, source="Manual"):
+        existing_row = self.main_window.db_one(
+            f"SELECT * FROM {SHIPMENT_TABLE_NAME} WHERE id = ?", (int(record_id),)
+        )
+        if existing_row is None:
+            raise ValueError("Shipment record no longer exists.")
+        before = dict(existing_row)
+        after = dict(before)
+        for field_name in self.EDITABLE_FIELDS:
+            if field_name in values:
+                after[field_name] = str(values.get(field_name) or "").strip()
+        after["status"] = self.normalise_status_value(after.get("status"))
+        after["is_closed"] = 1 if after["status"] == "CLOSED" else 0
+        after["updated_on"] = date.today().isoformat()
+        cur = self.main_window.db_conn.cursor()
+        cur.execute(
+            f"""
+            UPDATE {SHIPMENT_TABLE_NAME}
+            SET entry_date = ?, shipment_type = ?, order_no = ?, shipment_ref = ?, supplier_name = ?,
+                container_no = ?, product = ?, qty = ?, ready_date = ?, shipment_date = ?, due_date = ?,
+                status = ?, vessel = ?, transport = ?, pack_mode = ?, internal_notes = ?, is_closed = ?, updated_on = ?
+            WHERE id = ?
+            """,
+            (
+                after.get("entry_date", ""), after.get("shipment_type", ""), after.get("order_no", ""),
+                after.get("shipment_ref", ""), after.get("supplier_name", ""), after.get("container_no", ""),
+                after.get("product", ""), after.get("qty", ""), after.get("ready_date", ""),
+                after.get("shipment_date", ""), after.get("due_date", ""), after.get("status", ""),
+                after.get("vessel", ""), after.get("transport", ""), after.get("pack_mode", ""),
+                after.get("internal_notes", ""), after.get("is_closed", 0), after.get("updated_on", ""), int(record_id),
+            ),
+        )
+        shipment_uid = str(after.get("shipment_uid") or self.shipment_uid_for_id(record_id))
+        changed = self.log_shipment_changes(record_id, shipment_uid, before, after, source)
+        self.main_window.db_conn.commit()
+        self.mark_shipments_changed(after["updated_on"])
+        return changed
+
+    def create_new_shipment(self, shipment_type=""):
+        self.refresh_supplier_names()
+        dialog = ShipmentEditorDialog(self, default_destination=shipment_type, parent=self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        try:
+            _record_id, shipment_uid = self.insert_shipment_record(dialog.values(), "Manual create")
+            self.load_table()
+            self.select_shipment_uid(shipment_uid)
+            self.refresh_last_updated_display()
+        except Exception as exc:
+            QMessageBox.critical(self, "New Shipment", f"The shipment could not be created.\n\n{exc}")
+
+    def edit_selected_shipment(self):
+        row = self.current_selected_shipment()
+        if row is None:
+            return
+        self.refresh_supplier_names()
+        dialog = ShipmentEditorDialog(self, shipment=row, parent=self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        try:
+            self.update_shipment_record(int(row.get("id")), dialog.values(), "Manual edit")
+            uid = str(row.get("shipment_uid") or "")
+            self.load_table()
+            self.select_shipment_uid(uid)
+            self.refresh_last_updated_display()
+        except Exception as exc:
+            QMessageBox.critical(self, "Edit Shipment", f"The shipment could not be updated.\n\n{exc}")
+
+    def save_selected_internal_notes(self):
+        row = self.current_selected_shipment()
+        if row is None:
+            return
+        notes = self.internal_notes_edit.toPlainText().strip()
+        try:
+            self.update_shipment_record(int(row.get("id")), {"internal_notes": notes}, "Internal notes")
+            uid = str(row.get("shipment_uid") or "")
+            self.load_table()
+            self.select_shipment_uid(uid)
+            self.statusBar().showMessage("Internal notes saved.", 3000)
+        except Exception as exc:
+            QMessageBox.critical(self, "Save Notes", f"The notes could not be saved.\n\n{exc}")
+
+    def mark_selected_arrived(self):
+        row = self.current_selected_shipment()
+        if row is None:
+            return
+        try:
+            self.update_shipment_record(int(row.get("id")), {"status": "ARRIVED"}, "Mark arrived")
+            uid = str(row.get("shipment_uid") or "")
+            self.load_table()
+            self.select_shipment_uid(uid)
+        except Exception as exc:
+            QMessageBox.critical(self, "Mark Arrived", str(exc))
+
+    def close_selected_shipment(self):
+        row = self.current_selected_shipment()
+        if row is None:
+            return
+        answer = QMessageBox.question(self, "Close Shipment", f"Close {row.get('shipment_uid')}?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            self.update_shipment_record(int(row.get("id")), {"status": "CLOSED"}, "Close shipment")
+            self.load_table()
+        except Exception as exc:
+            QMessageBox.critical(self, "Close Shipment", str(exc))
+
+    def delete_selected_shipment(self):
+        row = self.current_selected_shipment()
+        if row is None:
+            return
+        answer = QMessageBox.question(
+            self, "Delete Shipment", f"Permanently delete {row.get('shipment_uid')}?\n\nClosing is usually safer than deleting.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        cur = self.main_window.db_conn.cursor()
+        cur.execute(f"DELETE FROM {SHIPMENT_TABLE_NAME} WHERE id = ?", (int(row.get("id")),))
+        self.main_window.db_conn.commit()
+        self.mark_shipments_changed(date.today().isoformat())
+        self.load_table()
+
+    def open_selected_container(self):
+        row = self.current_selected_shipment()
+        if row:
+            self.open_container_in_findteu(row.get("container_no"))
+
+    def open_selected_vessel(self):
+        row = self.current_selected_shipment()
+        if row:
+            self.open_vessel_in_marinetraffic(row.get("vessel"))
+
+    def select_shipment_uid(self, shipment_uid):
+        shipment_uid = str(shipment_uid or "")
+        table = self.table_widget()
+        if not shipment_uid or table is None:
+            return
+        uid_column = self.shipment_column_index("shipment_uid")
+        for row_index in range(table.rowCount()):
+            item = table.item(row_index, uid_column)
+            if item is not None and item.text() == shipment_uid:
+                table.selectRow(row_index)
+                table.scrollToItem(item)
+                return
+
+    def shipment_update_header_field(self, header_text):
+        key = self.normalise_shipment_update_header(header_text)
+        special = {
+            "windsorshipmentno": "shipment_uid",
+            "windsorshipmentnumber": "shipment_uid",
+            "internalshipmentno": "shipment_uid",
+            "shipmentuid": "shipment_uid",
+            "transport": "trans",
+            "trans": "trans",
+            "contents": "product",
+            "product": "product",
+            "load": "qty",
+            "loadtype": "qty",
+            "internalnotes": "internal_notes",
+        }
+        return special.get(key) or super().shipment_update_header_field(header_text)
+
+    def find_shipment_update_table(self, workbook):
+        for worksheet in workbook.worksheets:
+            for row in worksheet.iter_rows(min_row=1, max_row=min(100, worksheet.max_row)):
+                header_map = {}
+                for column_index, cell in enumerate(row):
+                    field_name = self.shipment_update_header_field(cell.value)
+                    if field_name and field_name not in header_map:
+                        header_map[field_name] = column_index
+                if "supplier_name" in header_map and ({"shipment_uid", "shipment_ref", "order_no"} & set(header_map)):
+                    return worksheet, row[0].row, header_map
+        raise ValueError("Could not find a shipment table. Expected a supplier plus Windsor Shipment No., Shipment or Order Ref.")
+
+    def build_shipment_import_row(self, raw):
+        result = super().build_shipment_import_row(raw)
+        result["shipment_uid"] = self.shipment_update_cell_text(raw.get("shipment_uid"))
+        result["transport"] = self.shipment_update_cell_text(raw.get("trans")).upper()
+        result["pack_mode"] = self.shipment_update_cell_text(raw.get("pack_mode")).upper()
+        result["product"] = self.shipment_update_cell_text(raw.get("product")) or result.get("product", "")
+        result["qty"] = self.shipment_update_cell_text(raw.get("qty")) or result.get("qty", "")
+        result["internal_notes"] = self.shipment_update_cell_text(raw.get("internal_notes"))
+        result["forwarder_updates"] = result.pop("notes", "")
+        result["latest_forwarder_update"] = self.extract_latest_forwarder_update(result["forwarder_updates"])
+        result["last_forwarder_update_at"] = date.today().isoformat()
+        return result
+
+    def parse_shipment_update_workbook(self, file_path):
+        suffix = Path(file_path).suffix.lower()
+        if suffix != ".xls":
+            return super().parse_shipment_update_workbook(file_path)
+        if xlrd is None:
+            raise RuntimeError("Legacy .xls support requires xlrd. Install the updated requirements file or save the report as .xlsx.")
+        book = xlrd.open_workbook(file_path)
+        for sheet in book.sheets():
+            header_row = None
+            header_map = {}
+            for row_index in range(min(100, sheet.nrows)):
+                candidate = {}
+                for column_index in range(sheet.ncols):
+                    field_name = self.shipment_update_header_field(sheet.cell_value(row_index, column_index))
+                    if field_name and field_name not in candidate:
+                        candidate[field_name] = column_index
+                if "supplier_name" in candidate and ({"shipment_uid", "shipment_ref", "order_no"} & set(candidate)):
+                    header_row = row_index
+                    header_map = candidate
+                    break
+            if header_row is None:
+                continue
+            import_rows = []
+            blank_streak = 0
+            for row_index in range(header_row + 1, sheet.nrows):
+                raw = {}
+                for field_name, column_index in header_map.items():
+                    cell = sheet.cell(row_index, column_index)
+                    value = cell.value
+                    if field_name in {"etd", "eta"} and cell.ctype == xlrd.XL_CELL_DATE:
+                        value = xlrd.xldate_as_datetime(value, book.datemode).date().strftime("%d/%m/%y")
+                    raw[field_name] = value
+                key_text = "".join(str(raw.get(name) or "").strip() for name in ("shipment_uid", "shipment_ref", "order_no", "supplier_name"))
+                if not key_text:
+                    blank_streak += 1
+                    if blank_streak >= 8 and import_rows:
+                        break
+                    continue
+                blank_streak = 0
+                import_rows.append(self.build_shipment_import_row(raw))
+            if import_rows:
+                return import_rows
+        raise ValueError("Could not find the shipment listing table in the .xls workbook.")
+
+    def load_existing_shipments_for_import(self):
+        return self.main_window.db_all(
+            f"""
+            SELECT id, shipment_uid, entry_date, shipment_type, order_no, shipment_ref, supplier_name,
+                   container_no, product, qty, ready_date, shipment_date, due_date, status, vessel, notes,
+                   updated_on, transport, pack_mode, internal_notes, forwarder_updates,
+                   latest_forwarder_update, last_forwarder_update_at, is_closed
+            FROM {SHIPMENT_TABLE_NAME} ORDER BY id DESC
+            """
+        )
+
+    def score_shipment_import_match(self, import_row, existing_row):
+        import_uid = re.sub(r"[^A-Z0-9]+", "", str(import_row.get("shipment_uid") or "").upper())
+        existing_uid = re.sub(r"[^A-Z0-9]+", "", str(existing_row.get("shipment_uid") or "").upper())
+        if import_uid and existing_uid:
+            if import_uid == existing_uid:
+                return 1000
+            return 0
+        return super().score_shipment_import_match(import_row, existing_row)
+
+    def update_values_from_import(self, import_row, existing_row=None):
+        existing = dict(existing_row or {})
+        incoming_history = str(import_row.get("forwarder_updates") or "").strip()
+        merged_history = self.merge_import_notes(existing.get("forwarder_updates") or existing.get("notes"), incoming_history)
+        latest = self.extract_latest_forwarder_update(incoming_history) or str(existing.get("latest_forwarder_update") or "").strip()
+        return {
+            "shipment_uid": str(existing.get("shipment_uid") or import_row.get("shipment_uid") or "").strip(),
+            "entry_date": str(existing.get("entry_date") or import_row.get("entry_date") or date.today().strftime("%d/%m/%y")).strip(),
+            "shipment_type": self.prefer_new_value(import_row.get("shipment_type"), existing.get("shipment_type")),
+            "order_no": self.prefer_new_value(import_row.get("order_no"), existing.get("order_no")),
+            "shipment_ref": self.prefer_new_value(import_row.get("shipment_ref"), existing.get("shipment_ref")),
+            "supplier_name": self.prefer_new_value(import_row.get("supplier_name"), existing.get("supplier_name")),
+            "container_no": self.prefer_new_value(import_row.get("container_no"), existing.get("container_no")),
+            "product": self.prefer_new_value(import_row.get("product"), existing.get("product")),
+            "qty": self.prefer_new_value(import_row.get("qty"), existing.get("qty")),
+            "ready_date": self.prefer_new_value(import_row.get("ready_date"), existing.get("ready_date")),
+            "shipment_date": self.prefer_new_value(import_row.get("shipment_date"), existing.get("shipment_date")),
+            "due_date": self.prefer_new_value(import_row.get("due_date"), existing.get("due_date")),
+            "status": self.strongest_status(import_row.get("status"), existing.get("status")),
+            "vessel": self.prefer_new_value(import_row.get("vessel"), existing.get("vessel")),
+            "transport": self.prefer_new_value(import_row.get("transport"), existing.get("transport")),
+            "pack_mode": self.prefer_new_value(import_row.get("pack_mode"), existing.get("pack_mode")),
+            "internal_notes": str(existing.get("internal_notes") or import_row.get("internal_notes") or "").strip(),
+            "forwarder_updates": merged_history,
+            "latest_forwarder_update": latest,
+            "last_forwarder_update_at": str(import_row.get("last_forwarder_update_at") or existing.get("last_forwarder_update_at") or date.today().isoformat()),
+            "is_closed": 1 if self.strongest_status(import_row.get("status"), existing.get("status")) == "CLOSED" else int(existing.get("is_closed") or 0),
+        }
+
+    def apply_shipment_update_actions(self, actions, existing_rows):
+        row_by_id = {int(row.get("id") or 0): dict(row) for row in existing_rows}
+        counts = {"updated": 0, "created": 0, "skipped": 0, "field_changes": Counter(), "created_uids": []}
+        for import_row, action, record_id in actions:
+            if action == SHIPMENT_IMPORT_ACTION_SKIP:
+                counts["skipped"] += 1
+                continue
+            if action == SHIPMENT_IMPORT_ACTION_CREATE:
+                values = self.update_values_from_import(import_row, None)
+                new_id, shipment_uid = self.insert_shipment_record(values, "Forwarder import")
+                counts["created"] += 1
+                counts["created_uids"].append(shipment_uid)
+                continue
+            existing = row_by_id.get(int(record_id or 0))
+            if existing is None:
+                counts["skipped"] += 1
+                continue
+            values = self.update_values_from_import(import_row, existing)
+            before = dict(existing)
+            cur = self.main_window.db_conn.cursor()
+            cur.execute(
+                f"""
+                UPDATE {SHIPMENT_TABLE_NAME}
+                SET entry_date = ?, shipment_type = ?, order_no = ?, shipment_ref = ?, supplier_name = ?,
+                    container_no = ?, product = ?, qty = ?, ready_date = ?, shipment_date = ?, due_date = ?,
+                    status = ?, vessel = ?, transport = ?, pack_mode = ?, internal_notes = ?,
+                    forwarder_updates = ?, latest_forwarder_update = ?, last_forwarder_update_at = ?,
+                    is_closed = ?, updated_on = ?
+                WHERE id = ?
+                """,
+                (
+                    values["entry_date"], values["shipment_type"], values["order_no"], values["shipment_ref"],
+                    values["supplier_name"], values["container_no"], values["product"], values["qty"],
+                    values["ready_date"], values["shipment_date"], values["due_date"], values["status"],
+                    values["vessel"], values["transport"], values["pack_mode"], values["internal_notes"],
+                    values["forwarder_updates"], values["latest_forwarder_update"], values["last_forwarder_update_at"],
+                    values["is_closed"], date.today().isoformat(), int(record_id),
+                ),
+            )
+            changes = self.log_shipment_changes(
+                int(record_id), str(existing.get("shipment_uid") or self.shipment_uid_for_id(record_id)), before, values, "Forwarder import"
+            )
+            for field_name in changes:
+                counts["field_changes"][field_name] += 1
+            counts["updated"] += 1
+        self.main_window.db_conn.commit()
+        self.mark_shipments_changed(date.today().isoformat())
+        return counts
+
+    def import_shipment_update_workbook(self):
+        file_path, _selected_filter = QFileDialog.getOpenFileName(
+            self, "Import forwarder shipment update", "",
+            "Excel Workbooks (*.xlsx *.xlsm *.xls);;All Files (*)",
+        )
+        if not file_path:
+            return
+        try:
+            self.refresh_supplier_names()
+            import_rows = self.parse_shipment_update_workbook(file_path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Import Forwarder Update", f"Could not read the shipment update workbook.\n\n{exc}")
+            return
+        if not import_rows:
+            QMessageBox.information(self, "Import Forwarder Update", "No shipment rows were found.")
+            return
+        existing_rows = self.load_existing_shipments_for_import()
+        self.attach_best_import_matches(import_rows, existing_rows)
+        review = ModernShipmentUpdateReviewDialog(import_rows, existing_rows, self)
+        if review.exec() != QDialog.Accepted:
+            return
+        self._recent_changed_fields = {}
+        try:
+            counts = self.apply_shipment_update_actions(review.confirmed_actions(), existing_rows)
+        except Exception as exc:
+            self.main_window.db_conn.rollback()
+            QMessageBox.critical(self, "Import Forwarder Update", f"The shipment table could not be updated.\n\n{exc}")
+            return
+        self.load_table()
+        self.refresh_last_updated_display()
+        try:
+            self.main_window.refresh_dashboard()
+        except Exception:
+            pass
+        change_lines = []
+        friendly = {
+            "due_date": "ETA", "shipment_date": "ETD", "ready_date": "Ready date",
+            "vessel": "Vessel", "container_no": "Container", "status": "Status",
+            "shipment_ref": "Forwarder reference", "forwarder_updates": "Forwarder updates",
+        }
+        for field_name, count in counts.get("field_changes", {}).most_common():
+            change_lines.append(f"{friendly.get(field_name, field_name)}: {count}")
+        message = (
+            "Shipment update import complete.\n\n"
+            f"Updated: {counts.get('updated', 0)}\nCreated: {counts.get('created', 0)}\nSkipped: {counts.get('skipped', 0)}"
+        )
+        if change_lines:
+            message += "\n\nChanged fields:\n" + "\n".join(change_lines[:12])
+        if counts.get("created_uids"):
+            message += "\n\nNew shipment numbers:\n" + "\n".join(counts["created_uids"][:12])
+        QMessageBox.information(self, "Import Forwarder Update", message)
+
+    def export_shipment_register(self):
+        if not self._filtered_shipments:
+            QMessageBox.information(self, "Export Shipment Register", "There are no shipments in the current view.")
+            return
+        default_name = f"shipment_register_{date.today().strftime('%Y%m%d')}.csv"
+        file_path, _selected_filter = QFileDialog.getSaveFileName(
+            self, "Export shipment register", default_name, "CSV Files (*.csv);;All Files (*)"
+        )
+        if not file_path:
+            return
+        if not str(file_path).lower().endswith(".csv"):
+            file_path += ".csv"
+        headers = [
+            "Windsor Shipment No.", "Destination", "Order No(s)", "Forwarder Ref", "Supplier",
+            "Transport", "Pack Mode", "Load", "Contents", "Container No", "Ready Date", "ETD", "ETA",
+            "Status", "Vessel", "Internal Notes", "Latest Forwarder Update", "Forwarder Update History", "Updated On",
+        ]
+        fields = [
+            "shipment_uid", "shipment_type", "order_no", "shipment_ref", "supplier_name", "transport",
+            "pack_mode", "qty", "product", "container_no", "ready_date", "shipment_date", "due_date",
+            "status", "vessel", "internal_notes", "latest_forwarder_update", "forwarder_updates", "updated_on",
+        ]
+        with open(file_path, "w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(headers)
+            for row in self._filtered_shipments:
+                writer.writerow([str(row.get(field) or "") for field in fields])
+        QMessageBox.information(self, "Export Shipment Register", f"Exported {len(self._filtered_shipments):,} shipments.\n\n{file_path}")
 
 
 
@@ -7294,7 +8805,7 @@ class Ui_MainWindow(object):
 
     def _build_shipments_page(self):
         self.shipments_page, layout = self._page("shipments_page", "Shipments")
-        intro = QLabel("Review shipment status, due dates, vessel details, and container movement without leaving the main app.", self.shipments_page)
+        intro = QLabel("Track each shipment by a permanent Windsor shipment number, review exceptions, and keep forwarder updates separate from internal notes.", self.shipments_page)
         intro.setObjectName("shipments_intro")
         intro.setProperty("role", "pageSubtitle")
         layout.addWidget(intro)
@@ -15394,7 +16905,7 @@ class MainWindow(QMainWindow):
                 f"""
                 SELECT shipment_type, supplier_name, container_no, due_date, status, order_no
                 FROM {SHIPMENT_TABLE_NAME}
-                WHERE COALESCE(status, '') <> 'ARRIVED'
+                WHERE UPPER(COALESCE(status, '')) NOT IN ('ARRIVED', 'CLOSED')
                 """
             )
         except Exception:
@@ -15404,7 +16915,7 @@ class MainWindow(QMainWindow):
         today = date.today()
         for row in rows:
             status = str(row.get("status") or "").strip().upper()
-            if status == "ARRIVED":
+            if status in {"ARRIVED", "CLOSED"}:
                 continue
             due = self.parse_date_value(row.get("due_date"))
             days = None if due is None else (due - today).days
@@ -18588,7 +20099,7 @@ class MainWindow(QMainWindow):
             "Item Number",
             "Select",
             "Description",
-            "On Order",
+            "Shipped",
             "Qty",
             "Supplier",
             "Status",
