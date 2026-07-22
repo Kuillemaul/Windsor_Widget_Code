@@ -1,0 +1,181 @@
+--- /mnt/data/Windsor_Widget_Shipments_Redesign_v1.7.0/main_patched_status_yu.py	2026-07-17 05:32:04.086146658 +0000
++++ /mnt/data/Windsor_Widget_Live_Refresh_View_Fix_v1.7.1/main_patched_status_yu.py	2026-07-17 05:35:12.866227479 +0000
+@@ -124,7 +124,7 @@
+ TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
+ TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
+ TABLE_FORMAT_SETTINGS_PREFIX = "table_format"
+-APP_VERSION = "1.7.0"
++APP_VERSION = "1.7.1"
+ APP_DESIGNER = "Bradley Mayze"
+ YU_SUPPLIER_DISPLAY_NAME = "Yuchang Textile Factory"
+ # Generic latest purchase-cost fields. These apply to every item in the item master.
+@@ -9957,20 +9957,60 @@
+         item = table.item(current_row, key_column)
+         return (item.text() or "").strip() if item is not None else ""
+ 
+-    def _restore_row_selection(self, table, key_text, key_column=0):
+-        if table is None or not key_text:
++    def _capture_table_view_state(self, table):
++        """Capture viewport position separately from the selected row.
++
++        A user may leave a row selected and then scroll elsewhere to inspect the
++        sheet.  Live refreshes must preserve that viewport instead of dragging
++        the hidden selected row back into the middle of the screen.
++        """
++        if table is None:
++            return {}
++        state = {
++            "current_column": table.currentColumn(),
++        }
++        try:
++            state["vertical_scroll"] = table.verticalScrollBar().value()
++        except Exception:
++            state["vertical_scroll"] = 0
++        try:
++            state["horizontal_scroll"] = table.horizontalScrollBar().value()
++        except Exception:
++            state["horizontal_scroll"] = 0
++        return state
++
++    def _restore_table_view_state(self, table, state):
++        """Restore the saved viewport after selection restoration has run."""
++        if table is None or not state:
+             return
++        try:
++            vertical = table.verticalScrollBar()
++            vertical.setValue(max(vertical.minimum(), min(vertical.maximum(), int(state.get("vertical_scroll", 0)))))
++        except Exception:
++            pass
++        try:
++            horizontal = table.horizontalScrollBar()
++            horizontal.setValue(max(horizontal.minimum(), min(horizontal.maximum(), int(state.get("horizontal_scroll", 0)))))
++        except Exception:
++            pass
++
++    def _restore_row_selection(self, table, key_text, key_column=0, current_column=None):
++        if table is None or not key_text:
++            return False
+         target = key_text.strip().upper()
+         for row in range(table.rowCount()):
+             item = table.item(row, key_column)
+             text = (item.text() or "").strip().upper() if item is not None else ""
+             if text != target:
+                 continue
++            target_column = key_column if current_column is None else int(current_column)
++            target_column = max(0, min(table.columnCount() - 1, target_column))
+             table.selectRow(row)
+-            table.setCurrentCell(row, key_column)
+-            if item is not None:
+-                table.scrollToItem(item, QAbstractItemView.PositionAtCenter)
+-            return
++            table.setCurrentCell(row, target_column)
++            # Do not call scrollToItem here.  The viewport is restored separately
++            # so a background refresh never recentres an off-screen selection.
++            return True
++        return False
+ 
+     def refresh_to_order_sheet_data(self, manual=False):
+         table = getattr(self.ui, "order_table", None)
+@@ -9979,12 +10019,20 @@
+                 self._show_refresh_message("Finish editing the To Order sheet before refreshing.")
+             return False
+ 
++        view_state = self._capture_table_view_state(table)
+         selected_item = self._selected_row_key(table, self.order_item_column)
+         self.load_saved_order_lines()
+         self.refresh_order_table_on_order_column()
+         self.reapply_table_header_sort(getattr(self.ui, "order_table", None))
+         self.refresh_item_summary_context_boxes()
+-        self._restore_row_selection(getattr(self.ui, "order_table", None), selected_item, self.order_item_column)
++        refreshed_table = getattr(self.ui, "order_table", None)
++        self._restore_row_selection(
++            refreshed_table,
++            selected_item,
++            self.order_item_column,
++            current_column=view_state.get("current_column"),
++        )
++        self._restore_table_view_state(refreshed_table, view_state)
+         if manual:
+             self._show_refresh_message("To Order sheet refreshed.")
+         return True
+@@ -9996,6 +10044,7 @@
+                 self._show_refresh_message("Finish editing the On Order sheet before refreshing.")
+             return False
+ 
++        view_state = self._capture_table_view_state(table)
+         selected_key = ""
+         current_row = table.currentRow() if table is not None else -1
+         if table is not None and current_row >= 0:
+@@ -10022,12 +10071,14 @@
+                 ])
+                 if row_key != selected_key:
+                     continue
++                target_column = view_state.get("current_column", self.on_order_item_column)
++                target_column = max(0, min(table.columnCount() - 1, int(target_column)))
+                 table.selectRow(row)
+-                table.setCurrentCell(row, self.on_order_item_column)
+-                if item_item is not None:
+-                    table.scrollToItem(item_item, QAbstractItemView.PositionAtCenter)
++                table.setCurrentCell(row, target_column)
+                 break
+ 
++        self._restore_table_view_state(table, view_state)
++
+         if manual:
+             self._show_refresh_message("On Order sheet refreshed.")
+         return True
+@@ -10041,7 +10092,21 @@
+ 
+         current_ref = (self.current_container_ref or self.get_container_ref_text() or "").strip()
+         containers_table = getattr(self.ui, "containers_tableWidget", None)
++        container_lines_table = getattr(self.ui, "container_table", None)
++        containers_view_state = self._capture_table_view_state(containers_table)
++        lines_view_state = self._capture_table_view_state(container_lines_table)
+         selected_container = self._selected_row_key(containers_table, 0)
++
++        selected_line_key = ""
++        selected_line_row = container_lines_table.currentRow() if container_lines_table is not None else -1
++        if container_lines_table is not None and selected_line_row >= 0:
++            order_item = container_lines_table.item(selected_line_row, self.container_columns["order"])
++            item_item = container_lines_table.item(selected_line_row, self.container_columns["item"])
++            selected_line_key = "|".join([
++                (order_item.text() or "").strip().upper() if order_item is not None else "",
++                (item_item.text() or "").strip().upper() if item_item is not None else "",
++            ])
++
+         self.refresh_containers_list()
+         self.reapply_table_header_sort(containers_table)
+         if current_ref:
+@@ -10050,7 +10115,31 @@
+             self.refresh_container_note_rows()
+             self.refresh_container_totals()
+             self.refresh_item_summary_context_boxes()
+-        self._restore_row_selection(containers_table, selected_container or current_ref, 0)
++
++        self._restore_row_selection(
++            containers_table,
++            selected_container or current_ref,
++            0,
++            current_column=containers_view_state.get("current_column"),
++        )
++        self._restore_table_view_state(containers_table, containers_view_state)
++
++        if container_lines_table is not None and selected_line_key:
++            for row in range(container_lines_table.rowCount()):
++                order_item = container_lines_table.item(row, self.container_columns["order"])
++                item_item = container_lines_table.item(row, self.container_columns["item"])
++                row_key = "|".join([
++                    (order_item.text() or "").strip().upper() if order_item is not None else "",
++                    (item_item.text() or "").strip().upper() if item_item is not None else "",
++                ])
++                if row_key != selected_line_key:
++                    continue
++                target_column = lines_view_state.get("current_column", self.container_columns["item"])
++                target_column = max(0, min(container_lines_table.columnCount() - 1, int(target_column)))
++                container_lines_table.selectRow(row)
++                container_lines_table.setCurrentCell(row, target_column)
++                break
++        self._restore_table_view_state(container_lines_table, lines_view_state)
+         if manual:
+             self._show_refresh_message("Build Container sheet refreshed.")
+         return True
