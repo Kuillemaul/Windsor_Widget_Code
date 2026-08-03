@@ -46,7 +46,7 @@ from datetime import datetime, date, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from collections import Counter, OrderedDict
 
-from PySide6.QtCore import Qt, QDate, QSettings, QMargins, QUrl, QEvent, QSignalBlocker, QTimer, QObject, Signal, QCoreApplication, QMetaObject, QSize
+from PySide6.QtCore import Qt, QDate, QSettings, QMargins, QUrl, QEvent, QSignalBlocker, QTimer, QObject, Signal, QCoreApplication, QMetaObject, QSize, QItemSelectionModel
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -124,7 +124,7 @@ from yu_order_workflow import YUOrderEntryDialog, load_yu_review_module
 TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
 TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
 TABLE_FORMAT_SETTINGS_PREFIX = "table_format"
-APP_VERSION = "1.7.1"
+APP_VERSION = "1.7.2"
 APP_DESIGNER = "Bradley Mayze"
 YU_SUPPLIER_DISPLAY_NAME = "Yuchang Textile Factory"
 # Generic latest purchase-cost fields. These apply to every item in the item master.
@@ -9951,6 +9951,21 @@ class MainWindow(QMainWindow):
     def _selected_row_key(self, table, key_column=0):
         if table is None:
             return ""
+
+        # A refresh-restored row can be selected without having a current cell.
+        # Prefer the selection model so we do not need to force an off-screen
+        # current index merely to remember the selected record.
+        try:
+            selection_model = table.selectionModel()
+            if selection_model is not None:
+                selected_rows = selection_model.selectedRows(key_column)
+                if selected_rows:
+                    selected_row = selected_rows[0].row()
+                    item = table.item(selected_row, key_column)
+                    return (item.text() or "").strip() if item is not None else ""
+        except Exception:
+            pass
+
         current_row = table.currentRow()
         if current_row < 0:
             return ""
@@ -9994,6 +10009,36 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _select_table_row_without_scrolling(self, table, row):
+        """Restore a row selection without assigning a current cell.
+
+        QTableWidget.setCurrentCell() can force the view to navigate to that
+        index.  Calling it immediately after sortItems() also caused an unstable
+        refresh path on the To Order table.  Selecting through the selection
+        model preserves the highlight without moving the viewport.
+        """
+        if table is None or row < 0 or row >= table.rowCount():
+            return False
+        try:
+            model = table.model()
+            selection_model = table.selectionModel()
+            if model is None or selection_model is None or table.columnCount() <= 0:
+                return False
+            row_index = model.index(row, 0)
+            if not row_index.isValid():
+                return False
+            blocker = QSignalBlocker(selection_model)
+            try:
+                selection_model.select(
+                    row_index,
+                    QItemSelectionModel.SelectionFlag.ClearAndSelect | QItemSelectionModel.SelectionFlag.Rows,
+                )
+            finally:
+                del blocker
+            return True
+        except Exception:
+            return False
+
     def _restore_row_selection(self, table, key_text, key_column=0, current_column=None):
         if table is None or not key_text:
             return False
@@ -10003,13 +10048,7 @@ class MainWindow(QMainWindow):
             text = (item.text() or "").strip().upper() if item is not None else ""
             if text != target:
                 continue
-            target_column = key_column if current_column is None else int(current_column)
-            target_column = max(0, min(table.columnCount() - 1, target_column))
-            table.selectRow(row)
-            table.setCurrentCell(row, target_column)
-            # Do not call scrollToItem here.  The viewport is restored separately
-            # so a background refresh never recentres an off-screen selection.
-            return True
+            return self._select_table_row_without_scrolling(table, row)
         return False
 
     def refresh_to_order_sheet_data(self, manual=False):
@@ -10021,18 +10060,35 @@ class MainWindow(QMainWindow):
 
         view_state = self._capture_table_view_state(table)
         selected_item = self._selected_row_key(table, self.order_item_column)
-        self.load_saved_order_lines()
-        self.refresh_order_table_on_order_column()
-        self.reapply_table_header_sort(getattr(self.ui, "order_table", None))
-        self.refresh_item_summary_context_boxes()
-        refreshed_table = getattr(self.ui, "order_table", None)
-        self._restore_row_selection(
-            refreshed_table,
-            selected_item,
-            self.order_item_column,
-            current_column=view_state.get("current_column"),
-        )
-        self._restore_table_view_state(refreshed_table, view_state)
+
+        # Rebuild, re-sort and restore the selection as one quiet UI operation.
+        # This prevents item/current-cell signals from firing against rows that
+        # are being moved by the active Item Number sort.
+        table_blocker = QSignalBlocker(table) if table is not None else None
+        if table is not None:
+            table.setUpdatesEnabled(False)
+        try:
+            self.load_saved_order_lines()
+            self.refresh_order_table_on_order_column()
+            refreshed_table = getattr(self.ui, "order_table", None)
+            self.reapply_table_header_sort(refreshed_table)
+            self._restore_row_selection(
+                refreshed_table,
+                selected_item,
+                self.order_item_column,
+                current_column=view_state.get("current_column"),
+            )
+            self._restore_table_view_state(refreshed_table, view_state)
+            self.refresh_item_summary_context_boxes()
+        finally:
+            if table_blocker is not None:
+                del table_blocker
+            if table is not None:
+                table.setUpdatesEnabled(True)
+                try:
+                    table.viewport().update()
+                except Exception:
+                    pass
         if manual:
             self._show_refresh_message("To Order sheet refreshed.")
         return True
@@ -10071,10 +10127,7 @@ class MainWindow(QMainWindow):
                 ])
                 if row_key != selected_key:
                     continue
-                target_column = view_state.get("current_column", self.on_order_item_column)
-                target_column = max(0, min(table.columnCount() - 1, int(target_column)))
-                table.selectRow(row)
-                table.setCurrentCell(row, target_column)
+                self._select_table_row_without_scrolling(table, row)
                 break
 
         self._restore_table_view_state(table, view_state)
@@ -10134,10 +10187,7 @@ class MainWindow(QMainWindow):
                 ])
                 if row_key != selected_line_key:
                     continue
-                target_column = lines_view_state.get("current_column", self.container_columns["item"])
-                target_column = max(0, min(container_lines_table.columnCount() - 1, int(target_column)))
-                container_lines_table.selectRow(row)
-                container_lines_table.setCurrentCell(row, target_column)
+                self._select_table_row_without_scrolling(container_lines_table, row)
                 break
         self._restore_table_view_state(container_lines_table, lines_view_state)
         if manual:
@@ -26732,12 +26782,11 @@ class MainWindow(QMainWindow):
         thin_side = Side(style="thin", color="000000") if Side is not None else None
         cell_border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side) if Border is not None and thin_side is not None else None
 
-        export_headers = ["Order Number", "Item Number", "Description", "Comments", "Qty", "Cartons"]
+        export_headers = ["Order Number", "Item Number", "Description", "Qty", "Cartons"]
         export_column_map = [
             self.container_columns["order"],
             self.container_columns["item"],
             self.container_columns["description"],
-            self.container_columns["comments"],
             self.container_columns["qty"],
             self.container_columns["cartons"],
         ]
@@ -26811,7 +26860,7 @@ class MainWindow(QMainWindow):
                 if row_fill is not None:
                     worksheet.cell(row=row_index, column=export_col).fill = row_fill
                 if Alignment is not None:
-                    align_horizontal = "right" if export_col in (5, 6) else "left"
+                    align_horizontal = "right" if export_col in (4, 5) else "left"
                     worksheet.cell(row=row_index, column=export_col).alignment = Alignment(horizontal=align_horizontal, vertical="center")
                 if cell_border is not None:
                     worksheet.cell(row=row_index, column=export_col).border = cell_border
@@ -26836,8 +26885,8 @@ class MainWindow(QMainWindow):
         ]
         total_row = row_index + 1
         for offset, (label_text, value) in enumerate(total_rows):
-            label_cell = worksheet.cell(row=total_row + offset, column=5, value=label_text)
-            value_cell = worksheet.cell(row=total_row + offset, column=6, value=value)
+            label_cell = worksheet.cell(row=total_row + offset, column=4, value=label_text)
+            value_cell = worksheet.cell(row=total_row + offset, column=5, value=value)
             if bold_font is not None:
                 label_cell.font = bold_font
                 value_cell.font = bold_font

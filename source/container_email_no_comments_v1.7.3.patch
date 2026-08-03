@@ -1,0 +1,36 @@
+--- a/main_patched_status_yu.py
++++ b/main_patched_status_yu.py
+@@ -26782,12 +26782,11 @@
+         thin_side = Side(style="thin", color="000000") if Side is not None else None
+         cell_border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side) if Border is not None and thin_side is not None else None
+ 
+-        export_headers = ["Order Number", "Item Number", "Description", "Comments", "Qty", "Cartons"]
++        export_headers = ["Order Number", "Item Number", "Description", "Qty", "Cartons"]
+         export_column_map = [
+             self.container_columns["order"],
+             self.container_columns["item"],
+             self.container_columns["description"],
+-            self.container_columns["comments"],
+             self.container_columns["qty"],
+             self.container_columns["cartons"],
+         ]
+@@ -26861,7 +26860,7 @@
+                 if row_fill is not None:
+                     worksheet.cell(row=row_index, column=export_col).fill = row_fill
+                 if Alignment is not None:
+-                    align_horizontal = "right" if export_col in (5, 6) else "left"
++                    align_horizontal = "right" if export_col in (4, 5) else "left"
+                     worksheet.cell(row=row_index, column=export_col).alignment = Alignment(horizontal=align_horizontal, vertical="center")
+                 if cell_border is not None:
+                     worksheet.cell(row=row_index, column=export_col).border = cell_border
+@@ -26886,8 +26885,8 @@
+         ]
+         total_row = row_index + 1
+         for offset, (label_text, value) in enumerate(total_rows):
+-            label_cell = worksheet.cell(row=total_row + offset, column=5, value=label_text)
+-            value_cell = worksheet.cell(row=total_row + offset, column=6, value=value)
++            label_cell = worksheet.cell(row=total_row + offset, column=4, value=label_text)
++            value_cell = worksheet.cell(row=total_row + offset, column=5, value=value)
+             if bold_font is not None:
+                 label_cell.font = bold_font
+                 value_cell.font = bold_font
