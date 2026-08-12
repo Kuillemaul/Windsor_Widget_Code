@@ -124,7 +124,7 @@ from yu_order_workflow import YUOrderEntryDialog, load_yu_review_module
 TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
 TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
 TABLE_FORMAT_SETTINGS_PREFIX = "table_format"
-APP_VERSION = "1.7.3"
+APP_VERSION = "1.7.7"
 APP_DESIGNER = "Bradley Mayze"
 YU_SUPPLIER_DISPLAY_NAME = "Yuchang Textile Factory"
 # Generic latest purchase-cost fields. These apply to every item in the item master.
@@ -5450,7 +5450,7 @@ class TopItemsDialog(QDialog):
 
         enter_item.setText(item_number)
         stacked_widget.setCurrentWidget(item_page)
-        self.main_window.load_item_summary()
+        self.main_window.load_item_summary(show_at_risk_alert=True)
 
 
 
@@ -11141,7 +11141,7 @@ class MainWindow(QMainWindow):
             self.ui.salesTable.cellDoubleClicked.connect(self.handle_customer_table_double_click)
 
         if hasattr(self.ui, "loadItem"):
-            self.ui.loadItem.clicked.connect(self.load_item_summary)
+            self.ui.loadItem.clicked.connect(lambda _checked=False: self.load_item_summary(show_at_risk_alert=True))
         if self.combine_threads_checkbox is not None:
             self.combine_threads_checkbox.stateChanged.connect(self.rerun_item_if_ready)
 
@@ -11173,9 +11173,9 @@ class MainWindow(QMainWindow):
             self.saba_hide_way_overdue_checkbox.stateChanged.connect(lambda _state: self.load_saba_review(show_warning=False))
 
         if hasattr(self.ui, "enterItem"):
-            self.ui.enterItem.returnPressed.connect(self.load_item_summary)
+            self.ui.enterItem.returnPressed.connect(lambda: self.load_item_summary(show_at_risk_alert=True))
             if self.ui.enterItem.completer() is not None:
-                self.ui.enterItem.completer().activated.connect(lambda *_args: self.load_item_summary())
+                self.ui.enterItem.completer().activated.connect(lambda *_args: self.load_item_summary(show_at_risk_alert=True))
 
         if self.customer_start_picker:
             self.customer_start_picker.dateChanged.connect(self.rerun_search_if_ready)
@@ -18780,7 +18780,7 @@ class MainWindow(QMainWindow):
             return
         item_edit.setText(item_number)
         self.ui.stackedWidget.setCurrentWidget(item_page)
-        self.load_item_summary()
+        self.load_item_summary(show_at_risk_alert=True)
 
     def handle_data_quality_double_click(self, _row, column):
         # The Suggested action column is deliberately interactive. Other
@@ -30714,7 +30714,7 @@ $mail.Display()
 
         enter_item.setText(item_number)
         stacked_widget.setCurrentWidget(item_page)
-        self.load_item_summary()
+        self.load_item_summary(show_at_risk_alert=True)
 
     def handle_customer_purchase_double_click(self, index):
         if not index.isValid():
@@ -30809,7 +30809,58 @@ $mail.Display()
                 self.load_item_summary()
 
 
-    def load_item_summary(self):
+    def show_item_at_risk_acknowledgement(self, item_number, at_risk_qty):
+        """Require an explicit acknowledgement when Item Summary shows positive At Risk."""
+        at_risk_qty = self.parse_float(at_risk_qty)
+        if at_risk_qty <= 0:
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Item At Risk")
+        dialog.setModal(True)
+        dialog.setMinimumWidth(520)
+        try:
+            dialog.setWindowFlag(Qt.WindowCloseButtonHint, False)
+        except Exception:
+            pass
+
+        layout = QVBoxLayout(dialog)
+
+        heading = QLabel(f"{item_number} requires attention", dialog)
+        heading_font = heading.font()
+        heading_font.setBold(True)
+        heading_font.setPointSize(max(heading_font.pointSize(), 12))
+        heading.setFont(heading_font)
+        layout.addWidget(heading)
+
+        message = QLabel(
+            f"This item has an At Risk quantity of {self.format_signed_value(at_risk_qty)}.\n\n"
+            "Please look into this item and review its demand, stock position, inbound supply and timing.",
+            dialog,
+        )
+        message.setWordWrap(True)
+        layout.addWidget(message)
+
+        understood = QCheckBox("Understood", dialog)
+        layout.addWidget(understood)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok, parent=dialog)
+        ok_button = buttons.button(QDialogButtonBox.Ok)
+        if ok_button is not None:
+            ok_button.setEnabled(False)
+        understood.toggled.connect(lambda checked: ok_button.setEnabled(bool(checked)) if ok_button is not None else None)
+        buttons.accepted.connect(dialog.accept)
+        layout.addWidget(buttons)
+
+        # Do not allow the warning to be dismissed without acknowledgement.
+        # If Escape/Alt+F4 manages to reject the dialog, reopen it.
+        while True:
+            result = dialog.exec()
+            if result == QDialog.Accepted and understood.isChecked():
+                break
+
+
+    def load_item_summary(self, show_at_risk_alert=False):
         typed_item = self.ui.enterItem.text() if hasattr(self.ui, "enterItem") else ""
         valid_item = self.find_item_number(typed_item)
 
@@ -30926,6 +30977,8 @@ $mail.Display()
 
         self.set_numeric_box("suggestedOrder_box", suggested_result["rounded"])
         self.set_numeric_box("atRisk_box", at_risk_result["rounded"])
+        if show_at_risk_alert and self.parse_float(at_risk_result.get("rounded", 0)) > 0:
+            self.show_item_at_risk_acknowledgement(valid_item, at_risk_result.get("rounded", 0))
         self.set_label_text("trendingOrder_label", self.trend_box_title(trend_result.get("comparison_months", getattr(self, "item_trend_comparison_months", 3))))
         self.set_signed_box("trendingOrder_box", trend_result["rounded"])
         self.set_signed_box("seasonalOrder_box", seasonal_result["rounded"])
@@ -31657,7 +31710,7 @@ $mail.Display()
 
         enter_item.setText(item_number)
         stacked_widget.setCurrentWidget(item_page)
-        self.load_item_summary()
+        self.load_item_summary(show_at_risk_alert=True)
 
     def open_to_order_sheet_for_item(self, item_number):
         stacked_widget = getattr(self.ui, "stackedWidget", None)
@@ -32328,18 +32381,45 @@ $mail.Display()
         chart_view.setChart(chart)
 
 
+    def get_yu_order_storage_root(self):
+        """Return a stable writable folder for YU drafts, temp files and exports.
+
+        In a PyInstaller one-file build, __file__ points inside the temporary
+        extraction folder. Files written there are not stable and may fail
+        depending on Windows permissions. Store operational files under the
+        current user's application-data folder instead.
+        """
+        candidates = [
+            Path(os.environ.get("LOCALAPPDATA", "")) / "WindsorWidget" / "YU",
+            Path(os.environ.get("APPDATA", "")) / "WindsorWidget" / "YU",
+            Path(tempfile.gettempdir()) / "WindsorWidget" / "YU",
+        ]
+        last_error = None
+        for candidate in candidates:
+            if not str(candidate).strip() or str(candidate) in {".", ""}:
+                continue
+            try:
+                candidate.mkdir(parents=True, exist_ok=True)
+                test_path = candidate / ".write_test"
+                test_path.write_text("ok", encoding="utf-8")
+                test_path.unlink(missing_ok=True)
+                return candidate
+            except Exception as exc:
+                last_error = exc
+        raise RuntimeError(f"Could not create a writable YU working folder: {last_error}")
+
     def get_yu_order_drafts_dir(self):
-        base_dir = Path(__file__).resolve().parent / "data" / "yu_order_drafts"
+        base_dir = self.get_yu_order_storage_root() / "drafts"
         base_dir.mkdir(parents=True, exist_ok=True)
         return str(base_dir)
 
     def get_yu_order_temp_dir(self):
-        base_dir = Path(__file__).resolve().parent / "data" / "yu_order_temp"
+        base_dir = self.get_yu_order_storage_root() / "temp"
         base_dir.mkdir(parents=True, exist_ok=True)
         return str(base_dir)
 
     def get_yu_order_output_dir(self):
-        base_dir = Path(__file__).resolve().parent / "data" / "yu_order_exports"
+        base_dir = self.get_yu_order_storage_root() / "exports"
         base_dir.mkdir(parents=True, exist_ok=True)
         return str(base_dir)
 
@@ -32351,11 +32431,16 @@ $mail.Display()
         if saved_path:
             candidate_paths.append(Path(saved_path))
 
-        # Common local fallback locations
-        app_dir = Path(__file__).resolve().parent
+        # In a frozen one-file build, self.app_dir is the folder containing the
+        # EXE while self.base_dir/__file__ point to PyInstaller's temporary
+        # extraction directory. The editable YU workbook must stay beside the
+        # EXE or in a user-selected permanent location.
+        source_dir = Path(__file__).resolve().parent
         candidate_paths.extend([
-            app_dir / expected_name,
-            app_dir / "data" / expected_name,
+            self.app_dir / expected_name,
+            self.app_dir / "data" / expected_name,
+            source_dir / expected_name,
+            source_dir / "data" / expected_name,
             self.base_dir / expected_name,
             self.base_dir / "data" / expected_name,
         ])
@@ -32374,7 +32459,7 @@ $mail.Display()
                 self.settings.setValue("yu/template_path", final_path)
                 return final_path
 
-        start_dir = str(app_dir)
+        start_dir = str(self.app_dir)
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             f"Choose {expected_name}",

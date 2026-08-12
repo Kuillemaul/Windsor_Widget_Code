@@ -1,0 +1,702 @@
+--- a/main_patched_status_yu.py
++++ b/main_patched_status_yu.py
+@@ -124,7 +124,7 @@
+ TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
+ TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
+ TABLE_FORMAT_SETTINGS_PREFIX = "table_format"
+-APP_VERSION = "1.7.3"
++APP_VERSION = "1.7.4"
+ APP_DESIGNER = "Bradley Mayze"
+ YU_SUPPLIER_DISPLAY_NAME = "Yuchang Textile Factory"
+ # Generic latest purchase-cost fields. These apply to every item in the item master.
+@@ -32328,18 +32328,45 @@
+         chart_view.setChart(chart)
+ 
+ 
++    def get_yu_order_storage_root(self):
++        """Return a stable writable folder for YU drafts, temp files and exports.
++
++        In a PyInstaller one-file build, __file__ points inside the temporary
++        extraction folder. Files written there are not stable and may fail
++        depending on Windows permissions. Store operational files under the
++        current user's application-data folder instead.
++        """
++        candidates = [
++            Path(os.environ.get("LOCALAPPDATA", "")) / "WindsorWidget" / "YU",
++            Path(os.environ.get("APPDATA", "")) / "WindsorWidget" / "YU",
++            Path(tempfile.gettempdir()) / "WindsorWidget" / "YU",
++        ]
++        last_error = None
++        for candidate in candidates:
++            if not str(candidate).strip() or str(candidate) in {".", ""}:
++                continue
++            try:
++                candidate.mkdir(parents=True, exist_ok=True)
++                test_path = candidate / ".write_test"
++                test_path.write_text("ok", encoding="utf-8")
++                test_path.unlink(missing_ok=True)
++                return candidate
++            except Exception as exc:
++                last_error = exc
++        raise RuntimeError(f"Could not create a writable YU working folder: {last_error}")
++
+     def get_yu_order_drafts_dir(self):
+-        base_dir = Path(__file__).resolve().parent / "data" / "yu_order_drafts"
++        base_dir = self.get_yu_order_storage_root() / "drafts"
+         base_dir.mkdir(parents=True, exist_ok=True)
+         return str(base_dir)
+ 
+     def get_yu_order_temp_dir(self):
+-        base_dir = Path(__file__).resolve().parent / "data" / "yu_order_temp"
++        base_dir = self.get_yu_order_storage_root() / "temp"
+         base_dir.mkdir(parents=True, exist_ok=True)
+         return str(base_dir)
+ 
+     def get_yu_order_output_dir(self):
+-        base_dir = Path(__file__).resolve().parent / "data" / "yu_order_exports"
++        base_dir = self.get_yu_order_storage_root() / "exports"
+         base_dir.mkdir(parents=True, exist_ok=True)
+         return str(base_dir)
+ 
+@@ -32351,11 +32378,16 @@
+         if saved_path:
+             candidate_paths.append(Path(saved_path))
+ 
+-        # Common local fallback locations
+-        app_dir = Path(__file__).resolve().parent
++        # In a frozen one-file build, self.app_dir is the folder containing the
++        # EXE while self.base_dir/__file__ point to PyInstaller's temporary
++        # extraction directory. The editable YU workbook must stay beside the
++        # EXE or in a user-selected permanent location.
++        source_dir = Path(__file__).resolve().parent
+         candidate_paths.extend([
+-            app_dir / expected_name,
+-            app_dir / "data" / expected_name,
++            self.app_dir / expected_name,
++            self.app_dir / "data" / expected_name,
++            source_dir / expected_name,
++            source_dir / "data" / expected_name,
+             self.base_dir / expected_name,
+             self.base_dir / "data" / expected_name,
+         ])
+@@ -32374,7 +32406,7 @@
+                 self.settings.setValue("yu/template_path", final_path)
+                 return final_path
+ 
+-        start_dir = str(app_dir)
++        start_dir = str(self.app_dir)
+         file_path, _ = QFileDialog.getOpenFileName(
+             self,
+             f"Choose {expected_name}",
+
+--- a/yu_order_workflow.py
++++ b/yu_order_workflow.py
+@@ -532,13 +532,38 @@
+         if not rows:
+             QMessageBox.warning(self, 'No lines', 'Add at least one line before validating.')
+             return
+-        temp_dir = Path(self.main_window.get_yu_order_temp_dir())
+-        temp_path = temp_dir / f'YU_{order_no}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+-        self.write_csv(temp_path)
+-        opened = self.main_window.open_yu_order_review_window(
+-            str(temp_path),
+-            source_to_order_lines=self._source_to_order_lines,
+-        )
++
++        try:
++            temp_dir = Path(self.main_window.get_yu_order_temp_dir())
++            temp_dir.mkdir(parents=True, exist_ok=True)
++            temp_path = temp_dir / f'YU_{order_no}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
++            self.write_csv(temp_path)
++            opened = self.main_window.open_yu_order_review_window(
++                str(temp_path),
++                source_to_order_lines=self._source_to_order_lines,
++            )
++        except Exception as exc:
++            try:
++                error_dir = Path(self.main_window.get_yu_order_temp_dir())
++            except Exception:
++                error_dir = Path(os.environ.get("TEMP") or os.environ.get("TMP") or Path.cwd())
++            error_path = error_dir / "yu_order_validation_error.log"
++            try:
++                error_dir.mkdir(parents=True, exist_ok=True)
++                import traceback
++                error_path.write_text(traceback.format_exc(), encoding="utf-8")
++                log_text = f"\n\nTechnical error log:\n{error_path}"
++            except Exception:
++                log_text = ""
++            QMessageBox.critical(
++                self,
++                "YU Order Validation",
++                "The YU order validation window could not be opened.\n\n"
++                f"{type(exc).__name__}: {exc}"
++                f"{log_text}",
++            )
++            return
++
+         if opened:
+             self.accept()
+ 
+
+--- a/yu_order_review_export_test_window.py
++++ b/yu_order_review_export_test_window.py
+@@ -1914,6 +1914,8 @@
+         # are only current workbook addresses used during validation.
+         self._workbook_scan: dict[str, Any] = {}
+         self._workbook_scan_error = ""
++        self._available_validation_tables: set[str] = set()
++        self._missing_validation_tables: list[str] = []
+ 
+         self.setObjectName("YUOrderReviewWindow")
+         self.setWindowTitle("YU Order Review")
+@@ -2347,21 +2349,42 @@
+ 
+     # ---------------- data load
+     def check_required_tables(self):
++        """Detect optional legacy YU validation tables without blocking the window.
++
++        Current Column A mappings in the YU workbook are authoritative. The legacy
++        yu_test_* tables are useful only for candidate suggestions and historical
++        match detail, so their absence must not stop normal validation/export.
++        """
++        available = set()
+         missing = []
+-        for table_name in self.tables.values():
+-            exists = self.db.scalar(
+-                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE' AND TABLE_NAME = ?",
+-                (table_name,),
+-            )
+-            if not exists:
++        for key, table_name in self.tables.items():
++            try:
++                exists = self.db.scalar(
++                    "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES "
++                    "WHERE TABLE_TYPE='BASE TABLE' AND TABLE_NAME = ?",
++                    (table_name,),
++                )
++            except Exception:
++                exists = 0
++            if exists:
++                available.add(key)
++            else:
+                 missing.append(table_name)
++
++        self._available_validation_tables = available
++        self._missing_validation_tables = missing
+         if missing:
+-            raise RuntimeError(
+-                "Required test tables were not found.\n\n"
+-                "Run the importer first, for example:\n"
+-                "python yu_sqlserver_test_import_v3.py rebuild --workbook \"yuchang_order_form_matched_third_pass.xlsx\"\n\n"
+-                f"Missing tables: {', '.join(missing)}"
+-            )
++            try:
++                self.statusBar().showMessage(
++                    "Workbook-only validation mode. Legacy suggestion tables unavailable: "
++                    + ", ".join(missing),
++                    10000,
++                )
++            except Exception:
++                pass
++
++    def validation_table_available(self, key: str) -> bool:
++        return str(key) in self._available_validation_tables
+ 
+     def load_order_csv(self):
+         if not self.order_csv_path:
+@@ -2521,9 +2544,16 @@
+         self.load_main_table()
+ 
+     def load_last_import_date(self):
+-        row = self.db.one(
+-            f"SELECT TOP 1 imported_at, workbook_path FROM dbo.{self.tables['import_runs']} ORDER BY imported_at DESC"
+-        )
++        if not self.validation_table_available("import_runs"):
++            self.last_import_browser.setPlainText("Workbook mode")
++            return
++        try:
++            row = self.db.one(
++                f"SELECT TOP 1 imported_at, workbook_path "
++                f"FROM dbo.{self.tables['import_runs']} ORDER BY imported_at DESC"
++            )
++        except Exception:
++            row = None
+         if row is None:
+             self.last_import_browser.setPlainText("")
+             return
+@@ -2546,9 +2576,6 @@
+                 review_hits=[],
+             )
+ 
+-        # Permanent resolution comes only from the current workbook's Column A.
+-        # The database source_row is a historical validation snapshot and is not
+-        # trusted as an export destination.
+         workbook_rows = self.workbook_rows_for_item(item_number)
+         if len(workbook_rows) == 1:
+             current_row = int(workbook_rows[0])
+@@ -2578,90 +2605,95 @@
+ 
+         hits: list[ReviewHit] = []
+ 
+-        direct_condition, direct_params = self.item_match_condition(
+-            ["current_item_number", "literal_item_number"], item_number
+-        )
+-        direct_rows_raw = self.db.all(
+-            f"""
+-            SELECT DISTINCT source_row
+-            FROM dbo.{self.tables["supplier_lines"]}
+-            WHERE row_kind = 'detail'
+-              AND {direct_condition}
+-            ORDER BY source_row
+-            """,
+-            direct_params,
+-        )
+-        for row in direct_rows_raw:
+-            hits.append(
+-                ReviewHit(
+-                    source_row=int(row["source_row"]),
+-                    match_type="supplier_snapshot",
+-                    confidence=None,
+-                    note="Item exists in the imported supplier snapshot but is missing from current workbook Column A.",
++        if self.validation_table_available("supplier_lines"):
++            direct_condition, direct_params = self.item_match_condition(
++                ["current_item_number", "literal_item_number"], item_number
++            )
++            direct_rows_raw = self.db.all(
++                f"""
++                SELECT DISTINCT source_row
++                FROM dbo.{self.tables["supplier_lines"]}
++                WHERE row_kind = 'detail'
++                  AND {direct_condition}
++                ORDER BY source_row
++                """,
++                direct_params,
++            )
++            for row in direct_rows_raw:
++                hits.append(
++                    ReviewHit(
++                        source_row=int(row["source_row"]),
++                        match_type="supplier_snapshot",
++                        confidence=None,
++                        note="Item exists in the imported supplier snapshot but is missing from current workbook Column A.",
++                    )
+                 )
+-            )
+-
+-        final_condition, final_params = self.item_match_condition(["final_selection"], item_number)
+-        final_rows_raw = self.db.all(
+-            f"""
+-            SELECT DISTINCT source_row
+-            FROM dbo.{self.tables["match_review"]}
+-            WHERE {final_condition}
+-            ORDER BY source_row
+-            """,
+-            final_params,
+-        )
+-        for row in final_rows_raw:
+-            hits.append(
+-                ReviewHit(
+-                    source_row=int(row["source_row"]),
+-                    match_type="database_confirmation",
+-                    confidence=None,
+-                    note="Database confirmation exists, but Column A is the permanent mapping and currently has no unique match.",
++
++        if self.validation_table_available("match_review"):
++            final_condition, final_params = self.item_match_condition(["final_selection"], item_number)
++            final_rows_raw = self.db.all(
++                f"""
++                SELECT DISTINCT source_row
++                FROM dbo.{self.tables["match_review"]}
++                WHERE {final_condition}
++                ORDER BY source_row
++                """,
++                final_params,
++            )
++            for row in final_rows_raw:
++                hits.append(
++                    ReviewHit(
++                        source_row=int(row["source_row"]),
++                        match_type="database_confirmation",
++                        confidence=None,
++                        note="Database confirmation exists, but Column A currently has no unique match.",
++                    )
+                 )
+-            )
+-
+-        suggested_condition, suggested_params = self.item_match_condition(["suggested_match"], item_number)
+-        suggested_hits = self.db.all(
+-            f"""
+-            SELECT source_row, confidence_pct, review_row
+-            FROM dbo.{self.tables["match_review"]}
+-            WHERE {suggested_condition}
+-            ORDER BY source_row
+-            """,
+-            suggested_params,
+-        )
+-        for row in suggested_hits:
+-            conf = row.get("confidence_pct")
+-            hits.append(
+-                ReviewHit(
+-                    source_row=int(row["source_row"]),
+-                    match_type="suggested_match",
+-                    confidence=float(conf) if conf is not None else None,
+-                    note=f"suggested in Match_Review row {row.get('review_row')}",
++
++            suggested_condition, suggested_params = self.item_match_condition(["suggested_match"], item_number)
++            suggested_hits = self.db.all(
++                f"""
++                SELECT source_row, confidence_pct, review_row
++                FROM dbo.{self.tables["match_review"]}
++                WHERE {suggested_condition}
++                ORDER BY source_row
++                """,
++                suggested_params,
++            )
++            for row in suggested_hits:
++                conf = row.get("confidence_pct")
++                hits.append(
++                    ReviewHit(
++                        source_row=int(row["source_row"]),
++                        match_type="suggested_match",
++                        confidence=float(conf) if conf is not None else None,
++                        note=f"suggested in Match_Review row {row.get('review_row')}",
++                    )
+                 )
+-            )
+-
+-        candidate_condition, candidate_params = self.item_match_condition(["candidate_item_number"], item_number)
+-        candidate_hits = self.db.all(
+-            f"""
+-            SELECT source_row, confidence_pct, review_row, candidate_rank
+-            FROM dbo.{self.tables["match_candidates"]}
+-            WHERE {candidate_condition}
+-            ORDER BY source_row, candidate_rank
+-            """,
+-            candidate_params,
+-        )
+-        for row in candidate_hits:
+-            conf = row.get("confidence_pct")
+-            hits.append(
+-                ReviewHit(
+-                    source_row=int(row["source_row"]),
+-                    match_type=f"candidate_{row.get('candidate_rank')}",
+-                    confidence=float(conf) if conf is not None else None,
+-                    note=f"candidate in Match_Review row {row.get('review_row')}",
++
++        if self.validation_table_available("match_candidates"):
++            candidate_condition, candidate_params = self.item_match_condition(
++                ["candidate_item_number"], item_number
++            )
++            candidate_hits = self.db.all(
++                f"""
++                SELECT source_row, confidence_pct, review_row, candidate_rank
++                FROM dbo.{self.tables["match_candidates"]}
++                WHERE {candidate_condition}
++                ORDER BY source_row, candidate_rank
++                """,
++                candidate_params,
++            )
++            for row in candidate_hits:
++                conf = row.get("confidence_pct")
++                hits.append(
++                    ReviewHit(
++                        source_row=int(row["source_row"]),
++                        match_type=f"candidate_{row.get('candidate_rank')}",
++                        confidence=float(conf) if conf is not None else None,
++                        note=f"candidate in Match_Review row {row.get('review_row')}",
++                    )
+                 )
+-            )
+ 
+         if hits:
+             hits_sorted = sorted(
+@@ -2691,6 +2723,12 @@
+                 review_hits=hits_sorted,
+             )
+ 
++        unavailable_note = ""
++        if self._missing_validation_tables:
++            unavailable_note = (
++                " Legacy candidate tables are unavailable, so use the manual current workbook row "
++                "field when this item needs to be mapped."
++            )
+         return OrderResolveResult(
+             item_number=item_number,
+             quantity=quantity,
+@@ -2699,7 +2737,8 @@
+             status="unmatched",
+             source_row=None,
+             source="not_found",
+-            note="Item number is not in current workbook Column A and no validation candidates were found.",
++            note="Item number is not in current workbook Column A and no validation candidates were found."
++                 + unavailable_note,
+             review_hits=[],
+         )
+ 
+@@ -2909,80 +2948,87 @@
+ 
+     def load_candidates_for_item(self, item_number: str, current_result: OrderResolveResult) -> list[dict]:
+         rows: list[dict] = []
+-        supplier_cols = self.candidate_supplier_select_sql("s.")
+-
+-        direct_condition, direct_params = self.item_match_condition(
+-            ["s.current_item_number", "s.literal_item_number"], item_number
+-        )
+-        direct_rows = self.db.all(
+-            f"""
+-            SELECT s.source_row, {supplier_cols}
+-            FROM dbo.{self.tables["supplier_lines"]} s
+-            WHERE s.row_kind = 'detail'
+-              AND {direct_condition}
+-            ORDER BY s.source_row
+-            """,
+-            direct_params,
+-        )
+-        for row in direct_rows:
+-            rows.append(self.decorate_candidate_row(row, hit_type="direct", confidence=None))
+-
+-        final_condition, final_params = self.item_match_condition(["r.final_selection"], item_number)
+-        final_rows = self.db.all(
+-            f"""
+-            SELECT r.source_row, {supplier_cols}
+-            FROM dbo.{self.tables["match_review"]} r
+-            LEFT JOIN dbo.{self.tables["supplier_lines"]} s ON s.source_row = r.source_row
+-            WHERE {final_condition}
+-            ORDER BY r.source_row
+-            """,
+-            final_params,
+-        )
+-        for row in final_rows:
+-            rows.append(self.decorate_candidate_row(row, hit_type="database_confirmation", confidence=None))
+-
+-        suggested_condition, suggested_params = self.item_match_condition(["r.suggested_match"], item_number)
+-        suggested_rows = self.db.all(
+-            f"""
+-            SELECT r.source_row, r.confidence_pct, {supplier_cols}
+-            FROM dbo.{self.tables["match_review"]} r
+-            LEFT JOIN dbo.{self.tables["supplier_lines"]} s ON s.source_row = r.source_row
+-            WHERE {suggested_condition}
+-            ORDER BY r.source_row
+-            """,
+-            suggested_params,
+-        )
+-        for row in suggested_rows:
+-            rows.append(
+-                self.decorate_candidate_row(
+-                    row,
+-                    hit_type="suggested_match",
+-                    confidence=float(row["confidence_pct"]) if row.get("confidence_pct") is not None else None,
++        supplier_available = self.validation_table_available("supplier_lines")
++        review_available = self.validation_table_available("match_review")
++        candidates_available = self.validation_table_available("match_candidates")
++
++        if supplier_available:
++            supplier_cols = self.candidate_supplier_select_sql("s.")
++
++            direct_condition, direct_params = self.item_match_condition(
++                ["s.current_item_number", "s.literal_item_number"], item_number
++            )
++            direct_rows = self.db.all(
++                f"""
++                SELECT s.source_row, {supplier_cols}
++                FROM dbo.{self.tables["supplier_lines"]} s
++                WHERE s.row_kind = 'detail'
++                  AND {direct_condition}
++                ORDER BY s.source_row
++                """,
++                direct_params,
++            )
++            for row in direct_rows:
++                rows.append(self.decorate_candidate_row(row, hit_type="direct", confidence=None))
++
++            if review_available:
++                final_condition, final_params = self.item_match_condition(["r.final_selection"], item_number)
++                final_rows = self.db.all(
++                    f"""
++                    SELECT r.source_row, {supplier_cols}
++                    FROM dbo.{self.tables["match_review"]} r
++                    LEFT JOIN dbo.{self.tables["supplier_lines"]} s ON s.source_row = r.source_row
++                    WHERE {final_condition}
++                    ORDER BY r.source_row
++                    """,
++                    final_params,
+                 )
+-            )
+-
+-        candidate_condition, candidate_params = self.item_match_condition(["c.candidate_item_number"], item_number)
+-        candidate_rows = self.db.all(
+-            f"""
+-            SELECT c.source_row, c.confidence_pct, c.candidate_rank, {supplier_cols}
+-            FROM dbo.{self.tables["match_candidates"]} c
+-            LEFT JOIN dbo.{self.tables["supplier_lines"]} s ON s.source_row = c.source_row
+-            WHERE {candidate_condition}
+-            ORDER BY c.source_row, c.candidate_rank
+-            """,
+-            candidate_params,
+-        )
+-        for row in candidate_rows:
+-            rows.append(
+-                self.decorate_candidate_row(
+-                    row,
+-                    hit_type=f"candidate_{row.get('candidate_rank')}",
+-                    confidence=float(row["confidence_pct"]) if row.get("confidence_pct") is not None else None,
++                for row in final_rows:
++                    rows.append(self.decorate_candidate_row(row, hit_type="database_confirmation", confidence=None))
++
++                suggested_condition, suggested_params = self.item_match_condition(["r.suggested_match"], item_number)
++                suggested_rows = self.db.all(
++                    f"""
++                    SELECT r.source_row, r.confidence_pct, {supplier_cols}
++                    FROM dbo.{self.tables["match_review"]} r
++                    LEFT JOIN dbo.{self.tables["supplier_lines"]} s ON s.source_row = r.source_row
++                    WHERE {suggested_condition}
++                    ORDER BY r.source_row
++                    """,
++                    suggested_params,
+                 )
+-            )
+-
+-        # When Column A already contains the item, always show its current row,
+-        # even if no matching database snapshot row is available.
++                for row in suggested_rows:
++                    rows.append(
++                        self.decorate_candidate_row(
++                            row,
++                            hit_type="suggested_match",
++                            confidence=float(row["confidence_pct"]) if row.get("confidence_pct") is not None else None,
++                        )
++                    )
++
++            if candidates_available:
++                candidate_condition, candidate_params = self.item_match_condition(
++                    ["c.candidate_item_number"], item_number
++                )
++                candidate_rows = self.db.all(
++                    f"""
++                    SELECT c.source_row, c.confidence_pct, c.candidate_rank, {supplier_cols}
++                    FROM dbo.{self.tables["match_candidates"]} c
++                    LEFT JOIN dbo.{self.tables["supplier_lines"]} s ON s.source_row = c.source_row
++                    WHERE {candidate_condition}
++                    ORDER BY c.source_row, c.candidate_rank
++                    """,
++                    candidate_params,
++                )
++                for row in candidate_rows:
++                    rows.append(
++                        self.decorate_candidate_row(
++                            row,
++                            hit_type=f"candidate_{row.get('candidate_rank')}",
++                            confidence=float(row["confidence_pct"]) if row.get("confidence_pct") is not None else None,
++                        )
++                    )
++
+         if current_result.source_row is not None:
+             current_row = int(current_result.source_row)
+             if not any(r.get("workbook_row") == current_row for r in rows):
+@@ -3104,6 +3150,19 @@
+                 f"<b>Current Workbook Row:</b> {self.html_text(workbook_row)}",
+                 f"<b>Row State:</b> {self.html_text(row_state)}",
+                 "<b>Mapping Source:</b> Current Sheet1 Column A",
++            ]
++            self.preview_browser.setHtml("<br>".join(lines))
++            return
++
++        if not (
++            self.validation_table_available("supplier_lines")
++            and self.validation_table_available("match_review")
++        ):
++            lines = [
++                f"<b>Current Workbook Row:</b> {self.html_text(workbook_row)}",
++                f"<b>Database Snapshot Row:</b> {self.html_text(db_source_row)}",
++                f"<b>Row State:</b> {self.html_text(row_state)}",
++                "<b>Mapping Source:</b> Workbook-only validation mode",
+             ]
+             self.preview_browser.setHtml("<br>".join(lines))
+             return
+@@ -3323,6 +3382,8 @@
+ 
+     def db_source_row_for_current_workbook_row(self, workbook_row: int) -> int | None:
+         """Best-effort link from a current workbook row to the old DB snapshot row."""
++        if not self.validation_table_available("supplier_lines"):
++            return None
+         records = self.db.all(
+             f"""
+             SELECT
+@@ -3414,7 +3475,11 @@
+         if db_source_row is None:
+             db_source_row = self.db_source_row_for_current_workbook_row(source_row)
+ 
+-        if db_source_row is not None:
++        if (
++            db_source_row is not None
++            and self.validation_table_available("supplier_lines")
++            and self.validation_table_available("match_review")
++        ):
+             db_source_row = int(db_source_row)
+             self.ensure_match_review_row(db_source_row)
+             self.reset_row_status_for_item(item_number, exclude_source_row=db_source_row)
+@@ -3532,24 +3597,34 @@
+             return
+ 
+         workbook_rows = self.workbook_rows_for_item(item_number)
+-        final_condition, final_params = self.item_match_condition(["r.final_selection"], item_number)
+-        rows = self.db.all(
+-            f"""
+-            SELECT r.source_row,
+-                   CASE
+-                     WHEN ISNULL(r.suggested_match, '') <> ''
+-                          OR EXISTS (
+-                              SELECT 1 FROM dbo.{self.tables["match_candidates"]} c
+-                              WHERE c.source_row = r.source_row
+-                          )
+-                     THEN 'needs_review'
+-                     ELSE 'unmatched'
+-                   END AS new_status
+-            FROM dbo.{self.tables["match_review"]} r
+-            WHERE {final_condition}
+-            """,
+-            final_params,
+-        )
++        rows = []
++        if self.validation_table_available("match_review"):
++            final_condition, final_params = self.item_match_condition(["r.final_selection"], item_number)
++            if self.validation_table_available("match_candidates"):
++                status_sql = f"""
++                    CASE
++                      WHEN ISNULL(r.suggested_match, '') <> ''
++                           OR EXISTS (
++                               SELECT 1 FROM dbo.{self.tables["match_candidates"]} c
++                               WHERE c.source_row = r.source_row
++                           )
++                      THEN 'needs_review'
++                      ELSE 'unmatched'
++                    END
++                """
++            else:
++                status_sql = """
++                    CASE WHEN ISNULL(r.suggested_match, '') <> ''
++                         THEN 'needs_review' ELSE 'unmatched' END
++                """
++            rows = self.db.all(
++                f"""
++                SELECT r.source_row, {status_sql} AS new_status
++                FROM dbo.{self.tables["match_review"]} r
++                WHERE {final_condition}
++                """,
++                final_params,
++            )
+ 
+         if not workbook_rows and not rows:
+             QMessageBox.information(self, "YU Order Review", f"There is no confirmed mapping for {item_number}.")
+
+--- a/Windsor Widget.spec
++++ b/Windsor Widget.spec
+@@ -6,7 +6,7 @@
+     pathex=[],
+     binaries=[],
+     datas=[],
+-    hiddenimports=[],
++    hiddenimports=['yu_order_workflow', 'yu_order_review_export_test_window'],
+     hookspath=[],
+     hooksconfig={},
+     runtime_hooks=[],

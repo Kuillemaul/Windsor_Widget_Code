@@ -532,13 +532,38 @@ class YUOrderEntryDialog(QDialog):
         if not rows:
             QMessageBox.warning(self, 'No lines', 'Add at least one line before validating.')
             return
-        temp_dir = Path(self.main_window.get_yu_order_temp_dir())
-        temp_path = temp_dir / f'YU_{order_no}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
-        self.write_csv(temp_path)
-        opened = self.main_window.open_yu_order_review_window(
-            str(temp_path),
-            source_to_order_lines=self._source_to_order_lines,
-        )
+
+        try:
+            temp_dir = Path(self.main_window.get_yu_order_temp_dir())
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            temp_path = temp_dir / f'YU_{order_no}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+            self.write_csv(temp_path)
+            opened = self.main_window.open_yu_order_review_window(
+                str(temp_path),
+                source_to_order_lines=self._source_to_order_lines,
+            )
+        except Exception as exc:
+            try:
+                error_dir = Path(self.main_window.get_yu_order_temp_dir())
+            except Exception:
+                error_dir = Path(os.environ.get("TEMP") or os.environ.get("TMP") or Path.cwd())
+            error_path = error_dir / "yu_order_validation_error.log"
+            try:
+                error_dir.mkdir(parents=True, exist_ok=True)
+                import traceback
+                error_path.write_text(traceback.format_exc(), encoding="utf-8")
+                log_text = f"\n\nTechnical error log:\n{error_path}"
+            except Exception:
+                log_text = ""
+            QMessageBox.critical(
+                self,
+                "YU Order Validation",
+                "The YU order validation window could not be opened.\n\n"
+                f"{type(exc).__name__}: {exc}"
+                f"{log_text}",
+            )
+            return
+
         if opened:
             self.accept()
 

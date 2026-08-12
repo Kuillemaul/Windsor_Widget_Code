@@ -65,6 +65,10 @@ DEFAULT_ORDER_CSV = ""
 DEFAULT_TEMPLATE = ""
 DEFAULT_OUTPUT_DIR = "yu_exports"
 
+VALIDATION_MODULE_VERSION = "1.7.5"
+YU_ORDER_SHEET_NAME = "Sheet1"
+YU_ITEM_MASTER_SHEET_NAME = "ITEM_Yuchang_Match"
+
 MYOB_PO_HEADERS = [
     "Co./Last Name",
     "First Name",
@@ -113,6 +117,106 @@ MYOB_YU_DELIVERY_STATUS = "P"
 MYOB_YU_TAX_CODE = "OSP"
 MYOB_YU_PURCHASE_STATUS = "O"
 MYOB_YU_LOCATION_ID = "Location1"
+
+
+def _normalised_header_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+
+def _looks_like_yu_order_sheet(worksheet) -> bool:
+    """Return True when a worksheet looks like the supplier order form.
+
+    The item-master lookup sheet also has values in column A, but it is not
+    row-aligned with the supplier order form. The order sheet is identified by
+    its Item / Size / Colour headers rather than by active-sheet position.
+    """
+    try:
+        row_12 = [
+            _normalised_header_text(worksheet.cell(row=12, column=column).value)
+            for column in range(1, 8)
+        ]
+        row_13 = [
+            _normalised_header_text(worksheet.cell(row=13, column=column).value)
+            for column in range(1, 8)
+        ]
+    except Exception:
+        return False
+
+    combined = set(row_12 + row_13)
+    return (
+        "item" in combined
+        and "size" in combined
+        and ("colour" in combined or "color" in combined)
+    )
+
+
+def detect_yu_order_sheet_name(workbook, preferred: str | None = YU_ORDER_SHEET_NAME) -> str:
+    """Locate the row-aligned YU supplier order sheet.
+
+    ITEM_Yuchang_Match is a lookup list and must never be treated as though its
+    row numbers match the supplier lines on the order form.
+    """
+    preferred = str(preferred or "").strip()
+    if preferred and preferred in workbook.sheetnames:
+        worksheet = workbook[preferred]
+        if _looks_like_yu_order_sheet(worksheet):
+            return preferred
+
+    candidates = []
+    for sheet_name in workbook.sheetnames:
+        if sheet_name in {YU_ITEM_MASTER_SHEET_NAME, "Match_Lists", "Match_Review"}:
+            continue
+        try:
+            if _looks_like_yu_order_sheet(workbook[sheet_name]):
+                candidates.append(sheet_name)
+        except Exception:
+            continue
+
+    non_flat = [name for name in candidates if not name.casefold().endswith("_flat")]
+    if len(non_flat) == 1:
+        return non_flat[0]
+    if len(candidates) == 1:
+        return candidates[0]
+    if preferred and preferred in candidates:
+        return preferred
+    if candidates:
+        return sorted(candidates, key=str.casefold)[0]
+
+    raise ValueError(
+        "Could not identify the YU supplier order sheet. "
+        f"Available sheets: {workbook.sheetnames}"
+    )
+
+
+def verify_yu_order_mapping(
+    template_path: str | Path,
+    sheet_name: str,
+    row_number: int,
+    expected_item_number: str,
+    match_col: str = "A",
+) -> str:
+    """Re-open the workbook and verify the exact order-sheet mapping cell."""
+    workbook = load_workbook(str(template_path), read_only=True, data_only=False)
+    try:
+        if sheet_name not in workbook.sheetnames:
+            raise ValueError(
+                f"Order sheet '{sheet_name}' was not found after saving. "
+                f"Available sheets: {workbook.sheetnames}"
+            )
+        cell_ref = f"{match_col}{int(row_number)}"
+        actual = str(workbook[sheet_name][cell_ref].value or "").strip()
+        expected = str(expected_item_number or "").strip()
+        if clean_item_key(actual) != clean_item_key(expected):
+            raise RuntimeError(
+                f"The mapping did not save to {sheet_name}!{cell_ref}. "
+                f"Expected {expected!r}, found {actual!r}."
+            )
+        return actual
+    finally:
+        try:
+            workbook.close()
+        except Exception:
+            pass
 
 
 def _decimal_value(value: Any, field_name: str = "value") -> Decimal:
@@ -733,7 +837,7 @@ def detect_yuchang_footer_rows(
 def scan_yuchang_workbook(
     template_path: str,
     *,
-    sheet_name: str = "Sheet1",
+    sheet_name: str | None = None,
     item_col: str = "A",
     header_end_row: int = 14,
     export_min_col: str = "A",
@@ -750,8 +854,7 @@ def scan_yuchang_workbook(
 
     wb = load_workbook(str(workbook_path), read_only=True, data_only=False)
     try:
-        if sheet_name not in wb.sheetnames:
-            raise ValueError(f"Sheet '{sheet_name}' not found. Available sheets: {wb.sheetnames}")
+        sheet_name = detect_yu_order_sheet_name(wb, sheet_name)
         ws = wb[sheet_name]
 
         item_idx = column_index_from_string(item_col)
@@ -876,7 +979,7 @@ def resolve_yuchang_items_to_current_rows(
     template_path: str,
     item_numbers_with_qty: Iterable[tuple[str, float | int]],
     *,
-    sheet_name: str = "Sheet1",
+    sheet_name: str | None = None,
     exact_item_numbers: Iterable[str] | None = None,
 ) -> tuple[list[tuple[int, float]], dict[str, Any]]:
     """Resolve order items against the current Column A positions."""
@@ -1299,7 +1402,7 @@ def save_yuchang_workbook_matches(
     template_path: str,
     row_matches: dict[int, str | None],
     *,
-    order_sheet_name: str = "Sheet1",
+    order_sheet_name: str | None = None,
     match_col: str = "A",
     review_sheet_name: str = "Match_Review",
     review_header_row: int = 4,
@@ -1313,6 +1416,17 @@ def save_yuchang_workbook_matches(
     workbook_path = Path(str(template_path or "").strip())
     if not workbook_path.exists():
         raise FileNotFoundError(f"YU workbook was not found: {workbook_path}")
+
+    # Resolve the order sheet by its actual order-form headers. The item-master
+    # sheet is a lookup list and its row numbers are unrelated to supplier rows.
+    workbook_for_sheet = load_workbook(str(workbook_path), read_only=True, data_only=False)
+    try:
+        order_sheet_name = detect_yu_order_sheet_name(workbook_for_sheet, order_sheet_name)
+    finally:
+        try:
+            workbook_for_sheet.close()
+        except Exception:
+            pass
 
     _register_xlsx_namespaces()
     updated_parts: dict[str, bytes] = {}
@@ -1378,7 +1492,15 @@ def save_yuchang_workbook_matches(
                 except Exception:
                     pass
 
-    return {"updated_rows": sorted(set(updated_rows)), "path": str(workbook_path)}
+    return {
+        "updated_rows": sorted(set(updated_rows)),
+        "updated_cells": [
+            f"{order_sheet_name}!{match_letter}{row_number}"
+            for row_number in sorted(set(updated_rows))
+        ],
+        "sheet_name": order_sheet_name,
+        "path": str(workbook_path),
+    }
 
 
 def _make_compact_export_row_plan(
@@ -1568,7 +1690,7 @@ def export_yuchang_po_compact_by_rows(
     order_number: str,
     source_rows_with_qty: list[tuple[int, float | int]],
     *,
-    sheet_name: str = "Sheet1",
+    sheet_name: str | None = None,
     qty_col: str = "L",
     date_cell: str = "C10",
     order_no_cell: str = "H10",
@@ -1586,9 +1708,7 @@ def export_yuchang_po_compact_by_rows(
     output_path = str(output_path)
 
     wb = load_workbook(template_path)
-    if sheet_name not in wb.sheetnames:
-        raise ValueError(f"Sheet '{sheet_name}' not found. Available sheets: {wb.sheetnames}")
-
+    sheet_name = detect_yu_order_sheet_name(wb, sheet_name)
     src = wb[sheet_name]
 
     qty_idx = column_index_from_string(qty_col)
@@ -1846,7 +1966,7 @@ def export_yuchang_po_compact_by_items(
     order_number: str,
     item_numbers_with_qty: Iterable[tuple[str, float | int]],
     *,
-    sheet_name: str = "Sheet1",
+    sheet_name: str | None = None,
     exact_item_numbers: Iterable[str] | None = None,
     **kwargs,
 ) -> dict:
@@ -1863,7 +1983,7 @@ def export_yuchang_po_compact_by_items(
         order_date=order_date,
         order_number=order_number,
         source_rows_with_qty=current_rows,
-        sheet_name=sheet_name,
+        sheet_name=str(scan["sheet_name"]),
         footer_start_row=int(scan["footer_start_row"]),
         footer_end_row=int(scan["footer_end_row"]),
         **kwargs,
@@ -1910,13 +2030,17 @@ class YUOrderReviewWindow(QMainWindow):
         self.current_rows: list[dict] = []
         self.current_selected_detail: dict[str, Any] | None = None
 
-        # Live Sheet1 index. Column A is the permanent item mapping; source rows
-        # are only current workbook addresses used during validation.
+        # Live supplier-order sheet index. Column A on the order form is the
+        # permanent item mapping. ITEM_Yuchang_Match is only an item lookup list
+        # and its row numbers are not aligned with supplier rows.
         self._workbook_scan: dict[str, Any] = {}
         self._workbook_scan_error = ""
+        self._order_sheet_name = YU_ORDER_SHEET_NAME
+        self._available_validation_tables: set[str] = set()
+        self._missing_validation_tables: list[str] = []
 
         self.setObjectName("YUOrderReviewWindow")
-        self.setWindowTitle("YU Order Review")
+        self.setWindowTitle(f"YU Order Review — Validation {VALIDATION_MODULE_VERSION}")
         self.resize(1480, 920)
         self.setMinimumSize(QSize(1280, 760))
 
@@ -1946,7 +2070,10 @@ class YUOrderReviewWindow(QMainWindow):
         self.last_import_browser.setReadOnly(True)
         top_layout.addWidget(self.last_import_browser)
 
-        self.title_label = QLabel("YU Order Review", self.top_frame)
+        self.title_label = QLabel(
+            f"YU Order Review {VALIDATION_MODULE_VERSION} — mapping sheet: {self._order_sheet_name}",
+            self.top_frame,
+        )
         self.title_label.setObjectName("title_label")
         top_layout.addWidget(self.title_label)
 
@@ -2347,21 +2474,42 @@ class YUOrderReviewWindow(QMainWindow):
 
     # ---------------- data load
     def check_required_tables(self):
+        """Detect optional legacy YU validation tables without blocking the window.
+
+        Current Column A mappings in the YU workbook are authoritative. The legacy
+        yu_test_* tables are useful only for candidate suggestions and historical
+        match detail, so their absence must not stop normal validation/export.
+        """
+        available = set()
         missing = []
-        for table_name in self.tables.values():
-            exists = self.db.scalar(
-                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE' AND TABLE_NAME = ?",
-                (table_name,),
-            )
-            if not exists:
+        for key, table_name in self.tables.items():
+            try:
+                exists = self.db.scalar(
+                    "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES "
+                    "WHERE TABLE_TYPE='BASE TABLE' AND TABLE_NAME = ?",
+                    (table_name,),
+                )
+            except Exception:
+                exists = 0
+            if exists:
+                available.add(key)
+            else:
                 missing.append(table_name)
+
+        self._available_validation_tables = available
+        self._missing_validation_tables = missing
         if missing:
-            raise RuntimeError(
-                "Required test tables were not found.\n\n"
-                "Run the importer first, for example:\n"
-                "python yu_sqlserver_test_import_v3.py rebuild --workbook \"yuchang_order_form_matched_third_pass.xlsx\"\n\n"
-                f"Missing tables: {', '.join(missing)}"
-            )
+            try:
+                self.statusBar().showMessage(
+                    "Workbook-only validation mode. Legacy suggestion tables unavailable: "
+                    + ", ".join(missing),
+                    10000,
+                )
+            except Exception:
+                pass
+
+    def validation_table_available(self, key: str) -> bool:
+        return str(key) in self._available_validation_tables
 
     def load_order_csv(self):
         if not self.order_csv_path:
@@ -2431,8 +2579,20 @@ class YUOrderReviewWindow(QMainWindow):
             ):
                 return True
 
-            self._workbook_scan = scan_yuchang_workbook(self.template_path)
+            self._workbook_scan = scan_yuchang_workbook(
+                self.template_path,
+                sheet_name=self._order_sheet_name,
+            )
+            self._order_sheet_name = str(
+                self._workbook_scan.get("sheet_name") or self._order_sheet_name
+            )
             self._workbook_scan_error = ""
+            try:
+                self.title_label.setText(
+                    f"YU Order Review {VALIDATION_MODULE_VERSION} — mapping sheet: {self._order_sheet_name}"
+                )
+            except Exception:
+                pass
             return True
         except Exception as exc:
             self._workbook_scan = {}
@@ -2521,9 +2681,16 @@ class YUOrderReviewWindow(QMainWindow):
         self.load_main_table()
 
     def load_last_import_date(self):
-        row = self.db.one(
-            f"SELECT TOP 1 imported_at, workbook_path FROM dbo.{self.tables['import_runs']} ORDER BY imported_at DESC"
-        )
+        if not self.validation_table_available("import_runs"):
+            self.last_import_browser.setPlainText("Workbook mode")
+            return
+        try:
+            row = self.db.one(
+                f"SELECT TOP 1 imported_at, workbook_path "
+                f"FROM dbo.{self.tables['import_runs']} ORDER BY imported_at DESC"
+            )
+        except Exception:
+            row = None
         if row is None:
             self.last_import_browser.setPlainText("")
             return
@@ -2546,9 +2713,6 @@ class YUOrderReviewWindow(QMainWindow):
                 review_hits=[],
             )
 
-        # Permanent resolution comes only from the current workbook's Column A.
-        # The database source_row is a historical validation snapshot and is not
-        # trusted as an export destination.
         workbook_rows = self.workbook_rows_for_item(item_number)
         if len(workbook_rows) == 1:
             current_row = int(workbook_rows[0])
@@ -2578,90 +2742,95 @@ class YUOrderReviewWindow(QMainWindow):
 
         hits: list[ReviewHit] = []
 
-        direct_condition, direct_params = self.item_match_condition(
-            ["current_item_number", "literal_item_number"], item_number
-        )
-        direct_rows_raw = self.db.all(
-            f"""
-            SELECT DISTINCT source_row
-            FROM dbo.{self.tables["supplier_lines"]}
-            WHERE row_kind = 'detail'
-              AND {direct_condition}
-            ORDER BY source_row
-            """,
-            direct_params,
-        )
-        for row in direct_rows_raw:
-            hits.append(
-                ReviewHit(
-                    source_row=int(row["source_row"]),
-                    match_type="supplier_snapshot",
-                    confidence=None,
-                    note="Item exists in the imported supplier snapshot but is missing from current workbook Column A.",
-                )
+        if self.validation_table_available("supplier_lines"):
+            direct_condition, direct_params = self.item_match_condition(
+                ["current_item_number", "literal_item_number"], item_number
             )
+            direct_rows_raw = self.db.all(
+                f"""
+                SELECT DISTINCT source_row
+                FROM dbo.{self.tables["supplier_lines"]}
+                WHERE row_kind = 'detail'
+                  AND {direct_condition}
+                ORDER BY source_row
+                """,
+                direct_params,
+            )
+            for row in direct_rows_raw:
+                hits.append(
+                    ReviewHit(
+                        source_row=int(row["source_row"]),
+                        match_type="supplier_snapshot",
+                        confidence=None,
+                        note="Item exists in the imported supplier snapshot but is missing from current workbook Column A.",
+                    )
+                )
 
-        final_condition, final_params = self.item_match_condition(["final_selection"], item_number)
-        final_rows_raw = self.db.all(
-            f"""
-            SELECT DISTINCT source_row
-            FROM dbo.{self.tables["match_review"]}
-            WHERE {final_condition}
-            ORDER BY source_row
-            """,
-            final_params,
-        )
-        for row in final_rows_raw:
-            hits.append(
-                ReviewHit(
-                    source_row=int(row["source_row"]),
-                    match_type="database_confirmation",
-                    confidence=None,
-                    note="Database confirmation exists, but Column A is the permanent mapping and currently has no unique match.",
-                )
+        if self.validation_table_available("match_review"):
+            final_condition, final_params = self.item_match_condition(["final_selection"], item_number)
+            final_rows_raw = self.db.all(
+                f"""
+                SELECT DISTINCT source_row
+                FROM dbo.{self.tables["match_review"]}
+                WHERE {final_condition}
+                ORDER BY source_row
+                """,
+                final_params,
             )
+            for row in final_rows_raw:
+                hits.append(
+                    ReviewHit(
+                        source_row=int(row["source_row"]),
+                        match_type="database_confirmation",
+                        confidence=None,
+                        note="Database confirmation exists, but Column A currently has no unique match.",
+                    )
+                )
 
-        suggested_condition, suggested_params = self.item_match_condition(["suggested_match"], item_number)
-        suggested_hits = self.db.all(
-            f"""
-            SELECT source_row, confidence_pct, review_row
-            FROM dbo.{self.tables["match_review"]}
-            WHERE {suggested_condition}
-            ORDER BY source_row
-            """,
-            suggested_params,
-        )
-        for row in suggested_hits:
-            conf = row.get("confidence_pct")
-            hits.append(
-                ReviewHit(
-                    source_row=int(row["source_row"]),
-                    match_type="suggested_match",
-                    confidence=float(conf) if conf is not None else None,
-                    note=f"suggested in Match_Review row {row.get('review_row')}",
-                )
+            suggested_condition, suggested_params = self.item_match_condition(["suggested_match"], item_number)
+            suggested_hits = self.db.all(
+                f"""
+                SELECT source_row, confidence_pct, review_row
+                FROM dbo.{self.tables["match_review"]}
+                WHERE {suggested_condition}
+                ORDER BY source_row
+                """,
+                suggested_params,
             )
+            for row in suggested_hits:
+                conf = row.get("confidence_pct")
+                hits.append(
+                    ReviewHit(
+                        source_row=int(row["source_row"]),
+                        match_type="suggested_match",
+                        confidence=float(conf) if conf is not None else None,
+                        note=f"suggested in Match_Review row {row.get('review_row')}",
+                    )
+                )
 
-        candidate_condition, candidate_params = self.item_match_condition(["candidate_item_number"], item_number)
-        candidate_hits = self.db.all(
-            f"""
-            SELECT source_row, confidence_pct, review_row, candidate_rank
-            FROM dbo.{self.tables["match_candidates"]}
-            WHERE {candidate_condition}
-            ORDER BY source_row, candidate_rank
-            """,
-            candidate_params,
-        )
-        for row in candidate_hits:
-            conf = row.get("confidence_pct")
-            hits.append(
-                ReviewHit(
-                    source_row=int(row["source_row"]),
-                    match_type=f"candidate_{row.get('candidate_rank')}",
-                    confidence=float(conf) if conf is not None else None,
-                    note=f"candidate in Match_Review row {row.get('review_row')}",
-                )
+        if self.validation_table_available("match_candidates"):
+            candidate_condition, candidate_params = self.item_match_condition(
+                ["candidate_item_number"], item_number
             )
+            candidate_hits = self.db.all(
+                f"""
+                SELECT source_row, confidence_pct, review_row, candidate_rank
+                FROM dbo.{self.tables["match_candidates"]}
+                WHERE {candidate_condition}
+                ORDER BY source_row, candidate_rank
+                """,
+                candidate_params,
+            )
+            for row in candidate_hits:
+                conf = row.get("confidence_pct")
+                hits.append(
+                    ReviewHit(
+                        source_row=int(row["source_row"]),
+                        match_type=f"candidate_{row.get('candidate_rank')}",
+                        confidence=float(conf) if conf is not None else None,
+                        note=f"candidate in Match_Review row {row.get('review_row')}",
+                    )
+                )
 
         if hits:
             hits_sorted = sorted(
@@ -2691,6 +2860,12 @@ class YUOrderReviewWindow(QMainWindow):
                 review_hits=hits_sorted,
             )
 
+        unavailable_note = ""
+        if self._missing_validation_tables:
+            unavailable_note = (
+                " Legacy candidate tables are unavailable, so use the manual current workbook row "
+                "field when this item needs to be mapped."
+            )
         return OrderResolveResult(
             item_number=item_number,
             quantity=quantity,
@@ -2699,7 +2874,8 @@ class YUOrderReviewWindow(QMainWindow):
             status="unmatched",
             source_row=None,
             source="not_found",
-            note="Item number is not in current workbook Column A and no validation candidates were found.",
+            note="Item number is not in current workbook Column A and no validation candidates were found."
+                 + unavailable_note,
             review_hits=[],
         )
 
@@ -2909,80 +3085,87 @@ class YUOrderReviewWindow(QMainWindow):
 
     def load_candidates_for_item(self, item_number: str, current_result: OrderResolveResult) -> list[dict]:
         rows: list[dict] = []
-        supplier_cols = self.candidate_supplier_select_sql("s.")
+        supplier_available = self.validation_table_available("supplier_lines")
+        review_available = self.validation_table_available("match_review")
+        candidates_available = self.validation_table_available("match_candidates")
 
-        direct_condition, direct_params = self.item_match_condition(
-            ["s.current_item_number", "s.literal_item_number"], item_number
-        )
-        direct_rows = self.db.all(
-            f"""
-            SELECT s.source_row, {supplier_cols}
-            FROM dbo.{self.tables["supplier_lines"]} s
-            WHERE s.row_kind = 'detail'
-              AND {direct_condition}
-            ORDER BY s.source_row
-            """,
-            direct_params,
-        )
-        for row in direct_rows:
-            rows.append(self.decorate_candidate_row(row, hit_type="direct", confidence=None))
+        if supplier_available:
+            supplier_cols = self.candidate_supplier_select_sql("s.")
 
-        final_condition, final_params = self.item_match_condition(["r.final_selection"], item_number)
-        final_rows = self.db.all(
-            f"""
-            SELECT r.source_row, {supplier_cols}
-            FROM dbo.{self.tables["match_review"]} r
-            LEFT JOIN dbo.{self.tables["supplier_lines"]} s ON s.source_row = r.source_row
-            WHERE {final_condition}
-            ORDER BY r.source_row
-            """,
-            final_params,
-        )
-        for row in final_rows:
-            rows.append(self.decorate_candidate_row(row, hit_type="database_confirmation", confidence=None))
-
-        suggested_condition, suggested_params = self.item_match_condition(["r.suggested_match"], item_number)
-        suggested_rows = self.db.all(
-            f"""
-            SELECT r.source_row, r.confidence_pct, {supplier_cols}
-            FROM dbo.{self.tables["match_review"]} r
-            LEFT JOIN dbo.{self.tables["supplier_lines"]} s ON s.source_row = r.source_row
-            WHERE {suggested_condition}
-            ORDER BY r.source_row
-            """,
-            suggested_params,
-        )
-        for row in suggested_rows:
-            rows.append(
-                self.decorate_candidate_row(
-                    row,
-                    hit_type="suggested_match",
-                    confidence=float(row["confidence_pct"]) if row.get("confidence_pct") is not None else None,
-                )
+            direct_condition, direct_params = self.item_match_condition(
+                ["s.current_item_number", "s.literal_item_number"], item_number
             )
-
-        candidate_condition, candidate_params = self.item_match_condition(["c.candidate_item_number"], item_number)
-        candidate_rows = self.db.all(
-            f"""
-            SELECT c.source_row, c.confidence_pct, c.candidate_rank, {supplier_cols}
-            FROM dbo.{self.tables["match_candidates"]} c
-            LEFT JOIN dbo.{self.tables["supplier_lines"]} s ON s.source_row = c.source_row
-            WHERE {candidate_condition}
-            ORDER BY c.source_row, c.candidate_rank
-            """,
-            candidate_params,
-        )
-        for row in candidate_rows:
-            rows.append(
-                self.decorate_candidate_row(
-                    row,
-                    hit_type=f"candidate_{row.get('candidate_rank')}",
-                    confidence=float(row["confidence_pct"]) if row.get("confidence_pct") is not None else None,
-                )
+            direct_rows = self.db.all(
+                f"""
+                SELECT s.source_row, {supplier_cols}
+                FROM dbo.{self.tables["supplier_lines"]} s
+                WHERE s.row_kind = 'detail'
+                  AND {direct_condition}
+                ORDER BY s.source_row
+                """,
+                direct_params,
             )
+            for row in direct_rows:
+                rows.append(self.decorate_candidate_row(row, hit_type="direct", confidence=None))
 
-        # When Column A already contains the item, always show its current row,
-        # even if no matching database snapshot row is available.
+            if review_available:
+                final_condition, final_params = self.item_match_condition(["r.final_selection"], item_number)
+                final_rows = self.db.all(
+                    f"""
+                    SELECT r.source_row, {supplier_cols}
+                    FROM dbo.{self.tables["match_review"]} r
+                    LEFT JOIN dbo.{self.tables["supplier_lines"]} s ON s.source_row = r.source_row
+                    WHERE {final_condition}
+                    ORDER BY r.source_row
+                    """,
+                    final_params,
+                )
+                for row in final_rows:
+                    rows.append(self.decorate_candidate_row(row, hit_type="database_confirmation", confidence=None))
+
+                suggested_condition, suggested_params = self.item_match_condition(["r.suggested_match"], item_number)
+                suggested_rows = self.db.all(
+                    f"""
+                    SELECT r.source_row, r.confidence_pct, {supplier_cols}
+                    FROM dbo.{self.tables["match_review"]} r
+                    LEFT JOIN dbo.{self.tables["supplier_lines"]} s ON s.source_row = r.source_row
+                    WHERE {suggested_condition}
+                    ORDER BY r.source_row
+                    """,
+                    suggested_params,
+                )
+                for row in suggested_rows:
+                    rows.append(
+                        self.decorate_candidate_row(
+                            row,
+                            hit_type="suggested_match",
+                            confidence=float(row["confidence_pct"]) if row.get("confidence_pct") is not None else None,
+                        )
+                    )
+
+            if candidates_available:
+                candidate_condition, candidate_params = self.item_match_condition(
+                    ["c.candidate_item_number"], item_number
+                )
+                candidate_rows = self.db.all(
+                    f"""
+                    SELECT c.source_row, c.confidence_pct, c.candidate_rank, {supplier_cols}
+                    FROM dbo.{self.tables["match_candidates"]} c
+                    LEFT JOIN dbo.{self.tables["supplier_lines"]} s ON s.source_row = c.source_row
+                    WHERE {candidate_condition}
+                    ORDER BY c.source_row, c.candidate_rank
+                    """,
+                    candidate_params,
+                )
+                for row in candidate_rows:
+                    rows.append(
+                        self.decorate_candidate_row(
+                            row,
+                            hit_type=f"candidate_{row.get('candidate_rank')}",
+                            confidence=float(row["confidence_pct"]) if row.get("confidence_pct") is not None else None,
+                        )
+                    )
+
         if current_result.source_row is not None:
             current_row = int(current_result.source_row)
             if not any(r.get("workbook_row") == current_row for r in rows):
@@ -3104,6 +3287,19 @@ class YUOrderReviewWindow(QMainWindow):
                 f"<b>Current Workbook Row:</b> {self.html_text(workbook_row)}",
                 f"<b>Row State:</b> {self.html_text(row_state)}",
                 "<b>Mapping Source:</b> Current Sheet1 Column A",
+            ]
+            self.preview_browser.setHtml("<br>".join(lines))
+            return
+
+        if not (
+            self.validation_table_available("supplier_lines")
+            and self.validation_table_available("match_review")
+        ):
+            lines = [
+                f"<b>Current Workbook Row:</b> {self.html_text(workbook_row)}",
+                f"<b>Database Snapshot Row:</b> {self.html_text(db_source_row)}",
+                f"<b>Row State:</b> {self.html_text(row_state)}",
+                "<b>Mapping Source:</b> Workbook-only validation mode",
             ]
             self.preview_browser.setHtml("<br>".join(lines))
             return
@@ -3297,11 +3493,14 @@ class YUOrderReviewWindow(QMainWindow):
                 f"{exc}",
             )
             return False
-        updated_rows = result.get("updated_rows") or []
-        if updated_rows:
+        updated_cells = result.get("updated_cells") or []
+        if updated_cells:
+            self._order_sheet_name = str(
+                result.get("sheet_name") or self._order_sheet_name
+            )
             self.statusBar().showMessage(
-                f"Saved YU workbook match row(s): {', '.join(str(r) for r in updated_rows)}.",
-                5000,
+                "Saved YU workbook mapping cell(s): " + ", ".join(updated_cells) + ".",
+                6000,
             )
         return True
 
@@ -3323,6 +3522,8 @@ class YUOrderReviewWindow(QMainWindow):
 
     def db_source_row_for_current_workbook_row(self, workbook_row: int) -> int | None:
         """Best-effort link from a current workbook row to the old DB snapshot row."""
+        if not self.validation_table_available("supplier_lines"):
+            return None
         records = self.db.all(
             f"""
             SELECT
@@ -3356,9 +3557,11 @@ class YUOrderReviewWindow(QMainWindow):
         *,
         db_source_row: int | None = None,
     ):
-        """Write the part number to the current workbook row.
+        """Write the selected Windsor part number to the supplier order row.
 
-        source_row is intentionally a current Sheet1 address, not a permanent key.
+        The supplier row belongs to the detected order sheet (normally Sheet1).
+        ITEM_Yuchang_Match is a separate lookup list; matching its row number to
+        the order sheet would assign the wrong item.
         """
         item_number = str(item_number or "").strip()
         source_row = int(source_row)
@@ -3372,11 +3575,18 @@ class YUOrderReviewWindow(QMainWindow):
             )
             return
 
+        sheet_name = str(
+            self._workbook_scan.get("sheet_name") or self._order_sheet_name
+        )
+        target_cell = f"{sheet_name}!A{source_row}"
+
         if not self.workbook_row_is_detail(source_row):
             QMessageBox.warning(
                 self,
                 "Confirm YU Match",
-                f"Current workbook row {source_row} is not recognised as a YU item detail row.",
+                f"{target_cell} is not on a recognised YU supplier item row.\n\n"
+                "The row number must refer to the supplier order sheet, not "
+                f"{YU_ITEM_MASTER_SHEET_NAME}.",
             )
             return
 
@@ -3393,14 +3603,13 @@ class YUOrderReviewWindow(QMainWindow):
                 QMessageBox.warning(
                     self,
                     "Confirm YU Match",
-                    f"Current workbook row {source_row} already contains item "
-                    f"{existing_at_target} in Column A.\n\n"
-                    "Clear or correct that mapping before assigning another item.",
+                    f"{target_cell} already contains {existing_at_target}.\n\n"
+                    f"The Widget was trying to assign {item_number}. Clear or "
+                    "correct the existing mapping before assigning another item.",
                 )
                 return
 
-        # Enforce one Column A location per item. Any previous occurrence is
-        # cleared from its current row, regardless of how the template moved.
+        # Enforce one mapping cell per item on the supplier order sheet.
         row_matches: dict[int, str | None] = {source_row: item_number}
         for existing_row in self.workbook_rows_for_item(item_number):
             if int(existing_row) != source_row:
@@ -3409,12 +3618,35 @@ class YUOrderReviewWindow(QMainWindow):
         if not self.save_workbook_matches_or_warn(row_matches, "Confirm YU Match"):
             return
 
+        # Do not report success until the exact order-sheet cell has been
+        # re-opened and verified.
+        try:
+            verify_yu_order_mapping(
+                self.template_path,
+                sheet_name,
+                source_row,
+                item_number,
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Confirm YU Match",
+                "The workbook was written but the mapping could not be verified.\n\n"
+                f"Expected: {target_cell} = {item_number}\n\n"
+                f"{type(exc).__name__}: {exc}",
+            )
+            return
+
         self.refresh_workbook_index(force=True)
 
         if db_source_row is None:
             db_source_row = self.db_source_row_for_current_workbook_row(source_row)
 
-        if db_source_row is not None:
+        if (
+            db_source_row is not None
+            and self.validation_table_available("supplier_lines")
+            and self.validation_table_available("match_review")
+        ):
             db_source_row = int(db_source_row)
             self.ensure_match_review_row(db_source_row)
             self.reset_row_status_for_item(item_number, exclude_source_row=db_source_row)
@@ -3438,11 +3670,11 @@ class YUOrderReviewWindow(QMainWindow):
         snapshot_text = (
             f" Database snapshot row {db_source_row} was updated."
             if db_source_row is not None
-            else " No unique database snapshot row was required."
+            else " No database snapshot update was required."
         )
         self.statusBar().showMessage(
-            f"Confirmed {item_number} to current workbook row {source_row}.{snapshot_text}",
-            6000,
+            f"Confirmed {item_number} in {target_cell}.{snapshot_text}",
+            7000,
         )
         self.refresh_all()
         self.reselect_item(item_number)
@@ -3532,24 +3764,34 @@ class YUOrderReviewWindow(QMainWindow):
             return
 
         workbook_rows = self.workbook_rows_for_item(item_number)
-        final_condition, final_params = self.item_match_condition(["r.final_selection"], item_number)
-        rows = self.db.all(
-            f"""
-            SELECT r.source_row,
-                   CASE
-                     WHEN ISNULL(r.suggested_match, '') <> ''
-                          OR EXISTS (
-                              SELECT 1 FROM dbo.{self.tables["match_candidates"]} c
-                              WHERE c.source_row = r.source_row
-                          )
-                     THEN 'needs_review'
-                     ELSE 'unmatched'
-                   END AS new_status
-            FROM dbo.{self.tables["match_review"]} r
-            WHERE {final_condition}
-            """,
-            final_params,
-        )
+        rows = []
+        if self.validation_table_available("match_review"):
+            final_condition, final_params = self.item_match_condition(["r.final_selection"], item_number)
+            if self.validation_table_available("match_candidates"):
+                status_sql = f"""
+                    CASE
+                      WHEN ISNULL(r.suggested_match, '') <> ''
+                           OR EXISTS (
+                               SELECT 1 FROM dbo.{self.tables["match_candidates"]} c
+                               WHERE c.source_row = r.source_row
+                           )
+                      THEN 'needs_review'
+                      ELSE 'unmatched'
+                    END
+                """
+            else:
+                status_sql = """
+                    CASE WHEN ISNULL(r.suggested_match, '') <> ''
+                         THEN 'needs_review' ELSE 'unmatched' END
+                """
+            rows = self.db.all(
+                f"""
+                SELECT r.source_row, {status_sql} AS new_status
+                FROM dbo.{self.tables["match_review"]} r
+                WHERE {final_condition}
+                """,
+                final_params,
+            )
 
         if not workbook_rows and not rows:
             QMessageBox.information(self, "YU Order Review", f"There is no confirmed mapping for {item_number}.")

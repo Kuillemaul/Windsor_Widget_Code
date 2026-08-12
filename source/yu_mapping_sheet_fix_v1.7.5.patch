@@ -1,0 +1,410 @@
+--- a/main_patched_status_yu.py
++++ b/main_patched_status_yu.py
+@@ -124,7 +124,7 @@
+ TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
+ TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
+ TABLE_FORMAT_SETTINGS_PREFIX = "table_format"
+-APP_VERSION = "1.7.4"
++APP_VERSION = "1.7.5"
+ APP_DESIGNER = "Bradley Mayze"
+ YU_SUPPLIER_DISPLAY_NAME = "Yuchang Textile Factory"
+ # Generic latest purchase-cost fields. These apply to every item in the item master.
+
+--- a/yu_order_review_export_test_window.py
++++ b/yu_order_review_export_test_window.py
+@@ -64,6 +64,10 @@
+ DEFAULT_ORDER_CSV = ""
+ DEFAULT_TEMPLATE = ""
+ DEFAULT_OUTPUT_DIR = "yu_exports"
++
++VALIDATION_MODULE_VERSION = "1.7.5"
++YU_ORDER_SHEET_NAME = "Sheet1"
++YU_ITEM_MASTER_SHEET_NAME = "ITEM_Yuchang_Match"
+ 
+ MYOB_PO_HEADERS = [
+     "Co./Last Name",
+@@ -113,6 +117,106 @@
+ MYOB_YU_TAX_CODE = "OSP"
+ MYOB_YU_PURCHASE_STATUS = "O"
+ MYOB_YU_LOCATION_ID = "Location1"
++
++
++def _normalised_header_text(value: Any) -> str:
++    return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
++
++
++def _looks_like_yu_order_sheet(worksheet) -> bool:
++    """Return True when a worksheet looks like the supplier order form.
++
++    The item-master lookup sheet also has values in column A, but it is not
++    row-aligned with the supplier order form. The order sheet is identified by
++    its Item / Size / Colour headers rather than by active-sheet position.
++    """
++    try:
++        row_12 = [
++            _normalised_header_text(worksheet.cell(row=12, column=column).value)
++            for column in range(1, 8)
++        ]
++        row_13 = [
++            _normalised_header_text(worksheet.cell(row=13, column=column).value)
++            for column in range(1, 8)
++        ]
++    except Exception:
++        return False
++
++    combined = set(row_12 + row_13)
++    return (
++        "item" in combined
++        and "size" in combined
++        and ("colour" in combined or "color" in combined)
++    )
++
++
++def detect_yu_order_sheet_name(workbook, preferred: str | None = YU_ORDER_SHEET_NAME) -> str:
++    """Locate the row-aligned YU supplier order sheet.
++
++    ITEM_Yuchang_Match is a lookup list and must never be treated as though its
++    row numbers match the supplier lines on the order form.
++    """
++    preferred = str(preferred or "").strip()
++    if preferred and preferred in workbook.sheetnames:
++        worksheet = workbook[preferred]
++        if _looks_like_yu_order_sheet(worksheet):
++            return preferred
++
++    candidates = []
++    for sheet_name in workbook.sheetnames:
++        if sheet_name in {YU_ITEM_MASTER_SHEET_NAME, "Match_Lists", "Match_Review"}:
++            continue
++        try:
++            if _looks_like_yu_order_sheet(workbook[sheet_name]):
++                candidates.append(sheet_name)
++        except Exception:
++            continue
++
++    non_flat = [name for name in candidates if not name.casefold().endswith("_flat")]
++    if len(non_flat) == 1:
++        return non_flat[0]
++    if len(candidates) == 1:
++        return candidates[0]
++    if preferred and preferred in candidates:
++        return preferred
++    if candidates:
++        return sorted(candidates, key=str.casefold)[0]
++
++    raise ValueError(
++        "Could not identify the YU supplier order sheet. "
++        f"Available sheets: {workbook.sheetnames}"
++    )
++
++
++def verify_yu_order_mapping(
++    template_path: str | Path,
++    sheet_name: str,
++    row_number: int,
++    expected_item_number: str,
++    match_col: str = "A",
++) -> str:
++    """Re-open the workbook and verify the exact order-sheet mapping cell."""
++    workbook = load_workbook(str(template_path), read_only=True, data_only=False)
++    try:
++        if sheet_name not in workbook.sheetnames:
++            raise ValueError(
++                f"Order sheet '{sheet_name}' was not found after saving. "
++                f"Available sheets: {workbook.sheetnames}"
++            )
++        cell_ref = f"{match_col}{int(row_number)}"
++        actual = str(workbook[sheet_name][cell_ref].value or "").strip()
++        expected = str(expected_item_number or "").strip()
++        if clean_item_key(actual) != clean_item_key(expected):
++            raise RuntimeError(
++                f"The mapping did not save to {sheet_name}!{cell_ref}. "
++                f"Expected {expected!r}, found {actual!r}."
++            )
++        return actual
++    finally:
++        try:
++            workbook.close()
++        except Exception:
++            pass
+ 
+ 
+ def _decimal_value(value: Any, field_name: str = "value") -> Decimal:
+@@ -733,7 +837,7 @@
+ def scan_yuchang_workbook(
+     template_path: str,
+     *,
+-    sheet_name: str = "Sheet1",
++    sheet_name: str | None = None,
+     item_col: str = "A",
+     header_end_row: int = 14,
+     export_min_col: str = "A",
+@@ -750,8 +854,7 @@
+ 
+     wb = load_workbook(str(workbook_path), read_only=True, data_only=False)
+     try:
+-        if sheet_name not in wb.sheetnames:
+-            raise ValueError(f"Sheet '{sheet_name}' not found. Available sheets: {wb.sheetnames}")
++        sheet_name = detect_yu_order_sheet_name(wb, sheet_name)
+         ws = wb[sheet_name]
+ 
+         item_idx = column_index_from_string(item_col)
+@@ -876,7 +979,7 @@
+     template_path: str,
+     item_numbers_with_qty: Iterable[tuple[str, float | int]],
+     *,
+-    sheet_name: str = "Sheet1",
++    sheet_name: str | None = None,
+     exact_item_numbers: Iterable[str] | None = None,
+ ) -> tuple[list[tuple[int, float]], dict[str, Any]]:
+     """Resolve order items against the current Column A positions."""
+@@ -1299,7 +1402,7 @@
+     template_path: str,
+     row_matches: dict[int, str | None],
+     *,
+-    order_sheet_name: str = "Sheet1",
++    order_sheet_name: str | None = None,
+     match_col: str = "A",
+     review_sheet_name: str = "Match_Review",
+     review_header_row: int = 4,
+@@ -1313,6 +1416,17 @@
+     workbook_path = Path(str(template_path or "").strip())
+     if not workbook_path.exists():
+         raise FileNotFoundError(f"YU workbook was not found: {workbook_path}")
++
++    # Resolve the order sheet by its actual order-form headers. The item-master
++    # sheet is a lookup list and its row numbers are unrelated to supplier rows.
++    workbook_for_sheet = load_workbook(str(workbook_path), read_only=True, data_only=False)
++    try:
++        order_sheet_name = detect_yu_order_sheet_name(workbook_for_sheet, order_sheet_name)
++    finally:
++        try:
++            workbook_for_sheet.close()
++        except Exception:
++            pass
+ 
+     _register_xlsx_namespaces()
+     updated_parts: dict[str, bytes] = {}
+@@ -1378,7 +1492,15 @@
+                 except Exception:
+                     pass
+ 
+-    return {"updated_rows": sorted(set(updated_rows)), "path": str(workbook_path)}
++    return {
++        "updated_rows": sorted(set(updated_rows)),
++        "updated_cells": [
++            f"{order_sheet_name}!{match_letter}{row_number}"
++            for row_number in sorted(set(updated_rows))
++        ],
++        "sheet_name": order_sheet_name,
++        "path": str(workbook_path),
++    }
+ 
+ 
+ def _make_compact_export_row_plan(
+@@ -1568,7 +1690,7 @@
+     order_number: str,
+     source_rows_with_qty: list[tuple[int, float | int]],
+     *,
+-    sheet_name: str = "Sheet1",
++    sheet_name: str | None = None,
+     qty_col: str = "L",
+     date_cell: str = "C10",
+     order_no_cell: str = "H10",
+@@ -1586,9 +1708,7 @@
+     output_path = str(output_path)
+ 
+     wb = load_workbook(template_path)
+-    if sheet_name not in wb.sheetnames:
+-        raise ValueError(f"Sheet '{sheet_name}' not found. Available sheets: {wb.sheetnames}")
+-
++    sheet_name = detect_yu_order_sheet_name(wb, sheet_name)
+     src = wb[sheet_name]
+ 
+     qty_idx = column_index_from_string(qty_col)
+@@ -1846,7 +1966,7 @@
+     order_number: str,
+     item_numbers_with_qty: Iterable[tuple[str, float | int]],
+     *,
+-    sheet_name: str = "Sheet1",
++    sheet_name: str | None = None,
+     exact_item_numbers: Iterable[str] | None = None,
+     **kwargs,
+ ) -> dict:
+@@ -1863,7 +1983,7 @@
+         order_date=order_date,
+         order_number=order_number,
+         source_rows_with_qty=current_rows,
+-        sheet_name=sheet_name,
++        sheet_name=str(scan["sheet_name"]),
+         footer_start_row=int(scan["footer_start_row"]),
+         footer_end_row=int(scan["footer_end_row"]),
+         **kwargs,
+@@ -1910,15 +2030,17 @@
+         self.current_rows: list[dict] = []
+         self.current_selected_detail: dict[str, Any] | None = None
+ 
+-        # Live Sheet1 index. Column A is the permanent item mapping; source rows
+-        # are only current workbook addresses used during validation.
++        # Live supplier-order sheet index. Column A on the order form is the
++        # permanent item mapping. ITEM_Yuchang_Match is only an item lookup list
++        # and its row numbers are not aligned with supplier rows.
+         self._workbook_scan: dict[str, Any] = {}
+         self._workbook_scan_error = ""
++        self._order_sheet_name = YU_ORDER_SHEET_NAME
+         self._available_validation_tables: set[str] = set()
+         self._missing_validation_tables: list[str] = []
+ 
+         self.setObjectName("YUOrderReviewWindow")
+-        self.setWindowTitle("YU Order Review")
++        self.setWindowTitle(f"YU Order Review — Validation {VALIDATION_MODULE_VERSION}")
+         self.resize(1480, 920)
+         self.setMinimumSize(QSize(1280, 760))
+ 
+@@ -1948,7 +2070,10 @@
+         self.last_import_browser.setReadOnly(True)
+         top_layout.addWidget(self.last_import_browser)
+ 
+-        self.title_label = QLabel("YU Order Review", self.top_frame)
++        self.title_label = QLabel(
++            f"YU Order Review {VALIDATION_MODULE_VERSION} — mapping sheet: {self._order_sheet_name}",
++            self.top_frame,
++        )
+         self.title_label.setObjectName("title_label")
+         top_layout.addWidget(self.title_label)
+ 
+@@ -2454,8 +2579,20 @@
+             ):
+                 return True
+ 
+-            self._workbook_scan = scan_yuchang_workbook(self.template_path)
++            self._workbook_scan = scan_yuchang_workbook(
++                self.template_path,
++                sheet_name=self._order_sheet_name,
++            )
++            self._order_sheet_name = str(
++                self._workbook_scan.get("sheet_name") or self._order_sheet_name
++            )
+             self._workbook_scan_error = ""
++            try:
++                self.title_label.setText(
++                    f"YU Order Review {VALIDATION_MODULE_VERSION} — mapping sheet: {self._order_sheet_name}"
++                )
++            except Exception:
++                pass
+             return True
+         except Exception as exc:
+             self._workbook_scan = {}
+@@ -3356,11 +3493,14 @@
+                 f"{exc}",
+             )
+             return False
+-        updated_rows = result.get("updated_rows") or []
+-        if updated_rows:
++        updated_cells = result.get("updated_cells") or []
++        if updated_cells:
++            self._order_sheet_name = str(
++                result.get("sheet_name") or self._order_sheet_name
++            )
+             self.statusBar().showMessage(
+-                f"Saved YU workbook match row(s): {', '.join(str(r) for r in updated_rows)}.",
+-                5000,
++                "Saved YU workbook mapping cell(s): " + ", ".join(updated_cells) + ".",
++                6000,
+             )
+         return True
+ 
+@@ -3417,9 +3557,11 @@
+         *,
+         db_source_row: int | None = None,
+     ):
+-        """Write the part number to the current workbook row.
+-
+-        source_row is intentionally a current Sheet1 address, not a permanent key.
++        """Write the selected Windsor part number to the supplier order row.
++
++        The supplier row belongs to the detected order sheet (normally Sheet1).
++        ITEM_Yuchang_Match is a separate lookup list; matching its row number to
++        the order sheet would assign the wrong item.
+         """
+         item_number = str(item_number or "").strip()
+         source_row = int(source_row)
+@@ -3433,11 +3575,18 @@
+             )
+             return
+ 
++        sheet_name = str(
++            self._workbook_scan.get("sheet_name") or self._order_sheet_name
++        )
++        target_cell = f"{sheet_name}!A{source_row}"
++
+         if not self.workbook_row_is_detail(source_row):
+             QMessageBox.warning(
+                 self,
+                 "Confirm YU Match",
+-                f"Current workbook row {source_row} is not recognised as a YU item detail row.",
++                f"{target_cell} is not on a recognised YU supplier item row.\n\n"
++                "The row number must refer to the supplier order sheet, not "
++                f"{YU_ITEM_MASTER_SHEET_NAME}.",
+             )
+             return
+ 
+@@ -3454,20 +3603,38 @@
+                 QMessageBox.warning(
+                     self,
+                     "Confirm YU Match",
+-                    f"Current workbook row {source_row} already contains item "
+-                    f"{existing_at_target} in Column A.\n\n"
+-                    "Clear or correct that mapping before assigning another item.",
++                    f"{target_cell} already contains {existing_at_target}.\n\n"
++                    f"The Widget was trying to assign {item_number}. Clear or "
++                    "correct the existing mapping before assigning another item.",
+                 )
+                 return
+ 
+-        # Enforce one Column A location per item. Any previous occurrence is
+-        # cleared from its current row, regardless of how the template moved.
++        # Enforce one mapping cell per item on the supplier order sheet.
+         row_matches: dict[int, str | None] = {source_row: item_number}
+         for existing_row in self.workbook_rows_for_item(item_number):
+             if int(existing_row) != source_row:
+                 row_matches[int(existing_row)] = None
+ 
+         if not self.save_workbook_matches_or_warn(row_matches, "Confirm YU Match"):
++            return
++
++        # Do not report success until the exact order-sheet cell has been
++        # re-opened and verified.
++        try:
++            verify_yu_order_mapping(
++                self.template_path,
++                sheet_name,
++                source_row,
++                item_number,
++            )
++        except Exception as exc:
++            QMessageBox.critical(
++                self,
++                "Confirm YU Match",
++                "The workbook was written but the mapping could not be verified.\n\n"
++                f"Expected: {target_cell} = {item_number}\n\n"
++                f"{type(exc).__name__}: {exc}",
++            )
+             return
+ 
+         self.refresh_workbook_index(force=True)
+@@ -3503,11 +3670,11 @@
+         snapshot_text = (
+             f" Database snapshot row {db_source_row} was updated."
+             if db_source_row is not None
+-            else " No unique database snapshot row was required."
++            else " No database snapshot update was required."
+         )
+         self.statusBar().showMessage(
+-            f"Confirmed {item_number} to current workbook row {source_row}.{snapshot_text}",
+-            6000,
++            f"Confirmed {item_number} in {target_cell}.{snapshot_text}",
++            7000,
+         )
+         self.refresh_all()
+         self.reselect_item(item_number)
