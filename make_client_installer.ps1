@@ -157,4 +157,4 @@ Write-Host "Compiling installer..." -ForegroundColor Cyan
 Write-Host ""
 Write-Host "Build complete." -ForegroundColor Green
 Write-Host "EXE: $exePath"
-Write-Host "Installer: $(Join-Path $outputDir 'WindsorWidget_Client_1_7_0.exe')"
+Write-Host "Installer: $(Join-Path $outputDir 'WindsorWidget_Client_1_7_7.exe')"

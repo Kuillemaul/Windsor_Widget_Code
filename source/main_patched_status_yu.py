@@ -124,7 +124,7 @@ from yu_order_workflow import YUOrderEntryDialog, load_yu_review_module
 TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
 TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
 TABLE_FORMAT_SETTINGS_PREFIX = "table_format"
-APP_VERSION = "1.7.7"
+APP_VERSION = "1.7.9"
 APP_DESIGNER = "Bradley Mayze"
 YU_SUPPLIER_DISPLAY_NAME = "Yuchang Textile Factory"
 # Generic latest purchase-cost fields. These apply to every item in the item master.
@@ -7533,6 +7533,7 @@ class Ui_MainWindow(object):
                 "Tick <b>Select</b> beside each line required for the next YU purchase order.",
                 "Use <b>Create YU Order from Selection</b> to load all checked lines into one order.",
                 "After the YU workbook exports successfully, those To Order lines change to <b>ORDERED</b>.",
+                "Use <b>Remove ORDERED</b> to clear all successfully ordered lines from To Order in one action.",
                 "Use import tools when loading updated order data.",
             ],
         )
@@ -8311,6 +8312,14 @@ class Ui_MainWindow(object):
         self.createYUOrder_pushButton.setMinimumWidth(235)
         self.createYUOrder_pushButton.setEnabled(False)
 
+        self.removeOrderedToOrder_button = QPushButton("Remove ORDERED", actions)
+        self.removeOrderedToOrder_button.setObjectName("removeOrderedToOrder_button")
+        self.removeOrderedToOrder_button.setMinimumWidth(175)
+        self.removeOrderedToOrder_button.setEnabled(False)
+        self.removeOrderedToOrder_button.setToolTip(
+            "Remove every To Order line whose Status is ORDERED."
+        )
+
         self.toOrderUsers_label = QLabel("Active: -", actions)
         self.toOrderUsers_label.setObjectName("toOrderUsers_label")
         self.toOrderUsers_label.setMinimumWidth(420)
@@ -8322,6 +8331,7 @@ class Ui_MainWindow(object):
 
         actions_layout.addWidget(self.updateOrders_button)
         actions_layout.addWidget(self.createYUOrder_pushButton)
+        actions_layout.addWidget(self.removeOrderedToOrder_button)
         actions_layout.addWidget(self.toOrderUsers_label, 1)
         self.horizontalLayout_9.addWidget(actions, 1)
 
@@ -11255,6 +11265,10 @@ class MainWindow(QMainWindow):
         to_order_yu_button = getattr(self.ui, "createYUOrder_pushButton", None)
         if to_order_yu_button is not None:
             to_order_yu_button.clicked.connect(self.create_yu_order_from_selection)
+
+        remove_ordered_to_order_button = getattr(self.ui, "removeOrderedToOrder_button", None)
+        if remove_ordered_to_order_button is not None:
+            remove_ordered_to_order_button.clicked.connect(self.remove_all_ordered_to_order_lines)
 
         update_data_yu_button = getattr(self.ui, "updateDataCreateYUOrder_pushButton", None)
         if update_data_yu_button is not None:
@@ -25824,22 +25838,130 @@ class MainWindow(QMainWindow):
         selected.discard("")
         return selected
 
+    def ordered_to_order_row_indexes(self):
+        """Return To Order row indexes explicitly marked ORDERED."""
+        table = getattr(self.ui, "order_table", None)
+        if table is None:
+            return []
+        ordered_rows = []
+        for row in range(table.rowCount()):
+            status_item = table.item(row, self.order_priority_column)
+            status_text = (
+                status_item.text().strip().upper()
+                if status_item is not None and status_item.text()
+                else ""
+            )
+            if self.normalise_order_status(status_text) == "ORDERED":
+                ordered_rows.append(row)
+        return ordered_rows
+
     def update_yu_selection_button(self):
         table = getattr(self.ui, "order_table", None)
-        button = getattr(self.ui, "createYUOrder_pushButton", None)
-        if button is None:
-            return
+        create_button = getattr(self.ui, "createYUOrder_pushButton", None)
+        remove_ordered_button = getattr(self.ui, "removeOrderedToOrder_button", None)
+
         selected_count = 0
         if table is not None:
             for row in range(table.rowCount()):
                 item = table.item(row, self.order_select_column)
                 if item is not None and item.checkState() == Qt.Checked:
                     selected_count += 1
-        button.setEnabled(selected_count > 0)
-        if selected_count:
-            button.setText(f"Create YU Order from Selection ({selected_count})")
-        else:
-            button.setText("Create YU Order from Selection")
+
+        if create_button is not None:
+            create_button.setEnabled(selected_count > 0)
+            if selected_count:
+                create_button.setText(f"Create YU Order from Selection ({selected_count})")
+            else:
+                create_button.setText("Create YU Order from Selection")
+
+        ordered_count = len(self.ordered_to_order_row_indexes())
+        if remove_ordered_button is not None:
+            remove_ordered_button.setEnabled(ordered_count > 0)
+            if ordered_count:
+                remove_ordered_button.setText(f"Remove ORDERED ({ordered_count})")
+            else:
+                remove_ordered_button.setText("Remove ORDERED")
+
+    def remove_all_ordered_to_order_lines(self):
+        """Remove all successfully ordered rows from the To Order reminder sheet."""
+        table = getattr(self.ui, "order_table", None)
+        if table is None:
+            return
+
+        ordered_rows = self.ordered_to_order_row_indexes()
+        if not ordered_rows:
+            QMessageBox.information(
+                self,
+                "Remove ORDERED",
+                "There are no ORDERED lines on the To Order sheet.",
+            )
+            self.update_yu_selection_button()
+            return
+
+        item_numbers = []
+        for row in ordered_rows:
+            item = table.item(row, self.order_item_column)
+            item_number = item.text().strip() if item is not None and item.text() else ""
+            if item_number:
+                item_numbers.append(item_number)
+
+        preview_limit = 10
+        preview_items = item_numbers[:preview_limit]
+        preview_text = "\n".join(f"  • {item}" for item in preview_items)
+        if len(item_numbers) > preview_limit:
+            preview_text += f"\n  • … and {len(item_numbers) - preview_limit} more"
+
+        message = (
+            f"Remove all {len(ordered_rows)} ORDERED line"
+            f"{'s' if len(ordered_rows) != 1 else ''} from To Order?"
+        )
+        if preview_text:
+            message += f"\n\n{preview_text}"
+        message += (
+            "\n\nThis only clears the completed reminder lines from To Order. "
+            "It does not delete On Order lines, containers, exported purchase orders, "
+            "MYOB data, or historical transactions."
+        )
+
+        result = QMessageBox.question(
+            self,
+            "Remove all ORDERED lines",
+            message,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if result != QMessageBox.Yes:
+            return
+
+        # Respect the existing shared-edit protection before changing the local table.
+        if not self.check_collaboration_save_allowed("to_order", "", "To Order"):
+            self.update_yu_selection_button()
+            return
+
+        self._updating_order_table = True
+        try:
+            for row in reversed(ordered_rows):
+                table.removeRow(row)
+        finally:
+            self._updating_order_table = False
+
+        if not self.save_order_table_state():
+            # A collaboration change may have landed between the pre-check and save.
+            # Reload rather than leaving the user's screen showing an unsaved deletion.
+            self.load_saved_order_lines()
+            self.update_yu_selection_button()
+            return
+
+        self.refresh_item_summary_context_boxes()
+        self.rerun_order_analysis_if_ready()
+        self.update_yu_selection_button()
+
+        QMessageBox.information(
+            self,
+            "ORDERED lines removed",
+            f"Removed {len(ordered_rows)} ORDERED line"
+            f"{'s' if len(ordered_rows) != 1 else ''} from To Order.",
+        )
 
     def selected_to_order_lines(self):
         table = getattr(self.ui, "order_table", None)
@@ -30810,45 +30932,155 @@ $mail.Display()
 
 
     def show_item_at_risk_acknowledgement(self, item_number, at_risk_qty):
-        """Require an explicit acknowledgement when Item Summary shows positive At Risk."""
+        """Require an unmistakable acknowledgement when Item Summary shows positive At Risk."""
         at_risk_qty = self.parse_float(at_risk_qty)
         if at_risk_qty <= 0:
             return
 
         dialog = QDialog(self)
-        dialog.setWindowTitle("Item At Risk")
+        dialog.setWindowTitle("AT RISK — ACTION REQUIRED")
         dialog.setModal(True)
-        dialog.setMinimumWidth(520)
+        dialog.setMinimumWidth(620)
+        dialog.setMinimumHeight(390)
         try:
             dialog.setWindowFlag(Qt.WindowCloseButtonHint, False)
         except Exception:
             pass
 
+        # Deliberately use a strong alarm treatment. This warning is meant to interrupt
+        # normal workflow when purchasing risk is detected.
+        dialog.setStyleSheet("""
+            QDialog {
+                background-color: #240000;
+                border: 6px solid #ff1a1a;
+            }
+            QLabel {
+                color: white;
+            }
+            QLabel#atRiskBanner {
+                background-color: #d40000;
+                color: white;
+                border: 3px solid #ff6666;
+                border-radius: 6px;
+                padding: 14px;
+            }
+            QLabel#atRiskItem {
+                color: #ffffff;
+                font-weight: 800;
+                padding-top: 6px;
+            }
+            QLabel#atRiskQuantity {
+                background-color: #ff1a1a;
+                color: white;
+                border: 3px solid white;
+                border-radius: 8px;
+                padding: 16px;
+                font-weight: 900;
+            }
+            QLabel#atRiskMessage {
+                background-color: #4a0000;
+                color: white;
+                border: 2px solid #ff6666;
+                border-radius: 6px;
+                padding: 14px;
+            }
+            QCheckBox#atRiskUnderstood {
+                background-color: #d40000;
+                color: white;
+                border: 2px solid #ff8080;
+                border-radius: 6px;
+                padding: 12px;
+                font-weight: 800;
+            }
+            QCheckBox#atRiskUnderstood::indicator {
+                width: 24px;
+                height: 24px;
+            }
+            QPushButton {
+                min-width: 130px;
+                min-height: 42px;
+                font-weight: 800;
+                font-size: 14px;
+            }
+            QPushButton:enabled {
+                background-color: #d40000;
+                color: white;
+                border: 2px solid white;
+                border-radius: 5px;
+            }
+            QPushButton:disabled {
+                background-color: #555555;
+                color: #aaaaaa;
+                border: 2px solid #777777;
+                border-radius: 5px;
+            }
+        """)
+
         layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(14)
 
-        heading = QLabel(f"{item_number} requires attention", dialog)
-        heading_font = heading.font()
-        heading_font.setBold(True)
-        heading_font.setPointSize(max(heading_font.pointSize(), 12))
-        heading.setFont(heading_font)
-        layout.addWidget(heading)
+        banner = QLabel("⚠  AT RISK — ACTION REQUIRED  ⚠", dialog)
+        banner.setObjectName("atRiskBanner")
+        banner.setAlignment(Qt.AlignCenter)
+        banner_font = banner.font()
+        banner_font.setBold(True)
+        banner_font.setPointSize(max(banner_font.pointSize(), 19))
+        banner.setFont(banner_font)
+        layout.addWidget(banner)
 
-        message = QLabel(
-            f"This item has an At Risk quantity of {self.format_signed_value(at_risk_qty)}.\n\n"
-            "Please look into this item and review its demand, stock position, inbound supply and timing.",
+        item_label = QLabel(str(item_number), dialog)
+        item_label.setObjectName("atRiskItem")
+        item_label.setAlignment(Qt.AlignCenter)
+        item_font = item_label.font()
+        item_font.setBold(True)
+        item_font.setPointSize(max(item_font.pointSize(), 17))
+        item_label.setFont(item_font)
+        layout.addWidget(item_label)
+
+        quantity_label = QLabel(
+            f"AT RISK:  {self.format_signed_value(at_risk_qty)}",
             dialog,
         )
+        quantity_label.setObjectName("atRiskQuantity")
+        quantity_label.setAlignment(Qt.AlignCenter)
+        qty_font = quantity_label.font()
+        qty_font.setBold(True)
+        qty_font.setPointSize(max(qty_font.pointSize(), 24))
+        quantity_label.setFont(qty_font)
+        layout.addWidget(quantity_label)
+
+        message = QLabel(
+            "THIS ITEM REQUIRES INVESTIGATION.\n\n"
+            "Review demand, stock position, inbound supply and timing before continuing.",
+            dialog,
+        )
+        message.setObjectName("atRiskMessage")
         message.setWordWrap(True)
+        message.setAlignment(Qt.AlignCenter)
+        message_font = message.font()
+        message_font.setBold(True)
+        message_font.setPointSize(max(message_font.pointSize(), 12))
+        message.setFont(message_font)
         layout.addWidget(message)
 
-        understood = QCheckBox("Understood", dialog)
+        understood = QCheckBox("UNDERSTOOD — I WILL LOOK INTO THIS ITEM", dialog)
+        understood.setObjectName("atRiskUnderstood")
+        understood_font = understood.font()
+        understood_font.setBold(True)
+        understood_font.setPointSize(max(understood_font.pointSize(), 12))
+        understood.setFont(understood_font)
         layout.addWidget(understood)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok, parent=dialog)
         ok_button = buttons.button(QDialogButtonBox.Ok)
         if ok_button is not None:
             ok_button.setEnabled(False)
-        understood.toggled.connect(lambda checked: ok_button.setEnabled(bool(checked)) if ok_button is not None else None)
+            ok_button.setText("OK — CONTINUE")
+        understood.toggled.connect(
+            lambda checked: ok_button.setEnabled(bool(checked))
+            if ok_button is not None else None
+        )
         buttons.accepted.connect(dialog.accept)
         layout.addWidget(buttons)
 
