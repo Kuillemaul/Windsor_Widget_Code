@@ -124,7 +124,7 @@ from yu_order_workflow import YUOrderEntryDialog, load_yu_review_module
 TABLE_FONT_SIZE_OPTIONS = (8, 9, 10, 11, 12, 14, 16, 18, 20)
 TABLE_FONT_SETTINGS_PREFIX = "table_font_sizes"
 TABLE_FORMAT_SETTINGS_PREFIX = "table_format"
-APP_VERSION = "1.7.9"
+APP_VERSION = "1.8.0"
 APP_DESIGNER = "Bradley Mayze"
 YU_SUPPLIER_DISPLAY_NAME = "Yuchang Textile Factory"
 # Generic latest purchase-cost fields. These apply to every item in the item master.
@@ -16513,10 +16513,13 @@ class MainWindow(QMainWindow):
             "- Use the date range shown in the import instruction window. It starts from the latest sales date already in the database so same-day updates are re-captured.\n"
             "- Description, Freight Amount, Invoice No., and Customer PO must be present as columns in the export.\n"
             "- Description values are required for normal item rows. Rare MYOB backslash/non-stock rows can have a blank description and will still import.\n"
-            "- Customer PO values are saved to the sales table. If an imported row already exists, the matching row is updated with the Customer PO from the new file.\n"
+            "- Customer PO values are saved exactly as supplied by the current MYOB export.\n"
             "- Freight Amount can be blank on a row; blank freight imports as 0.\n"
             "- Multiple rows can share the same Invoice No. This is normal for multi-line invoices.\n"
-            "- Duplicate checking uses Invoice No. + Date + Customer + Item Number + Quantity + Price.\n"
+            "- Every invoice number present in the selected export is treated as the current MYOB version of that invoice.\n"
+            "- Existing database rows for those invoice numbers are removed and every line from the selected export is inserted in one transaction.\n"
+            "- This prevents edited invoices from accumulating old revisions while preserving legitimate multi-line invoices and backslash miscellaneous/non-stock lines.\n"
+            "- Only invoices present in the selected export are refreshed. Include an older invoice in the export if it was edited after its original import.\n"
             "- Blank rows are ignored.\n"
             "- Rows with a blank Item Number are skipped.\n"
             "- A backslash item number is kept, because MYOB uses it on some non-stock or repair lines.\n"
@@ -16783,7 +16786,8 @@ class MainWindow(QMainWindow):
                 f"From date: {start_date.strftime('%d/%m/%Y')}\n"
                 f"To date: {today_text}\n"
                 "Use the latest existing sales date as the from date. Do not start the day after it.\n"
-                "This deliberately re-captures the same day in case invoices were added or changed after the last update.\n"
+                "Invoices present in the export replace their previously stored version, so re-capturing the same day is safe.\n"
+                "If an older invoice was edited after its original import, extend the MYOB export back far enough to include that invoice.\n"
             )
 
         if import_key == "orders":
@@ -20122,7 +20126,12 @@ class MainWindow(QMainWindow):
                 self._update_watched_import_meta("item_master", candidates[0], message, result=result)
             elif kind == "sales":
                 count = self.import_sales_file(paths[0], progress=None)
-                message = f"{count:,} new sales row(s)"
+                replaced_rows = int(getattr(self, "_last_sales_rows_replaced", 0) or 0)
+                invoice_count = int(getattr(self, "_last_sales_invoices_imported", 0) or 0)
+                message = (
+                    f"{count:,} sales row(s) imported across {invoice_count:,} invoice(s); "
+                    f"{replaced_rows:,} prior row(s) replaced"
+                )
                 self._update_watched_import_meta("sales", candidates[0], message)
             elif kind == "stock":
                 count = self.import_stock_file(paths[0], progress=None)
@@ -24021,9 +24030,14 @@ class MainWindow(QMainWindow):
         try:
             self._last_sales_customers_added = 0
             self._last_sales_customer_po_updated = 0
+            self._last_sales_rows_replaced = 0
+            self._last_sales_invoices_replaced = 0
+            self._last_sales_invoices_imported = 0
             imported_count = self.import_sales_file(file_path, progress=progress)
             customers_added = int(getattr(self, "_last_sales_customers_added", 0) or 0)
-            customer_po_updated = int(getattr(self, "_last_sales_customer_po_updated", 0) or 0)
+            replaced_rows = int(getattr(self, "_last_sales_rows_replaced", 0) or 0)
+            replaced_invoices = int(getattr(self, "_last_sales_invoices_replaced", 0) or 0)
+            invoice_count = int(getattr(self, "_last_sales_invoices_imported", 0) or 0)
             self.update_import_progress(progress, 92, "Refreshing sales and customer lists...")
         except Exception as exc:
             self.close_import_progress(progress)
@@ -24033,8 +24047,10 @@ class MainWindow(QMainWindow):
         display_text = (
             f"Last import: {datetime.now().strftime('%d/%m/%Y %H:%M')}\n"
             f"File: {Path(file_path).name}\n"
-            f"Rows added: {imported_count:,}\n"
-            f"Customer PO rows updated: {customer_po_updated:,}\n"
+            f"Rows imported: {imported_count:,}\n"
+            f"Invoices in file: {invoice_count:,}\n"
+            f"Existing invoice rows replaced: {replaced_rows:,}\n"
+            f"Existing invoices refreshed: {replaced_invoices:,}\n"
             f"New customers added: {customers_added:,}"
         )
         self.set_meta_value("sales_last_import_display", display_text)
@@ -24052,9 +24068,10 @@ class MainWindow(QMainWindow):
         self.rerun_item_if_ready()
 
         self.close_import_progress(progress)
-        message_parts = [f"Added {imported_count:,} new row(s) to the sales table."]
-        if customer_po_updated:
-            message_parts.append(f"Updated Customer PO on {customer_po_updated:,} existing row(s).")
+        message_parts = [
+            f"Imported {imported_count:,} sales row(s) across {invoice_count:,} invoice(s).",
+            f"Replaced {replaced_rows:,} previously stored row(s) across {replaced_invoices:,} existing invoice(s).",
+        ]
         if customers_added:
             message_parts.append(f"Added {customers_added:,} new customer(s) to the customer list.")
         QMessageBox.information(
@@ -24064,61 +24081,94 @@ class MainWindow(QMainWindow):
         )
 
     def import_sales_file(self, file_path, progress=None):
+        """Import the current MYOB version of every invoice present in *file_path*.
+
+        Invoice number is the revision boundary.  All existing rows for invoice
+        numbers present in the incoming file are deleted, then every parsed line
+        from the file is inserted.  Delete + insert is one database transaction,
+        so a failed insert rolls the invoice replacements back.
+
+        This deliberately preserves legitimate multi-line invoices, including
+        repeated or backslash miscellaneous/non-stock lines, because the selected
+        MYOB export is treated as the source of truth for those invoice numbers.
+        """
         self.update_import_progress(progress, 5, "Preparing sales table...")
         self.ensure_sales_optional_columns()
         self.update_import_progress(progress, 8, "Reading sales file...")
         rows = self.read_sales_import_rows(file_path)
+
+        self._last_sales_customer_po_updated = 0
+        self._last_sales_rows_replaced = 0
+        self._last_sales_invoices_replaced = 0
+        self._last_sales_invoices_imported = 0
+
         if not rows:
-            self._last_sales_customer_po_updated = 0
             return 0
 
-        self.update_import_progress(progress, 28, "Checking customer list...")
+        invoice_keys = sorted({
+            str(row[8] if len(row) > 8 else "").strip().upper()
+            for row in rows
+            if str(row[8] if len(row) > 8 else "").strip()
+        })
+        if not invoice_keys:
+            raise ValueError("The selected sales file did not contain any invoice numbers.")
+
+        self._last_sales_invoices_imported = len(invoice_keys)
+
+        self.update_import_progress(progress, 24, "Checking customer list...")
         try:
             self._last_sales_customers_added = self.add_missing_customers_from_sales_rows(rows)
         except Exception as exc:
             raise ValueError(f"Sales rows were read, but the customer list could not be updated: {exc}") from exc
 
-        self.update_import_progress(progress, 35, f"Checking {len(rows):,} sales rows for duplicates...")
-        date_values = [row[0] for row in rows if row and row[0]]
-        min_date = min(date_values) if date_values else "0001-01-01"
-        max_date = max(date_values) if date_values else "9999-12-31"
-
-        existing_rows = self.db_all(
-            """
-            SELECT sale_date, customer_name, item_number, quantity, price, invoice_no
-            FROM sales
-            WHERE sale_date >= ? AND sale_date <= ?
-            """,
-            (min_date, max_date),
+        self.update_import_progress(
+            progress,
+            38,
+            f"Preparing {len(invoice_keys):,} invoice(s) for replacement...",
         )
-        existing_counts = Counter()
-        for row in existing_rows:
-            existing_counts[self.sales_row_signature(
-                row["sale_date"],
-                row["customer_name"],
-                row["item_number"],
-                row["quantity"],
-                row["price"],
-                row["invoice_no"],
-            )] += 1
 
-        self.update_import_progress(progress, 55, "Preparing new sales rows...")
-        incoming_counts = Counter()
-        rows_to_insert = []
-        for row in rows:
-            signature = self.sales_row_signature(row[0], row[1], row[2], row[5], row[6], row[8])
-            if incoming_counts[signature] < existing_counts[signature]:
-                incoming_counts[signature] += 1
-                continue
-            incoming_counts[signature] += 1
-            rows_to_insert.append(row)
+        # SQL Server has a 2,100-parameter statement limit.  Keep batches well
+        # below that, and use a normalised text expression so numeric and text
+        # invoice_no columns are both handled safely.
+        if self.db_engine == "sqlserver":
+            invoice_expr = "UPPER(LTRIM(RTRIM(CAST(invoice_no AS NVARCHAR(255)))))"
+        else:
+            invoice_expr = "UPPER(TRIM(CAST(invoice_no AS TEXT)))"
 
-        customer_po_rows = [row for row in rows if str(row[10] if len(row) > 10 else "").strip()]
-        customer_po_updated = 0
         cur = self.db_conn.cursor()
+        replaced_rows = 0
+        replaced_invoices = 0
+        batch_size = 500
 
-        if rows_to_insert:
-            self.update_import_progress(progress, 72, f"Saving {len(rows_to_insert):,} sales rows...")
+        try:
+            for start_index in range(0, len(invoice_keys), batch_size):
+                batch = invoice_keys[start_index:start_index + batch_size]
+                placeholders = ", ".join("?" for _ in batch)
+
+                count_row = cur.execute(
+                    f"SELECT COUNT(*) FROM sales WHERE {invoice_expr} IN ({placeholders})",
+                    tuple(batch),
+                ).fetchone()
+                batch_existing_rows = int(count_row[0] or 0) if count_row is not None else 0
+                replaced_rows += batch_existing_rows
+
+                if batch_existing_rows:
+                    invoice_count_row = cur.execute(
+                        f"SELECT COUNT(DISTINCT {invoice_expr}) FROM sales WHERE {invoice_expr} IN ({placeholders})",
+                        tuple(batch),
+                    ).fetchone()
+                    replaced_invoices += int(invoice_count_row[0] or 0) if invoice_count_row is not None else 0
+
+                    cur.execute(
+                        f"DELETE FROM sales WHERE {invoice_expr} IN ({placeholders})",
+                        tuple(batch),
+                    )
+
+            self.update_import_progress(
+                progress,
+                68,
+                f"Saving {len(rows):,} current sales row(s)...",
+            )
             cur.executemany(
                 """
                 INSERT INTO sales (
@@ -24126,43 +24176,24 @@ class MainWindow(QMainWindow):
                     month_key, quantity, price, extended, invoice_no, freight_amount, customer_po
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                rows_to_insert,
+                rows,
             )
-        else:
-            self.update_import_progress(progress, 72, "No new sales rows to save.")
 
-        if customer_po_rows:
-            self.update_import_progress(progress, 82, f"Updating Customer PO on existing sales rows...")
-            for row in customer_po_rows:
-                customer_po = str(row[10] or "").strip()
-                cur.execute(
-                    """
-                    UPDATE sales
-                    SET customer_po = ?
-                    WHERE sale_date = ?
-                      AND customer_name = ?
-                      AND item_number = ?
-                      AND ABS(quantity - ?) < 0.000001
-                      AND ABS(price - ?) < 0.000001
-                      AND invoice_no = ?
-                      AND (customer_po IS NULL OR LTRIM(RTRIM(customer_po)) = '' OR customer_po <> ?)
-                    """,
-                    (customer_po, row[0], row[1], row[2], row[5], row[6], row[8], customer_po),
-                )
-                try:
-                    if cur.rowcount and cur.rowcount > 0:
-                        customer_po_updated += int(cur.rowcount)
-                except Exception:
-                    pass
-
-        if rows_to_insert or customer_po_updated:
-            self.update_import_progress(progress, 88, "Committing sales import...")
+            self.update_import_progress(progress, 88, "Committing invoice replacements...")
             self.db_conn.commit()
-        else:
-            self.update_import_progress(progress, 88, "No sales changes to save.")
+        except Exception as exc:
+            try:
+                self.db_conn.rollback()
+            except Exception:
+                pass
+            raise ValueError(
+                "Sales import was rolled back. No invoice replacements from this file were committed. "
+                f"Database error: {exc}"
+            ) from exc
 
-        self._last_sales_customer_po_updated = customer_po_updated
-        return len(rows_to_insert)
+        self._last_sales_rows_replaced = replaced_rows
+        self._last_sales_invoices_replaced = replaced_invoices
+        return len(rows)
 
     def read_sales_import_rows(self, file_path):
         path = Path(file_path)
